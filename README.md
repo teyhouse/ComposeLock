@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/teyhouse/ComposeLock/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/teyhouse/ComposeLock/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/teyhouse/ComposeLock)](https://github.com/teyhouse/ComposeLock/releases/latest)
-[![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
 ComposeLock is a small Go CLI that keeps a Docker Compose stack in sync
@@ -38,7 +38,7 @@ them.
 
 ## Requirements
 
-- Go 1.26 or newer to build.
+- Go 1.27 or newer to build.
 - A reachable Docker daemon at runtime. The Compose SDK talks to it
   directly, so no `docker compose` CLI is required.
 - `git` on `PATH`.
