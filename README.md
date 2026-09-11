@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="ComposeLock logo" width="320">
+</p>
+
 # ComposeLock
 
 [![CI](https://github.com/teyhouse/ComposeLock/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/teyhouse/ComposeLock/actions/workflows/ci.yml)
