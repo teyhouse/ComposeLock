@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        run: go tool staticcheck ./...
+
+      - name: Test
+        run: go test -race -shuffle=on ./...
+
+      - name: Vulnerability check
+        run: go tool govulncheck ./...
+
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Determine next version
+        id: version
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          BASE="$(cat VERSION)"
+          LAST_TAG="$(git tag -l "v${BASE}.*" | sort -V | tail -n1)"
+          if [ -z "$LAST_TAG" ]; then
+            NEXT="v${BASE}.0"
+          else
+            PATCH="${LAST_TAG##*.}"
+            NEXT="v${BASE}.$((PATCH + 1))"
+          fi
+          echo "Next version: $NEXT"
+          echo "value=$NEXT" >> "$GITHUB_OUTPUT"
+
+      - name: Build linux/amd64
+        run: make build GOOS=linux GOARCH=amd64 VERSION=${{ steps.version.outputs.value }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf dist/composelock-linux-amd64.tar.gz -C bin composelock
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.value }}
+          name: ${{ steps.version.outputs.value }}
+          files: dist/composelock-linux-amd64.tar.gz

@@ -28,5 +28,13 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
+.idea/
 # .vscode/
+
+# Build artifacts
+/bin/
+/dist/
+
+# Planning docs (local only)
+architecture.md
+plan.md
