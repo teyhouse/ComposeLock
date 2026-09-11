@@ -14,7 +14,6 @@ Only the latest release receives security updates.
 Report security vulnerabilities privately via:
 
 - **GitHub Security Advisories**: Use the "Report a vulnerability" tab on this repository
-- **Email**: security@teyhouse.dev
 
 Do not open public issues for security vulnerabilities.
 
