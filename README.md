@@ -28,9 +28,17 @@ On each run it:
 5. If the stack does not stay healthy for the full window, it reverts to
    the last commit that was known to be healthy and watches that too.
 
+The Git checkout only moves once every pre-flight check has passed, so a
+failed check (Docker unreachable, a missing `env_file`, an invalid
+Compose file) is retried on the next run. Containers that exit with code
+0, such as one-shot migration or init jobs, count as completed rather
+than failed. Services removed from the Compose file are removed from the
+stack.
+
 State (last healthy commit, last failed commit, pending commit) is kept
 in a JSON file next to the binary so a crash mid-deploy is recoverable on
-the next run.
+the next run: an interrupted deploy is re-applied and watched again, and
+an interrupted revert is finished.
 
 Secrets are out of scope. ComposeLock will check that `env_file:` paths
 referenced in the Compose file exist, but never opens, reads, or logs
@@ -100,13 +108,18 @@ Everything else has a sane default:
 | `health_restart_tolerance`      | `1`                   | Restarts allowed before treating it as a failure |
 | `discord_webhook`               | (disabled)            | Discord webhook URL for notifications           |
 | `log_format`                    | `json`                | `json` or `text`, logged to stdout              |
+| `pprof_listen`                  | (disabled)            | Loopback address for a pprof server in `poll`/`webhook` mode, e.g. `127.0.0.1:6060` |
 | `webhook.listen`                | `127.0.0.1:8080`      | Address for `composelock webhook`               |
 | `webhook.path`                  | `/webhook`            | Path for `composelock webhook`                  |
 | `webhook.secret`                | (disabled)            | HMAC secret for the webhook; empty disables validation |
 
 Every field can be overridden on the command line, run
 `composelock --help` for the full flag list. Flags win over the config
-file.
+file and are validated the same way. Duration flags must be whole
+seconds (`30s`, `5m`).
+
+The config file can hold `webhook.secret` and `discord_webhook`, so
+`--init` creates it with mode `0600`.
 
 ## Commands
 

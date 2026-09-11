@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
@@ -21,6 +24,20 @@ func exitCode(result reconcile.Result) int {
 	default:
 		return 0
 	}
+}
+
+func logResult(log *slog.Logger, msg string, result reconcile.Result) {
+	log.Info(msg,
+		"changed", result.Changed,
+		"skipped", result.Skipped,
+		"applied", result.Applied,
+		"reverted", result.Reverted,
+		"degraded", result.Degraded,
+		"old_commit", result.OldCommit,
+		"new_commit", result.NewCommit,
+		"duration_ms", result.Duration.Milliseconds(),
+		"err", result.Err,
+	)
 }
 
 func cmdInit(f *cliFlags) int {
@@ -42,7 +59,7 @@ func cmdInit(f *cliFlags) int {
 	return 0
 }
 
-func cmdStatus(configPath string, cfg *config.Config, deps reconcile.Deps) int {
+func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps reconcile.Deps) int {
 	fmt.Println("config:", configPath)
 
 	st, err := deps.State.Load()
@@ -50,9 +67,14 @@ func cmdStatus(configPath string, cfg *config.Config, deps reconcile.Deps) int {
 		fmt.Fprintln(os.Stderr, "reading state:", err)
 		return 2
 	}
-	fmt.Printf("state: %+v\n", st)
+	data, err := json.Marshal(st, jsontext.WithIndent("  "))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "encoding state:", err)
+		return 1
+	}
+	fmt.Printf("state:\n%s\n", data)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	snap, err := deps.Health.Snapshot(ctx, cfg.ProjectName)
 	if err != nil {
@@ -73,17 +95,7 @@ func cmdReconcile(ctx context.Context, trigger string, dryRun, force bool, deps 
 		Trigger: trigger,
 	}, deps)
 
-	deps.Log.Info("reconcile complete",
-		"changed", result.Changed,
-		"skipped", result.Skipped,
-		"applied", result.Applied,
-		"reverted", result.Reverted,
-		"degraded", result.Degraded,
-		"old_commit", result.OldCommit,
-		"new_commit", result.NewCommit,
-		"duration_ms", result.Duration.Milliseconds(),
-		"err", result.Err,
-	)
+	logResult(deps.Log, "reconcile complete", result)
 	return exitCode(result)
 }
 
@@ -94,19 +106,15 @@ func cmdPoll(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 		return 2
 	}
 
+	stopPprof := startPprof(ctx, cfg.PprofListen, deps.Log)
+	defer stopPprof()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		result := reconcile.Reconcile(ctx, reconcile.Options{Trigger: "poll"}, deps)
-		deps.Log.Info("poll tick complete",
-			"changed", result.Changed,
-			"skipped", result.Skipped,
-			"applied", result.Applied,
-			"reverted", result.Reverted,
-			"degraded", result.Degraded,
-			"err", result.Err,
-		)
+		logResult(deps.Log, "poll tick complete", result)
 
 		select {
 		case <-ctx.Done():
@@ -117,15 +125,17 @@ func cmdPoll(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 }
 
 func cmdWebhook(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
-	srv := &webhook.Server{
+	stopPprof := startPprof(ctx, cfg.PprofListen, deps.Log)
+	defer stopPprof()
+
+	srv := webhook.New(webhook.Config{
 		Addr:   cfg.Webhook.Listen,
 		Path:   cfg.Webhook.Path,
 		Secret: cfg.Webhook.Secret,
-		Reconcile: func(rctx context.Context) {
-			reconcile.Reconcile(rctx, reconcile.Options{Trigger: "webhook"}, deps)
-		},
-		Log: deps.Log,
-	}
+	}, func(rctx context.Context) {
+		result := reconcile.Reconcile(rctx, reconcile.Options{Trigger: "webhook"}, deps)
+		logResult(deps.Log, "webhook reconcile complete", result)
+	}, deps.Log)
 
 	deps.Log.Info("webhook server starting", "addr", cfg.Webhook.Listen, "path", cfg.Webhook.Path)
 	if err := srv.ListenAndServe(ctx); err != nil {

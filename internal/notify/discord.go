@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -165,14 +167,14 @@ func (n *Notifier) Send(ctx context.Context, embed Embed) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.webhookURL, bytes.NewReader(data))
 	if err != nil {
-		n.log.Warn("discord notify: building request failed", "err", err)
+		n.log.Warn("discord notify: building request failed", "err", redactURL(err))
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		n.log.Warn("discord notify: request failed", "err", err)
+		n.log.Warn("discord notify: request failed", "err", redactURL(err))
 		return
 	}
 	defer resp.Body.Close()
@@ -180,4 +182,11 @@ func (n *Notifier) Send(ctx context.Context, embed Embed) {
 	if resp.StatusCode >= 300 {
 		n.log.Warn("discord notify: non-2xx response", "status", resp.StatusCode)
 	}
+}
+
+func redactURL(err error) error {
+	if uerr, ok := errors.AsType[*url.Error](err); ok {
+		return fmt.Errorf("%s: %w", uerr.Op, uerr.Err)
+	}
+	return err
 }

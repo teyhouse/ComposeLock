@@ -14,29 +14,28 @@ const schemaVersion = 1
 type Result string
 
 const (
-	ResultSuccess         Result = "success"
-	ResultFailedPreflight Result = "failed_preflight"
-	ResultFailedApply     Result = "failed_apply"
-	ResultReverted        Result = "reverted"
-	ResultDegraded        Result = "degraded"
+	ResultSuccess     Result = "success"
+	ResultFailedApply Result = "failed_apply"
+	ResultReverted    Result = "reverted"
+	ResultDegraded    Result = "degraded"
 )
 
 type State struct {
 	SchemaVersion int `json:"schema_version"`
 
 	LastHealthyCommit string    `json:"last_healthy_commit"`
-	LastHealthyAt     time.Time `json:"last_healthy_at,omitempty"`
+	LastHealthyAt     time.Time `json:"last_healthy_at,omitzero"`
 
 	LastFailedCommit string    `json:"last_failed_commit"`
-	LastFailedAt     time.Time `json:"last_failed_at,omitempty"`
+	LastFailedAt     time.Time `json:"last_failed_at,omitzero"`
 
 	LastResult Result `json:"last_result"`
 
 	LastAttemptCommit string    `json:"last_attempt_commit"`
-	LastAttemptAt     time.Time `json:"last_attempt_at,omitempty"`
+	LastAttemptAt     time.Time `json:"last_attempt_at,omitzero"`
 
 	PendingCommit string    `json:"pending_commit"`
-	PendingSince  time.Time `json:"pending_since,omitempty"`
+	PendingSince  time.Time `json:"pending_since,omitzero"`
 }
 
 func New() *State {
@@ -92,11 +91,36 @@ func Save(path string, st *State) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("renaming temp state file into place: %w", err)
 	}
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("fsync state directory: %w", err)
+	}
 	return nil
+}
+
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+func CheckWritable(path string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".state-*.json.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	return errors.Join(tmp.Close(), os.Remove(name))
 }
 
 func (s *State) Pending() bool {
 	return s.PendingCommit != ""
+}
+
+func (s *State) RevertInProgress() bool {
+	return s.Pending() && s.PendingCommit == s.LastFailedCommit
 }
 
 type Store interface {
@@ -119,10 +143,12 @@ func (m *MemStore) Load() (*State, error) {
 	if m.State == nil {
 		return New(), nil
 	}
-	return m.State, nil
+	st := *m.State
+	return &st, nil
 }
 
 func (m *MemStore) Save(st *State) error {
-	m.State = st
+	saved := *st
+	m.State = &saved
 	return nil
 }

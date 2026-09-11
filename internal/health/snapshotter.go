@@ -32,6 +32,7 @@ func (s *ComposeSnapshotter) Snapshot(ctx context.Context, projectName string) (
 			State:        string(cs.State),
 			Health:       string(cs.Health),
 			RestartCount: restartCount,
+			ExitCode:     cs.ExitCode,
 		}
 	}
 

@@ -1,6 +1,10 @@
 package config
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 type Overrides struct {
 	RepoPath    *string
@@ -21,7 +25,7 @@ type Overrides struct {
 	RestartTolerance *int
 }
 
-func (c *Config) Apply(o Overrides) {
+func (c *Config) Apply(o Overrides) error {
 	setString(&c.RepoPath, o.RepoPath)
 	setString(&c.Remote, o.Remote)
 	setString(&c.Branch, o.Branch)
@@ -35,10 +39,12 @@ func (c *Config) Apply(o Overrides) {
 	setInt(&c.RetryAttempts, o.RetryAttempts)
 	setInt(&c.HealthRestartTolerance, o.RestartTolerance)
 
-	setSeconds(&c.RetryDelaySeconds, o.RetryDelay)
-	setSeconds(&c.PollIntervalSeconds, o.PollInterval)
-	setSeconds(&c.HealthWatchSeconds, o.HealthWatch)
-	setSeconds(&c.HealthPollIntervalSeconds, o.HealthInterval)
+	return errors.Join(
+		setSeconds(&c.RetryDelaySeconds, o.RetryDelay, "retry_delay_seconds"),
+		setSeconds(&c.PollIntervalSeconds, o.PollInterval, "poll_interval_seconds"),
+		setSeconds(&c.HealthWatchSeconds, o.HealthWatch, "health_watch_seconds"),
+		setSeconds(&c.HealthPollIntervalSeconds, o.HealthInterval, "health_poll_interval_seconds"),
+	)
 }
 
 func setString(dst *string, src *string) {
@@ -53,8 +59,13 @@ func setInt(dst *int, src *int) {
 	}
 }
 
-func setSeconds(dst *int, src *time.Duration) {
-	if src != nil {
-		*dst = int(src.Seconds())
+func setSeconds(dst *int, src *time.Duration, field string) error {
+	if src == nil {
+		return nil
 	}
+	if *src%time.Second != 0 {
+		return fmt.Errorf("config: %s must be a whole number of seconds, got %s", field, *src)
+	}
+	*dst = int(*src / time.Second)
+	return nil
 }

@@ -29,7 +29,11 @@ func (s *Syncer) env() []string {
 	if s.SSHKey == "" {
 		return nil
 	}
-	return []string{fmt.Sprintf("GIT_SSH_COMMAND=ssh -i %s -o IdentitiesOnly=yes", s.SSHKey)}
+	return []string{"GIT_SSH_COMMAND=ssh -i " + shellQuote(s.SSHKey) + " -o IdentitiesOnly=yes"}
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func (s *Syncer) git(ctx context.Context, args ...string) (string, error) {
@@ -37,8 +41,6 @@ func (s *Syncer) git(ctx context.Context, args ...string) (string, error) {
 	return strings.TrimSpace(string(stdout)), err
 }
 
-// Preview fetches and diffs without checking out, so dry-run can report
-// what would change without mutating the working tree.
 func (s *Syncer) Preview(ctx context.Context) (Result, error) {
 	if _, err := s.git(ctx, "fetch", s.Remote, s.Branch); err != nil {
 		return Result{}, fmt.Errorf("git fetch: %w", err)
@@ -75,18 +77,6 @@ func (s *Syncer) Preview(ctx context.Context) (Result, error) {
 	}, nil
 }
 
-func (s *Syncer) SyncOnce(ctx context.Context) (Result, error) {
-	result, err := s.Preview(ctx)
-	if err != nil || !result.Changed {
-		return result, err
-	}
-
-	if _, err := s.git(ctx, "checkout", result.NewCommit); err != nil {
-		return Result{}, fmt.Errorf("git checkout %s: %w", result.NewCommit, err)
-	}
-	return result, nil
-}
-
 func (s *Syncer) Checkout(ctx context.Context, commit string) error {
 	if _, err := s.git(ctx, "checkout", commit); err != nil {
 		return fmt.Errorf("git checkout %s: %w", commit, err)
@@ -94,15 +84,12 @@ func (s *Syncer) Checkout(ctx context.Context, commit string) error {
 	return nil
 }
 
-func Sync(ctx context.Context, s *Syncer, attempts int, delay time.Duration, log *slog.Logger) (Result, error) {
-	return retry(ctx, attempts, delay, log, s.SyncOnce)
-}
-
-func SyncPreview(ctx context.Context, s *Syncer, attempts int, delay time.Duration, log *slog.Logger) (Result, error) {
+func Fetch(ctx context.Context, s *Syncer, attempts int, delay time.Duration, log *slog.Logger) (Result, error) {
 	return retry(ctx, attempts, delay, log, s.Preview)
 }
 
 func retry(ctx context.Context, attempts int, delay time.Duration, log *slog.Logger, fn func(context.Context) (Result, error)) (Result, error) {
+	attempts = max(attempts, 1)
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		result, err := fn(ctx)

@@ -56,7 +56,8 @@ func run(args []string) int {
 		return cmdInit(f)
 	}
 
-	cfg, deps, code := setup(f)
+	readOnly := command == "status" || command == "check" || (command == "sync" && f.dryRun)
+	cfg, deps, code := setup(f, !readOnly)
 	if code != 0 {
 		return code
 	}
@@ -70,7 +71,7 @@ func run(args []string) int {
 	case "check":
 		return cmdReconcile(ctx, "cli", true, f.force, deps)
 	case "status":
-		return cmdStatus(config.ResolvePath(f.configPath), cfg, deps)
+		return cmdStatus(ctx, config.ResolvePath(f.configPath), cfg, deps)
 	case "poll":
 		return cmdPoll(ctx, cfg, deps)
 	case "webhook":

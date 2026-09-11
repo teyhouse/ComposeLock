@@ -79,12 +79,7 @@ func Reconcile(ctx context.Context, opts Options, deps Deps) Result {
 	result.Duration = time.Since(start)
 
 	if result.Notification != nil {
-		embed := *result.Notification
-		if opts.Trigger == "cli" {
-			deps.Notifier.Send(ctx, embed)
-		} else {
-			go deps.Notifier.Send(context.Background(), embed)
-		}
+		deps.Notifier.Send(context.WithoutCancel(ctx), *result.Notification)
 	}
 	return result
 }
@@ -94,6 +89,11 @@ func reconcileLocked(ctx context.Context, opts Options, deps Deps, start time.Ti
 	if err != nil {
 		deps.Log.Error("loading state", "err", err)
 		return Result{Err: fmt.Errorf("loading state: %w", err)}
+	}
+
+	if st.LastResult == state.ResultDegraded && !opts.Force {
+		deps.Log.Warn("refusing to reconcile: system is DEGRADED, use --force", "pending_commit", st.PendingCommit)
+		return Result{Degraded: true, NewCommit: st.PendingCommit, Err: errDegraded}
 	}
 
 	if st.Pending() {

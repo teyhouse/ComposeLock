@@ -25,6 +25,11 @@ type ContainerStatus struct {
 	State        string // "running", "exited", ...
 	Health       string // "", "none", "starting", "healthy", "unhealthy"
 	RestartCount int
+	ExitCode     int
+}
+
+func (c ContainerStatus) Completed() bool {
+	return c.State == StateExited && c.ExitCode == 0
 }
 
 type Snapshot struct {
@@ -60,7 +65,8 @@ func (RealClock) Sleep(ctx context.Context, d time.Duration) bool {
 type Outcome int
 
 const (
-	Healthy Outcome = iota
+	Unknown Outcome = iota
+	Healthy
 	Unhealthy
 )
 
@@ -117,10 +123,10 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 
 		anyUnhealthy := false
 		for _, c := range cur.Containers {
-			if c.State == StateExited {
-				result.Reason = fmt.Sprintf("container exited: %s", c.Service)
+			if c.State == StateExited && !c.Completed() {
+				result.Reason = fmt.Sprintf("container exited: %s (exit code %d)", c.Service, c.ExitCode)
 				result.Failures = append(result.Failures, result.Reason)
-				log.Warn("health watch: container exited", "service", c.Service)
+				log.Warn("health watch: container exited", "service", c.Service, "exit_code", c.ExitCode)
 				result.Outcome = Unhealthy
 				return result, nil
 			}
@@ -165,7 +171,7 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 
 func Evaluate(snap Snapshot) (healthy bool, reason string) {
 	for _, c := range snap.Containers {
-		if c.State != StateRunning {
+		if c.State != StateRunning && !c.Completed() {
 			return false, fmt.Sprintf("not running: %s (state=%s)", c.Service, c.State)
 		}
 		if c.Health != "" && c.Health != HealthNone && c.Health != HealthHealthy {

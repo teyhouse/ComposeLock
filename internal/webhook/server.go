@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,23 +18,45 @@ const maxBodyBytes = 1 << 20
 
 type ReconcileFunc func(ctx context.Context)
 
+type Config struct {
+	Addr   string
+	Path   string
+	Secret string
+}
+
 type Server struct {
-	Addr      string
-	Path      string
-	Secret    string
-	Reconcile ReconcileFunc
-	Log       *slog.Logger
+	cfg       Config
+	reconcile ReconcileFunc
+	log       *slog.Logger
+	triggers  chan struct{}
+}
+
+func New(cfg Config, reconcile ReconcileFunc, log *slog.Logger) *Server {
+	return &Server{
+		cfg:       cfg,
+		reconcile: reconcile,
+		log:       log,
+		triggers:  make(chan struct{}, 1),
+	}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+s.Path, s.handleWebhook)
+	mux.HandleFunc("POST "+s.cfg.Path, s.handleWebhook)
 	return mux
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", s.cfg.Addr)
+	if err != nil {
+		return err
+	}
+	return s.Serve(ctx, ln)
+}
+
+func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
-		Addr:              s.Addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -40,16 +64,35 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	defer func() {
+		stopWorker()
+		wg.Wait()
+	}()
+	wg.Go(func() { s.processTriggers(workerCtx) })
+
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
+	wg.Go(func() { errCh <- srv.Serve(ln) })
 
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	case err := <-errCh:
 		return err
+	}
+}
+
+func (s *Server) processTriggers(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.triggers:
+			s.reconcile(ctx)
+		}
 	}
 }
 
@@ -62,16 +105,21 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.validSignature(r.Header.Get("X-Hub-Signature-256"), body) {
+		s.log.Warn("webhook: rejected request with invalid signature", "remote_addr", r.RemoteAddr)
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
+	select {
+	case s.triggers <- struct{}{}:
+	default:
+		s.log.Info("webhook: reconcile already queued, coalescing trigger")
+	}
 	w.WriteHeader(http.StatusAccepted)
-	go s.Reconcile(context.Background())
 }
 
 func (s *Server) validSignature(header string, body []byte) bool {
-	if s.Secret == "" {
+	if s.cfg.Secret == "" {
 		return true
 	}
 
@@ -80,7 +128,7 @@ func (s *Server) validSignature(header string, body []byte) bool {
 		return false
 	}
 
-	mac := hmac.New(sha256.New, []byte(s.Secret))
+	mac := hmac.New(sha256.New, []byte(s.cfg.Secret))
 	mac.Write(body)
 	expected := hex.EncodeToString(mac.Sum(nil))
 

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,6 +96,23 @@ func TestNotifierSendPostsPayload(t *testing.T) {
 	}
 	if received.Embeds[0].Title != "Deployed" {
 		t.Errorf("posted title = %q, want %q", received.Embeds[0].Title, "Deployed")
+	}
+}
+
+func TestNotifierSendDoesNotLogWebhookToken(t *testing.T) {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	webhookURL := srv.URL + "/api/webhooks/123/SUPERSECRETTOKEN"
+	srv.Close()
+
+	var buf bytes.Buffer
+	n := New(webhookURL, slog.New(slog.NewTextHandler(&buf, nil)))
+	n.Send(t.Context(), Embed{Title: "unreachable"})
+
+	if !strings.Contains(buf.String(), "request failed") {
+		t.Fatalf("expected the failed request to be logged, got: %s", buf.String())
+	}
+	if strings.Contains(buf.String(), "SUPERSECRETTOKEN") {
+		t.Errorf("webhook token leaked into logs: %s", buf.String())
 	}
 }
 

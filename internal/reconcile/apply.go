@@ -12,19 +12,18 @@ import (
 	"github.com/teyhouse/ComposeLock/internal/state"
 )
 
+const restoreCheckoutTimeout = 30 * time.Second
+
 func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, start time.Time) Result {
 	cfg := deps.Config
 	retryDelay := time.Duration(cfg.RetryDelaySeconds) * time.Second
 
-	var gitResult git.Result
-	var err error
-	if opts.DryRun {
-		gitResult, err = git.SyncPreview(ctx, deps.Git, cfg.RetryAttempts, retryDelay, deps.Log)
-	} else {
-		gitResult, err = git.Sync(ctx, deps.Git, cfg.RetryAttempts, retryDelay, deps.Log)
-	}
+	gitResult, err := git.Fetch(ctx, deps.Git, cfg.RetryAttempts, retryDelay, deps.Log)
 	if err != nil {
 		deps.Log.Error("git sync failed", "err", err)
+		if ctx.Err() != nil {
+			return Result{Err: err}
+		}
 		embed := notify.BuildEmbed(notify.Report{
 			Outcome: notify.OutcomeFailure,
 			Title:   "ComposeLock: git sync failed",
@@ -59,6 +58,9 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 	if err != nil {
 		deps.Log.Error("pre-flight snapshot failed", "err", err)
 		result.Err = fmt.Errorf("pre-flight snapshot: %w", err)
+		if ctx.Err() != nil {
+			return result
+		}
 		embed := notify.BuildEmbed(notify.Report{
 			Outcome: notify.OutcomeFailure,
 			Title:   "ComposeLock: pre-flight check failed",
@@ -78,7 +80,6 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 
 	if !liveHealthy {
 		deps.Log.Warn("pre-flight gate: live stack unhealthy, not applying", "reason", reason)
-		st.LastResult = state.ResultFailedPreflight
 		revertResult := doRevert(ctx, deps, st, gitResult.NewCommit, "pre-flight: live stack unhealthy: "+reason, start)
 		revertResult.Changed = result.Changed
 		revertResult.OldCommit = result.OldCommit
@@ -87,71 +88,48 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		return revertResult
 	}
 
-	return applyAndWatch(ctx, deps, st, gitResult, result, start)
+	return applyAndWatch(ctx, deps, st, result, start)
 }
 
-func applyAndWatch(ctx context.Context, deps Deps, st *state.State, gitResult git.Result, result Result, start time.Time) Result {
+func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Result, start time.Time) Result {
 	cfg := deps.Config
+	commit := result.NewCommit
+
+	if err := deps.Git.Checkout(ctx, commit); err != nil {
+		return abortBeforeUp(ctx, deps, result, "checkout failed", err)
+	}
 
 	project, err := deps.Compose.LoadProject(ctx, cfg.ComposeFile, cfg.ProjectName)
 	if err != nil {
-		result.Err = fmt.Errorf("loading project: %w", err)
-		deps.Log.Error("loading compose project failed", "err", err)
-		embed := notify.BuildEmbed(notify.Report{
-			Outcome: notify.OutcomeFailure,
-			Title:   "ComposeLock: loading compose project failed",
-			Commit:  gitResult.NewCommit,
-			Branch:  cfg.Branch,
-			Err:     result.Err,
-		})
-		result.Notification = &embed
-		return result
+		return abortBeforeUp(ctx, deps, result, "loading compose project failed", fmt.Errorf("loading project: %w", err))
 	}
 
 	if err := compose.CheckEnvFiles(project); err != nil {
-		result.Err = err
-		deps.Log.Error("env_file check failed", "err", err)
-		embed := notify.BuildEmbed(notify.Report{
-			Outcome: notify.OutcomeFailure,
-			Title:   "ComposeLock: env_file missing",
-			Commit:  gitResult.NewCommit,
-			Branch:  cfg.Branch,
-			Err:     result.Err,
-		})
-		result.Notification = &embed
-		return result
+		return abortBeforeUp(ctx, deps, result, "env_file missing", err)
 	}
 
 	// Persisted before touching Docker so a crash here is recoverable via
 	// pending_commit on the next run.
 	now := deps.Clock.Now()
-	st.PendingCommit = gitResult.NewCommit
+	st.PendingCommit = commit
 	st.PendingSince = now
-	st.LastAttemptCommit = gitResult.NewCommit
+	st.LastAttemptCommit = commit
 	st.LastAttemptAt = now
+	if st.LastFailedCommit == commit {
+		st.LastFailedCommit = ""
+		st.LastFailedAt = time.Time{}
+	}
 	if err := deps.State.Save(st); err != nil {
-		result.Err = fmt.Errorf("saving state: %w", err)
-		return result
+		return abortBeforeUp(ctx, deps, result, "saving state failed", fmt.Errorf("saving state: %w", err))
 	}
 
 	if err := deps.Compose.Up(ctx, project); err != nil {
-		deps.Log.Error("compose up failed", "err", err)
-		st.LastFailedCommit = gitResult.NewCommit
-		st.LastFailedAt = deps.Clock.Now()
-		st.LastResult = state.ResultFailedApply
-		if saveErr := deps.State.Save(st); saveErr != nil {
-			deps.Log.Error("saving state after failed apply", "err", saveErr)
+		if ctx.Err() != nil {
+			result.Err = fmt.Errorf("compose up interrupted: %w", err)
+			return result
 		}
-		result.Err = fmt.Errorf("compose up: %w", err)
-		embed := notify.BuildEmbed(notify.Report{
-			Outcome: notify.OutcomeFailure,
-			Title:   "ComposeLock: apply failed",
-			Commit:  gitResult.NewCommit,
-			Branch:  cfg.Branch,
-			Err:     result.Err,
-		})
-		result.Notification = &embed
-		return result
+		deps.Log.Error("compose up failed, reverting", "err", err)
+		return failAndRevert(ctx, deps, st, result, fmt.Sprintf("applying %s failed: %v", shortCommit(commit), err), start)
 	}
 
 	result.Applied = true
@@ -166,7 +144,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, gitResult gi
 	result.HealthWatch = watchOpts.WatchDuration
 
 	if watchResult.Outcome == health.Healthy {
-		st.LastHealthyCommit = gitResult.NewCommit
+		st.LastHealthyCommit = commit
 		st.LastHealthyAt = deps.Clock.Now()
 		st.PendingCommit = ""
 		st.PendingSince = time.Time{}
@@ -180,7 +158,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, gitResult gi
 		embed := notify.BuildEmbed(notify.Report{
 			Outcome:     notify.OutcomeSuccess,
 			Title:       "ComposeLock: deployed successfully",
-			Commit:      gitResult.NewCommit,
+			Commit:      commit,
 			Branch:      cfg.Branch,
 			Services:    result.Services,
 			HealthWatch: watchOpts.WatchDuration,
@@ -191,11 +169,18 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, gitResult gi
 	}
 
 	deps.Log.Warn("health watch failed, reverting", "reason", watchResult.Reason)
-	st.LastFailedCommit = gitResult.NewCommit
+	return failAndRevert(ctx, deps, st, result, fmt.Sprintf("applied %s failed health watch (%s)", shortCommit(commit), watchResult.Reason), start)
+}
+
+func failAndRevert(ctx context.Context, deps Deps, st *state.State, result Result, reason string, start time.Time) Result {
+	st.LastFailedCommit = result.NewCommit
 	st.LastFailedAt = deps.Clock.Now()
 	st.LastResult = state.ResultFailedApply
+	if err := deps.State.Save(st); err != nil {
+		deps.Log.Error("saving state before revert", "err", err)
+	}
 
-	revertResult := doRevert(ctx, deps, st, gitResult.NewCommit, watchResult.Reason, start)
+	revertResult := doRevert(ctx, deps, st, result.NewCommit, reason, start)
 	result.Reverted = revertResult.Reverted
 	result.Degraded = revertResult.Degraded
 	result.RolledBackTo = revertResult.RolledBackTo
@@ -203,4 +188,33 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, gitResult gi
 	result.Notification = revertResult.Notification
 	result.HealthWatch += revertResult.HealthWatch
 	return result
+}
+
+func abortBeforeUp(ctx context.Context, deps Deps, result Result, title string, err error) Result {
+	deps.Log.Error(title, "err", err)
+	restoreCheckout(ctx, deps, result.OldCommit)
+	result.Err = err
+	if ctx.Err() != nil {
+		return result
+	}
+	embed := notify.BuildEmbed(notify.Report{
+		Outcome: notify.OutcomeFailure,
+		Title:   "ComposeLock: " + title,
+		Commit:  result.NewCommit,
+		Branch:  deps.Config.Branch,
+		Err:     err,
+	})
+	result.Notification = &embed
+	return result
+}
+
+func restoreCheckout(ctx context.Context, deps Deps, commit string) {
+	if commit == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreCheckoutTimeout)
+	defer cancel()
+	if err := deps.Git.Checkout(ctx, commit); err != nil {
+		deps.Log.Error("restoring previous checkout failed", "commit", commit, "err", err)
+	}
 }

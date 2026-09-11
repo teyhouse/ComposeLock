@@ -72,7 +72,7 @@ func TestWatchFullWindowPasses(t *testing.T) {
 func TestWatchContainerExitsFails(t *testing.T) {
 	snap := &fakeSnapshotter{snapshots: []Snapshot{
 		{Containers: []ContainerStatus{running("c1", "web")}},
-		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateExited}}},
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateExited, ExitCode: 137}}},
 	}}
 	result, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
 	if err != nil {
@@ -145,6 +145,63 @@ func TestWatchSingleUnhealthyBlipRecovers(t *testing.T) {
 	}
 	if result.Outcome != Healthy {
 		t.Fatalf("Outcome = %v, want Healthy after recovering from a single unhealthy blip", result.Outcome)
+	}
+}
+
+func TestWatchCompletedOneShotContainerPasses(t *testing.T) {
+	migrate := ContainerStatus{ID: "c2", Service: "migrate", State: StateExited, ExitCode: 0}
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web"), migrate}},
+	}}
+	result, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if result.Outcome != Healthy {
+		t.Fatalf("Outcome = %v, want Healthy (reason: %s)", result.Outcome, result.Reason)
+	}
+}
+
+func TestWatchFailedOneShotContainerFails(t *testing.T) {
+	migrate := ContainerStatus{ID: "c2", Service: "migrate", State: StateExited, ExitCode: 1}
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web"), migrate}},
+	}}
+	result, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if result.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want Unhealthy", result.Outcome)
+	}
+}
+
+func TestEvaluate(t *testing.T) {
+	tests := []struct {
+		name      string
+		container ContainerStatus
+		want      bool
+	}{
+		{"running", running("c1", "web"), true},
+		{"completed one-shot", ContainerStatus{ID: "c1", Service: "migrate", State: StateExited, ExitCode: 0}, true},
+		{"failed one-shot", ContainerStatus{ID: "c1", Service: "migrate", State: StateExited, ExitCode: 1}, false},
+		{"restarting", ContainerStatus{ID: "c1", Service: "web", State: "restarting"}, false},
+		{"unhealthy", ContainerStatus{ID: "c1", Service: "web", State: StateRunning, Health: HealthUnhealthy}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, reason := Evaluate(Snapshot{Containers: []ContainerStatus{tt.container}})
+			if got != tt.want {
+				t.Errorf("Evaluate() = %v (%s), want %v", got, reason, tt.want)
+			}
+		})
+	}
+}
+
+func TestOutcomeZeroValueIsNotHealthy(t *testing.T) {
+	var result Result
+	if result.Outcome == Healthy {
+		t.Error("zero-value Outcome must not read as Healthy")
 	}
 }
 

@@ -2,8 +2,12 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net"
+	"net/netip"
 	"os"
 	"reflect"
 	"strings"
@@ -43,6 +47,7 @@ type Config struct {
 
 	DiscordWebhook string `json:"discord_webhook"`
 	LogFormat      string `json:"log_format"`
+	PprofListen    string `json:"pprof_listen"`
 
 	Webhook WebhookConfig `json:"webhook"`
 }
@@ -72,6 +77,7 @@ func Default() *Config {
 
 		DiscordWebhook: "",
 		LogFormat:      "json",
+		PprofListen:    "",
 
 		Webhook: WebhookConfig{
 			Listen: "127.0.0.1:8080",
@@ -91,7 +97,7 @@ func ResolvePath(flagValue string) string {
 	return defaultPath
 }
 
-func Load(path string, logger *slog.Logger) (*Config, error) {
+func Load(path string, overrides Overrides, logger *slog.Logger) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("reading config file %s: %w", path, err)
@@ -117,6 +123,9 @@ func Load(path string, logger *slog.Logger) (*Config, error) {
 		cfg.SchemaVersion = schemaVersion
 	}
 
+	if err := cfg.Apply(overrides); err != nil {
+		return nil, err
+	}
 	if err := cfg.Validate(logger); err != nil {
 		return nil, err
 	}
@@ -175,14 +184,38 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	if c.HealthRestartTolerance < 0 {
 		return fmt.Errorf("config: health_restart_tolerance must be >= 0")
 	}
+	if c.HealthPollIntervalSeconds < 1 {
+		return fmt.Errorf("config: health_poll_interval_seconds must be >= 1")
+	}
+	if c.HealthUnhealthyStreak < 1 {
+		return fmt.Errorf("config: health_unhealthy_streak must be >= 1")
+	}
+	if c.PollIntervalSeconds < 0 {
+		return fmt.Errorf("config: poll_interval_seconds must be >= 0")
+	}
+	if c.PprofListen != "" && !isLoopback(c.PprofListen) {
+		return fmt.Errorf("config: pprof_listen must be a loopback address, got %q", c.PprofListen)
+	}
 	return nil
+}
+
+func isLoopback(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.IsLoopback()
 }
 
 func Init(path string, force bool) error {
 	if !force {
 		if _, err := os.Stat(path); err == nil {
 			return fmt.Errorf("config file %s already exists (use --force to overwrite)", path)
-		} else if !os.IsNotExist(err) {
+		} else if !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("checking config file %s: %w", path, err)
 		}
 	}
@@ -193,7 +226,7 @@ func Init(path string, force bool) error {
 	}
 	data = append(data, '\n')
 
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("writing config file %s: %w", path, err)
 	}
 	return nil

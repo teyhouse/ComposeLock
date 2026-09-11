@@ -43,39 +43,33 @@ func newSyncer(t *testing.T, responses map[string]fakeResponse) (*Syncer, *fakeR
 	}, fr
 }
 
-func TestSyncOnceNoChange(t *testing.T) {
-	s, fr := newSyncer(t, map[string]fakeResponse{
+func TestPreviewNoChange(t *testing.T) {
+	s, _ := newSyncer(t, map[string]fakeResponse{
 		"git fetch origin main":     {},
 		"git rev-parse HEAD":        {stdout: "abc123"},
 		"git rev-parse origin/main": {stdout: "abc123"},
 	})
 
-	result, err := s.SyncOnce(t.Context())
+	result, err := s.Preview(t.Context())
 	if err != nil {
-		t.Fatalf("SyncOnce: %v", err)
+		t.Fatalf("Preview: %v", err)
 	}
 	if result.Changed {
 		t.Error("expected Changed = false")
 	}
-	for _, call := range fr.calls {
-		if strings.Contains(call, "checkout") {
-			t.Errorf("unexpected checkout call on no-change path: %s", call)
-		}
-	}
 }
 
-func TestSyncOnceChange(t *testing.T) {
+func TestPreviewChangeDoesNotCheckout(t *testing.T) {
 	s, _ := newSyncer(t, map[string]fakeResponse{
 		"git fetch origin main":              {},
 		"git rev-parse HEAD":                 {stdout: "old111"},
 		"git rev-parse origin/main":          {stdout: "new222"},
 		"git diff --name-only old111 new222": {stdout: "docker-compose.yml\napp.env.example"},
-		"git checkout new222":                {},
 	})
 
-	result, err := s.SyncOnce(t.Context())
+	result, err := s.Preview(t.Context())
 	if err != nil {
-		t.Fatalf("SyncOnce: %v", err)
+		t.Fatalf("Preview: %v", err)
 	}
 	if !result.Changed {
 		t.Fatal("expected Changed = true")
@@ -94,7 +88,7 @@ func TestSyncOnceChange(t *testing.T) {
 	}
 }
 
-func TestSyncRetriesExhausted(t *testing.T) {
+func TestFetchRetriesExhausted(t *testing.T) {
 	fetchErr := errors.New("network unreachable")
 	fr := &fakeRunner{t: t, responses: map[string]fakeResponse{
 		"git fetch origin main": {err: fetchErr},
@@ -104,7 +98,7 @@ func TestSyncRetriesExhausted(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, nil))
 
-	_, err := Sync(t.Context(), s, 3, time.Millisecond, log)
+	_, err := Fetch(t.Context(), s, 3, time.Millisecond, log)
 	if err == nil {
 		t.Fatal("expected error after exhausting retries")
 	}
@@ -119,7 +113,7 @@ func TestSyncRetriesExhausted(t *testing.T) {
 	}
 }
 
-func TestSyncFailsTwiceThenSucceeds(t *testing.T) {
+func TestFetchFailsTwiceThenSucceeds(t *testing.T) {
 	attempt := 0
 	responses := map[string]fakeResponse{
 		"git rev-parse HEAD":        {stdout: "abc123"},
@@ -143,15 +137,40 @@ func TestSyncFailsTwiceThenSucceeds(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, nil))
 
-	result, err := Sync(t.Context(), s, 3, time.Millisecond, log)
+	result, err := Fetch(t.Context(), s, 3, time.Millisecond, log)
 	if err != nil {
-		t.Fatalf("Sync: %v", err)
+		t.Fatalf("Fetch: %v", err)
 	}
 	if result.Changed {
 		t.Error("expected Changed = false")
 	}
 	if attempt != 3 {
 		t.Errorf("fetch attempted %d times, want 3 (2 failures + 1 success)", attempt)
+	}
+}
+
+func TestFetchZeroAttemptsStillTriesOnce(t *testing.T) {
+	s, fr := newSyncer(t, map[string]fakeResponse{
+		"git fetch origin main":     {},
+		"git rev-parse HEAD":        {stdout: "abc123"},
+		"git rev-parse origin/main": {stdout: "abc123"},
+	})
+
+	if _, err := Fetch(t.Context(), s, 0, 0, slog.New(slog.DiscardHandler)); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if len(fr.calls) == 0 {
+		t.Error("expected at least one fetch attempt")
+	}
+}
+
+func TestEnvQuotesSSHKeyPath(t *testing.T) {
+	s := &Syncer{SSHKey: "/keys/deploy key's id"}
+
+	got := s.env()
+	want := `GIT_SSH_COMMAND=ssh -i '/keys/deploy key'\''s id' -o IdentitiesOnly=yes`
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("env() = %q, want [%q]", got, want)
 	}
 }
 

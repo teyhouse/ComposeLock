@@ -32,7 +32,7 @@ func TestLoadDefaults(t *testing.T) {
 	}`))
 
 	var buf bytes.Buffer
-	cfg, err := Load(path, testLogger(&buf))
+	cfg, err := Load(path, Overrides{}, testLogger(&buf))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestLoadUnknownFieldWarns(t *testing.T) {
 	}`))
 
 	var buf bytes.Buffer
-	if _, err := Load(path, testLogger(&buf)); err != nil {
+	if _, err := Load(path, Overrides{}, testLogger(&buf)); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 
@@ -81,6 +81,10 @@ func TestLoadValidationErrors(t *testing.T) {
 		{"negative retry_attempts", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "retry_attempts": 0}`},
 		{"negative retry_delay", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "retry_delay_seconds": -1}`},
 		{"negative restart tolerance", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "health_restart_tolerance": -1}`},
+		{"zero health poll interval", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "health_poll_interval_seconds": 0}`},
+		{"zero unhealthy streak", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "health_unhealthy_streak": 0}`},
+		{"negative poll interval", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "poll_interval_seconds": -1}`},
+		{"public pprof listener", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "pprof_listen": "0.0.0.0:6060"}`},
 	}
 
 	for _, tt := range tests {
@@ -88,7 +92,7 @@ func TestLoadValidationErrors(t *testing.T) {
 			dir := t.TempDir()
 			path := writeConfig(t, dir, []byte(tt.json))
 			var buf bytes.Buffer
-			if _, err := Load(path, testLogger(&buf)); err == nil {
+			if _, err := Load(path, Overrides{}, testLogger(&buf)); err == nil {
 				t.Fatal("expected validation error, got nil")
 			}
 		})
@@ -105,7 +109,7 @@ func TestLoadZeroHealthWatchWarns(t *testing.T) {
 	}`))
 
 	var buf bytes.Buffer
-	if _, err := Load(path, testLogger(&buf)); err != nil {
+	if _, err := Load(path, Overrides{}, testLogger(&buf)); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("health_watch_seconds")) {
@@ -120,11 +124,13 @@ func TestApplyOverrides(t *testing.T) {
 	retryDelay := 45 * time.Second
 	tolerance := 2
 
-	cfg.Apply(Overrides{
+	if err := cfg.Apply(Overrides{
 		Branch:           &branch,
 		RetryDelay:       &retryDelay,
 		RestartTolerance: &tolerance,
-	})
+	}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
 
 	if cfg.Branch != "develop" {
 		t.Errorf("Branch = %q, want %q", cfg.Branch, "develop")
@@ -137,6 +143,61 @@ func TestApplyOverrides(t *testing.T) {
 	}
 	if cfg.Remote != "origin" {
 		t.Errorf("Remote = %q, want unchanged default %q", cfg.Remote, "origin")
+	}
+}
+
+func TestApplyRejectsSubSecondDurations(t *testing.T) {
+	cfg := Default()
+	half := 500 * time.Millisecond
+
+	if err := cfg.Apply(Overrides{HealthInterval: &half}); err == nil {
+		t.Fatal("expected an error for a sub-second duration")
+	}
+	if cfg.HealthPollIntervalSeconds != 5 {
+		t.Errorf("HealthPollIntervalSeconds = %d, want default 5 kept", cfg.HealthPollIntervalSeconds)
+	}
+}
+
+func TestLoadValidatesOverrides(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), []byte(`{
+		"repo_path": ".",
+		"compose_file": "./docker-compose.yml",
+		"project_name": "my-stack"
+	}`))
+
+	zero := 0
+	negative := -time.Minute
+	tests := []struct {
+		name      string
+		overrides Overrides
+	}{
+		{"zero retry attempts", Overrides{RetryAttempts: &zero}},
+		{"negative health watch", Overrides{HealthWatch: &negative}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if _, err := Load(path, tt.overrides, testLogger(&buf)); err == nil {
+				t.Fatal("expected validation error for override, got nil")
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsLoopbackPprofListener(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:6060", "localhost:6060", "[::1]:6060"} {
+		t.Run(addr, func(t *testing.T) {
+			path := writeConfig(t, t.TempDir(), []byte(`{
+				"repo_path": ".",
+				"compose_file": "./docker-compose.yml",
+				"project_name": "my-stack",
+				"pprof_listen": "`+addr+`"
+			}`))
+			var buf bytes.Buffer
+			if _, err := Load(path, Overrides{}, testLogger(&buf)); err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+		})
 	}
 }
 
@@ -180,5 +241,20 @@ func TestInitRefusesToOverwrite(t *testing.T) {
 	}
 	if cfg.ProjectName != "my-stack" {
 		t.Errorf("scaffolded ProjectName = %q, want %q", cfg.ProjectName, "my-stack")
+	}
+}
+
+func TestInitWritesPrivateFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "composelock.json")
+	if err := Init(path, false); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("config file mode = %o, want 600", perm)
 	}
 }

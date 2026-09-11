@@ -1,9 +1,11 @@
 package compose
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -21,13 +23,11 @@ type Service struct {
 }
 
 func New() (*Service, error) {
-	var discard bytes.Buffer
-
 	// The SDK's own progress output defaults to os.Stdout/os.Stderr, which
 	// would interleave with our JSON log stream and break log parsing.
 	dockerCLI, err := command.NewDockerCli(
-		command.WithOutputStream(&discard),
-		command.WithErrorStream(&discard),
+		command.WithOutputStream(io.Discard),
+		command.WithErrorStream(io.Discard),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("creating docker cli: %w", err)
@@ -57,8 +57,8 @@ func (s *Service) LoadProject(ctx context.Context, composeFile, projectName stri
 
 func (s *Service) Up(ctx context.Context, project *types.Project) error {
 	if err := s.compose.Up(ctx, project, api.UpOptions{
-		Create: api.CreateOptions{},
-		Start:  api.StartOptions{},
+		Create: api.CreateOptions{RemoveOrphans: true},
+		Start:  api.StartOptions{Project: project},
 	}); err != nil {
 		return fmt.Errorf("compose up: %w", err)
 	}
@@ -98,7 +98,7 @@ func CheckEnvFiles(project *types.Project) error {
 				path = filepath.Join(project.WorkingDir, path)
 			}
 			if _, err := os.Stat(path); err != nil {
-				if os.IsNotExist(err) {
+				if errors.Is(err, fs.ErrNotExist) {
 					return fmt.Errorf("env_file not found: %s (referenced by service %q)", path, name)
 				}
 				return fmt.Errorf("checking env_file %s (referenced by service %q): %w", path, name, err)

@@ -23,14 +23,12 @@ func newLogger(format string, out io.Writer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(out, nil))
 }
 
-func loadConfig(f *cliFlags, bootLogger *slog.Logger) (*config.Config, string, error) {
-	path := config.ResolvePath(f.configPath)
-	cfg, err := config.Load(path, bootLogger)
+func loadConfig(f *cliFlags, bootLogger *slog.Logger) (*config.Config, error) {
+	cfg, err := config.Load(config.ResolvePath(f.configPath), f.overrides(), bootLogger)
 	if err != nil {
-		return nil, path, fmt.Errorf("loading config: %w", err)
+		return nil, fmt.Errorf("loading config: %w", err)
 	}
-	cfg.Apply(f.overrides())
-	return cfg, path, nil
+	return cfg, nil
 }
 
 func buildDeps(cfg *config.Config, log *slog.Logger) (reconcile.Deps, error) {
@@ -57,10 +55,10 @@ func buildDeps(cfg *config.Config, log *slog.Logger) (reconcile.Deps, error) {
 	}, nil
 }
 
-func setup(f *cliFlags) (*config.Config, reconcile.Deps, int) {
+func setup(f *cliFlags, writesState bool) (*config.Config, reconcile.Deps, int) {
 	bootLogger := newLogger("json", os.Stdout)
 
-	cfg, _, err := loadConfig(f, bootLogger)
+	cfg, err := loadConfig(f, bootLogger)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return nil, reconcile.Deps{}, 2
@@ -75,8 +73,14 @@ func setup(f *cliFlags) (*config.Config, reconcile.Deps, int) {
 	}
 
 	if _, err := deps.State.Load(); err != nil {
-		fmt.Fprintln(os.Stderr, fmt.Errorf("state file unwritable: %w", err))
+		fmt.Fprintln(os.Stderr, fmt.Errorf("reading state: %w", err))
 		return nil, reconcile.Deps{}, 2
+	}
+	if writesState {
+		if err := state.CheckWritable(cfg.StateFile); err != nil {
+			fmt.Fprintln(os.Stderr, fmt.Errorf("state file unwritable: %w", err))
+			return nil, reconcile.Deps{}, 2
+		}
 	}
 
 	return cfg, deps, 0

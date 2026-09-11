@@ -7,8 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -19,15 +22,40 @@ func sign(secret string, body []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
+func startWorker(t *testing.T, s *Server) {
+	t.Helper()
+	var wg sync.WaitGroup
+	wg.Go(func() { s.processTriggers(t.Context()) })
+	t.Cleanup(wg.Wait)
+}
+
 func testServer(t *testing.T, secret string, reconciled chan<- struct{}) *Server {
 	t.Helper()
-	return &Server{
-		Path:   "/webhook",
-		Secret: secret,
-		Reconcile: func(_ context.Context) {
-			reconciled <- struct{}{}
-		},
-		Log: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	s := New(Config{Path: "/webhook", Secret: secret}, func(context.Context) {
+		reconciled <- struct{}{}
+	}, slog.New(slog.DiscardHandler))
+	startWorker(t, s)
+	return s
+}
+
+func waitFor(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+func postEmpty(t *testing.T, url string) {
+	t.Helper()
+	resp, err := http.Post(url, "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
 	}
 }
 
@@ -51,11 +79,7 @@ func TestWebhookValidSignatureAccepted(t *testing.T) {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
 	}
 
-	select {
-	case <-reconciled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Reconcile was not invoked")
-	}
+	waitFor(t, reconciled, "Reconcile to be invoked")
 }
 
 func TestWebhookInvalidSignatureRejected(t *testing.T) {
@@ -108,19 +132,74 @@ func TestWebhookNoSecretSkipsValidation(t *testing.T) {
 	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 
-	resp, err := http.Post(srv.URL+"/webhook", "application/json", bytes.NewReader([]byte(`{}`)))
-	if err != nil {
-		t.Fatalf("request: %v", err)
-	}
-	defer resp.Body.Close()
+	postEmpty(t, srv.URL+"/webhook")
+	waitFor(t, reconciled, "Reconcile to be invoked")
+}
 
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
+func TestWebhookCoalescesTriggersWhileReconciling(t *testing.T) {
+	started := make(chan struct{}, 10)
+	release := make(chan struct{})
+	s := New(Config{Path: "/webhook"}, func(ctx context.Context) {
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	}, slog.New(slog.DiscardHandler))
+	startWorker(t, s)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	postEmpty(t, srv.URL+"/webhook")
+	waitFor(t, started, "first reconcile")
+
+	for range 3 {
+		postEmpty(t, srv.URL+"/webhook")
 	}
+	release <- struct{}{}
+	waitFor(t, started, "follow-up reconcile for pushes received mid-run")
+	release <- struct{}{}
 
 	select {
-	case <-reconciled:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Reconcile was not invoked")
+	case <-started:
+		t.Fatal("expected pushes received during a reconcile to coalesce into a single follow-up run")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestServeWaitsForInFlightReconcileOnShutdown(t *testing.T) {
+	started := make(chan struct{}, 1)
+	var finished atomic.Bool
+	s := New(Config{Path: "/webhook"}, func(ctx context.Context) {
+		started <- struct{}{}
+		<-ctx.Done()
+		finished.Store(true)
+	}, slog.New(slog.DiscardHandler))
+
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Serve(ctx, ln) }()
+
+	postEmpty(t, "http://"+ln.Addr().String()+"/webhook")
+	waitFor(t, started, "reconcile to start")
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return after shutdown")
+	}
+	if !finished.Load() {
+		t.Error("Serve returned before the in-flight reconcile finished")
 	}
 }
