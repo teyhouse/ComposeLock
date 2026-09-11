@@ -174,25 +174,30 @@ ComposeLock follows [Semantic Versioning](https://semver.org). It is
 currently `0.y.z`: the config format, CLI flags, and state file layout
 may still change without a major bump.
 
-The `VERSION` file at the repository root holds the current
-`MAJOR.MINOR` line, for example `0.1`. It is bumped by hand when a change
-is significant enough to deserve a new line, a breaking config or CLI
-change, for instance. The patch number is not stored anywhere: CI derives
-it automatically from the highest existing tag on that line, so
-`v0.1.0`, `v0.1.1`, `v0.1.2`, ... are created without anyone tagging by
-hand. Bumping `VERSION` to `0.2` starts a fresh `v0.2.0`.
+The `VERSION` file at the repository root always holds the version that
+will be used for the *next* release, for example `0.1.1`. Nobody needs to
+touch it for routine changes: every release workflow run tags and
+publishes exactly what is in `VERSION`, then increments the patch number
+and commits `VERSION` back to `main` for next time. Patch releases are
+therefore fully automatic.
+
+Bump `VERSION` by hand only when a change is significant enough to
+deserve a new major or minor line, a breaking config or CLI change, for
+instance. Set it to whatever should be released next (`0.2.0`, `1.0.0`,
+...) and commit it; the next relevant push releases exactly that version
+and resumes auto-incrementing the patch from there.
 
 Once the config format, CLI surface, and state file layout are
-considered stable, `VERSION` moves to `1.0`.
+considered stable, bump `VERSION` to `1.0.0`.
 
 ## Continuous integration and releases
 
 Every push to `main` that touches Go code (or `go.mod`/`go.sum`/the
-`Makefile`) runs `go vet`, `staticcheck`, the full test suite under the
-race detector, and `govulncheck`. If those pass, a `linux/amd64` binary
-is built, tagged with the next version (see Versioning above), and
-published as a new GitHub Release. Pull requests against `main` run the
-same checks without publishing anything.
+`Makefile`/`VERSION`) runs `go vet`, `staticcheck`, the full test suite
+under the race detector, and `govulncheck`. If those pass, a
+`linux/amd64` binary is built, tagged with the version from `VERSION`
+(see Versioning above), and published as a new GitHub Release. Pull
+requests against `main` run the same checks without publishing anything.
 
 See `.github/workflows/ci.yml`.
 
