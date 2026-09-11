@@ -13,7 +13,7 @@ LDFLAGS := -s -w \
 GOOS   ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: build run test lint vuln fmt tidy clean install
+.PHONY: build run test smoke lint vuln fmt tidy clean install
 
 build:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
@@ -23,6 +23,9 @@ run: build
 
 test:
 	go test -race -shuffle=on ./...
+
+smoke:
+	./scripts/smoke.sh
 
 lint:
 	go vet ./...

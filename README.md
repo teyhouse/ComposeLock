@@ -61,6 +61,7 @@ Produces `bin/composelock`. Other targets:
 
 ```sh
 make test     # go test -race -shuffle=on ./...
+make smoke    # end-to-end run against the local Docker daemon
 make lint     # go vet + staticcheck
 make vuln     # govulncheck
 make fmt      # gofmt
@@ -180,6 +181,27 @@ Notes for cron specifically:
   to parse cron output at all.
 - Do not run `composelock poll` from cron. `poll` is a long-running loop
   and will simply pile up one process per cron tick.
+
+## Smoke test
+
+`make smoke` runs the real binary end to end against the local Docker
+daemon. It creates a throwaway Git origin and a two-service stack
+(project `composelock-smoke`, image `alpine:3.22`), then deploys, crashes
+and reverts, skips the known-bad commit, trips the `env_file` check,
+fails a Git fetch, and ends DEGRADED. The containers and the work
+directory are removed afterwards.
+
+To check Discord notifications as well, pass a webhook through the
+environment. It is only written into the generated config file, never
+into the repository:
+
+```sh
+COMPOSELOCK_SMOKE_DISCORD_WEBHOOK='https://discord.com/api/webhooks/...' make smoke
+```
+
+Six notifications arrive: deployed, reverted, `env_file` failure,
+deployed, git sync failed, DEGRADED. Set `SMOKE_KEEP=1` to keep the work
+directory and its logs.
 
 ## Versioning
 
