@@ -64,6 +64,26 @@ func TestBuildEmbedFields(t *testing.T) {
 	}
 }
 
+func TestBuildEmbedRoundsDuration(t *testing.T) {
+	tests := []struct {
+		duration time.Duration
+		want     string
+	}{
+		{10906176203 * time.Nanosecond, "11s"},
+		{5*time.Minute + 3400*time.Millisecond, "5m3s"},
+		{340123456 * time.Nanosecond, "340ms"},
+		{0, "0s"},
+	}
+	for _, tt := range tests {
+		embed := BuildEmbed(Report{Outcome: OutcomeSuccess, Duration: tt.duration})
+		for _, f := range embed.Fields {
+			if f.Name == "Duration" && f.Value != tt.want {
+				t.Errorf("Duration %v: field = %q, want %q", tt.duration, f.Value, tt.want)
+			}
+		}
+	}
+}
+
 func TestBuildEmbedTruncatesLongError(t *testing.T) {
 	longErr := errors.New(string(bytes.Repeat([]byte("x"), maxErrorFieldLen+50)))
 	embed := BuildEmbed(Report{Outcome: OutcomeFailure, Err: longErr})
@@ -94,8 +114,8 @@ func TestNotifierSendPostsPayload(t *testing.T) {
 	if len(received.Embeds) != 1 {
 		t.Fatalf("received %d embeds, want 1", len(received.Embeds))
 	}
-	if received.Embeds[0].Title != "Deployed" {
-		t.Errorf("posted title = %q, want %q", received.Embeds[0].Title, "Deployed")
+	if received.Embeds[0].Title != "✅ Deployed" {
+		t.Errorf("posted title = %q, want %q", received.Embeds[0].Title, "✅ Deployed")
 	}
 }
 

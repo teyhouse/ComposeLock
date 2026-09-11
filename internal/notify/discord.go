@@ -44,6 +44,19 @@ func (o Outcome) color() Color {
 	}
 }
 
+func (o Outcome) icon() string {
+	switch o {
+	case OutcomeSuccess:
+		return "✅"
+	case OutcomeRecovered:
+		return "⚠️"
+	case OutcomeDryRun:
+		return "🔍"
+	default:
+		return "❌"
+	}
+}
+
 type Field struct {
 	Name   string `json:"name"`
 	Value  string `json:"value"`
@@ -103,7 +116,7 @@ func BuildEmbed(r Report) Embed {
 			Inline: true,
 		})
 	}
-	fields = append(fields, Field{Name: "Duration", Value: r.Duration.String(), Inline: true})
+	fields = append(fields, Field{Name: "Duration", Value: formatDuration(r.Duration), Inline: true})
 
 	if r.Err != nil {
 		fields = append(fields, Field{Name: "Error", Value: truncate(r.Err.Error(), maxErrorFieldLen)})
@@ -112,11 +125,23 @@ func BuildEmbed(r Report) Embed {
 		fields = append(fields, Field{Name: "Stderr", Value: truncate(r.StderrTail, maxErrorFieldLen)})
 	}
 
+	title := r.Outcome.icon()
+	if r.Title != "" {
+		title += " " + r.Title
+	}
+
 	return Embed{
-		Title:  r.Title,
+		Title:  title,
 		Color:  int(r.Outcome.color()),
 		Fields: fields,
 	}
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return d.Round(time.Second).String()
 }
 
 func orDash(s string) string {
