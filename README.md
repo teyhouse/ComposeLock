@@ -1,11 +1,13 @@
+<p align="center">
+  <img src="assets/logo.png" alt="ComposeLock logo" width="320">
+</p>
+
 # ComposeLock
 
 [![CI](https://github.com/teyhouse/ComposeLock/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/teyhouse/ComposeLock/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/teyhouse/ComposeLock)](https://github.com/teyhouse/ComposeLock/releases/latest)
 [![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
-
-<img src="assets/logo.png" alt="ComposeLock logo" width="320">
 
 ComposeLock is a small Go CLI that keeps a Docker Compose stack in sync
 with a Git repository. It replaces manual `git pull && docker compose up`
