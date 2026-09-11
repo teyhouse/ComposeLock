@@ -228,13 +228,16 @@ considered stable, bump `VERSION` to `1.0.0`.
 ## Continuous integration and releases
 
 Every push to `main` that touches Go code (or `go.mod`/`go.sum`/the
-`Makefile`/`VERSION`) runs `go vet`, `staticcheck`, the full test suite
-under the race detector, and `govulncheck`. If those pass, a
-`linux/amd64` binary is built, tagged with the version from `VERSION`
-(see Versioning above), and published as a new GitHub Release. Pull
-requests against `main` run the same checks without publishing anything.
+`Makefile`) runs `go vet`, `staticcheck`, the full test suite
+under the race detector, and `govulncheck`. Pull requests against
+`main` run the same checks.
 
-See `.github/workflows/ci.yml`.
+Releases are manual: trigger them via the **Run workflow** button on
+the Release workflow, or push a version tag (e.g. `git tag v0.1.2 && git push origin v0.1.2`).
+The Release workflow reads `VERSION`, builds a `linux/amd64` binary,
+publishes a GitHub Release, then bumps `VERSION` for the next patch.
+
+See `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
 
 ## License
 
