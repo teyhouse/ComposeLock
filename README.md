@@ -214,6 +214,34 @@ still resolve correctly, since the host daemon (not this container)
 creates those containers. Every tagged release publishes this image;
 build it locally instead with `make image`.
 
+### `env_file:` paths outside the mounted directory
+
+If a service in the target compose file has an `env_file:` pointing
+somewhere other than inside the mounted data directory, mount that path
+too, at the identical location. `CheckEnvFiles` and the Compose SDK read
+`env_file:` contents from inside this container, before anything talks
+to the Docker daemon a path that only exists on the host, unmounted,
+fails with `env file ... not found` even though `ls` on the host finds
+it fine. For example, if `docker-compose.yml` has:
+
+```yaml
+services:
+  traefik:
+    env_file:
+      - /share/secrets/traefik.env
+```
+
+add a matching mount:
+
+```sh
+docker run -d --name composelock \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /share/CACHEDEV1_DATA/composelock:/share/CACHEDEV1_DATA/composelock \
+  -v /share/secrets/traefik.env:/share/secrets/traefik.env:ro \
+  ghcr.io/teyhouse/composelock:latest \
+  --config /share/CACHEDEV1_DATA/composelock/composelock.json poll
+```
+
 ## Smoke test
 
 `make smoke` runs the real binary end to end against the local Docker
