@@ -81,6 +81,7 @@ type Report struct {
 	RepoURL     string
 	Branch      string
 	Services    []string
+	Stacks      []string
 	HealthWatch time.Duration
 	Duration    time.Duration
 	Err         error
@@ -108,6 +109,9 @@ func BuildEmbed(r Report) Embed {
 		{Name: "Commit", Value: orDash(commitValue), Inline: true},
 		{Name: "Branch", Value: orDash(r.Branch), Inline: true},
 		{Name: "Services", Value: services, Inline: true},
+	}
+	if len(r.Stacks) > 0 {
+		fields = append(fields, Field{Name: "Stacks", Value: strings.Join(r.Stacks, ", "), Inline: true})
 	}
 	if r.HealthWatch > 0 {
 		fields = append(fields, Field{

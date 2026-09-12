@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
@@ -44,13 +45,13 @@ func New() (*Service, error) {
 	return &Service{compose: svc, cli: dockerCLI}, nil
 }
 
-func (s *Service) LoadProject(ctx context.Context, composeFile, projectName string) (*types.Project, error) {
+func (s *Service) LoadProject(ctx context.Context, composeFiles []string, projectName string) (*types.Project, error) {
 	project, err := s.compose.LoadProject(ctx, api.ProjectLoadOptions{
-		ConfigPaths: []string{composeFile},
+		ConfigPaths: composeFiles,
 		ProjectName: projectName,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("loading compose project %s: %w", composeFile, err)
+		return nil, fmt.Errorf("loading compose project %s: %w", strings.Join(composeFiles, ", "), err)
 	}
 	return project, nil
 }

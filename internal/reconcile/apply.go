@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/compose-spec/compose-go/v2/types"
+
 	"github.com/teyhouse/ComposeLock/internal/compose"
+	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/git"
 	"github.com/teyhouse/ComposeLock/internal/health"
 	"github.com/teyhouse/ComposeLock/internal/notify"
@@ -45,8 +49,8 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		return result
 	}
 
-	if !composeFileChanged(cfg.RepoPath, cfg.ComposeFile, gitResult.ChangedFiles) {
-		deps.Log.Info("compose file unchanged, skipping apply",
+	if !relevantChange(cfg, gitResult.ChangedFiles) {
+		deps.Log.Info("compose file(s) unchanged, skipping apply",
 			"commit", gitResult.NewCommit, "changed_files", gitResult.ChangedFiles)
 		result.Skipped = true
 		return result
@@ -62,7 +66,12 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		return result
 	}
 
-	snap, err := deps.Health.Snapshot(ctx, cfg.ProjectName)
+	previousStacks, previousStacksErr := StacksFor(cfg)
+	if previousStacksErr != nil {
+		deps.Log.Info("no compose stacks discovered at the current checkout", "err", previousStacksErr)
+	}
+
+	liveHealthy, reason, err := evaluateLive(ctx, deps, previousStacks)
 	if err != nil {
 		deps.Log.Error("pre-flight snapshot failed", "err", err)
 		result.Err = fmt.Errorf("pre-flight snapshot: %w", err)
@@ -79,7 +88,6 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		result.Notification = &embed
 		return result
 	}
-	liveHealthy, reason := health.Evaluate(snap)
 
 	if opts.DryRun {
 		deps.Log.Info("dry run: would apply", "old_commit", gitResult.OldCommit, "new_commit", gitResult.NewCommit, "live_healthy", liveHealthy, "gate_reason", reason)
@@ -88,7 +96,11 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 
 	if !liveHealthy {
 		deps.Log.Warn("pre-flight gate: live stack unhealthy, not applying", "reason", reason)
-		revertResult := doRevert(ctx, deps, st, gitResult.NewCommit, "pre-flight: live stack unhealthy: "+reason, start)
+		if previousStacksErr != nil {
+			result.Err = fmt.Errorf("discovering compose stacks for pre-flight revert: %w", previousStacksErr)
+			return result
+		}
+		revertResult := doRevert(ctx, deps, st, previousStacks, gitResult.NewCommit, "pre-flight: live stack unhealthy: "+reason, start)
 		revertResult.Changed = result.Changed
 		revertResult.OldCommit = result.OldCommit
 		revertResult.NewCommit = result.NewCommit
@@ -96,10 +108,10 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		return revertResult
 	}
 
-	return applyAndWatch(ctx, deps, st, result, start)
+	return applyAndWatch(ctx, deps, st, result, previousStacks, start)
 }
 
-func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Result, start time.Time) Result {
+func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Result, previousStacks []compose.Stack, start time.Time) Result {
 	cfg := deps.Config
 	commit := result.NewCommit
 
@@ -107,13 +119,36 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 		return abortBeforeUp(ctx, deps, result, "checkout failed", err)
 	}
 
-	project, err := deps.Compose.LoadProject(ctx, cfg.ComposeFile, cfg.ProjectName)
+	stacks, err := StacksFor(cfg)
 	if err != nil {
-		return abortBeforeUp(ctx, deps, result, "loading compose project failed", fmt.Errorf("loading project: %w", err))
+		return abortBeforeUp(ctx, deps, result, "discovering compose stacks failed", err)
+	}
+	vanished := vanishedStacks(previousStacks, stacks)
+
+	changedStacks := stacks
+	if result.ChangedFiles != nil {
+		changedStacks = filterChanged(cfg.RepoPath, stacks, result.ChangedFiles)
+	}
+	if len(changedStacks) == 0 {
+		tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir")
+		deps.Log.Info("no compose stack changed, nothing to apply", "commit", commit)
+		result.Skipped = true
+		if err := promoteHealthy(deps, st, commit); err != nil {
+			result.Err = err
+		}
+		return result
 	}
 
-	if err := compose.CheckEnvFiles(project); err != nil {
-		return abortBeforeUp(ctx, deps, result, "env_file missing", err)
+	projects := make([]*types.Project, len(changedStacks))
+	for i, s := range changedStacks {
+		project, err := deps.Compose.LoadProject(ctx, s.Files, s.ProjectName)
+		if err != nil {
+			return abortBeforeUp(ctx, deps, result, "loading compose project failed", fmt.Errorf("loading project %s: %w", s.ProjectName, err))
+		}
+		if err := compose.CheckEnvFiles(project); err != nil {
+			return abortBeforeUp(ctx, deps, result, "env_file missing", err)
+		}
+		projects[i] = project
 	}
 
 	// Persisted before touching Docker so a crash here is recoverable via
@@ -131,36 +166,34 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 		return abortBeforeUp(ctx, deps, result, "saving state failed", fmt.Errorf("saving state: %w", err))
 	}
 
-	if err := deps.Compose.Up(ctx, project); err != nil {
-		if ctx.Err() != nil {
-			result.Err = fmt.Errorf("compose up interrupted: %w", err)
-			return result
+	var allServices []string
+	for i, s := range changedStacks {
+		if err := deps.Compose.Up(ctx, projects[i]); err != nil {
+			if ctx.Err() != nil {
+				result.Err = fmt.Errorf("compose up interrupted: %w", err)
+				return result
+			}
+			deps.Log.Error("compose up failed, reverting", "stack", s.ProjectName, "err", err)
+			return failAndRevert(ctx, deps, st, changedStacks, result, fmt.Sprintf("applying %s (%s) failed: %v", shortCommit(commit), s.ProjectName, err), start)
 		}
-		deps.Log.Error("compose up failed, reverting", "err", err)
-		return failAndRevert(ctx, deps, st, result, fmt.Sprintf("applying %s failed: %v", shortCommit(commit), err), start)
+		allServices = append(allServices, serviceNames(projects[i])...)
 	}
 
 	result.Applied = true
-	result.Services = serviceNames(project)
+	result.Services = allServices
+	result.Stacks = stackNames(changedStacks)
 
-	watchOpts := healthOptions(cfg, commit)
-	watchResult, err := health.Watch(ctx, deps.Health, deps.Clock, watchOpts, deps.Log)
+	watchResult, err := watchStacks(ctx, deps, changedStacks, commit)
 	if err != nil {
 		result.Err = fmt.Errorf("health watch: %w", err)
 		return result
 	}
-	result.HealthWatch = watchOpts.WatchDuration
+	result.HealthWatch = time.Duration(cfg.HealthWatchSeconds) * time.Second
 
 	if watchResult.Outcome == health.Healthy {
-		st.LastHealthyCommit = commit
-		st.LastHealthyAt = deps.Clock.Now()
-		st.PendingCommit = ""
-		st.PendingSince = time.Time{}
-		st.LastFailedCommit = ""
-		st.LastFailedAt = time.Time{}
-		st.LastResult = state.ResultSuccess
-		if err := deps.State.Save(st); err != nil {
-			result.Err = fmt.Errorf("saving state: %w", err)
+		tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir")
+		if err := promoteHealthy(deps, st, commit); err != nil {
+			result.Err = err
 			return result
 		}
 		embed := notify.BuildEmbed(notify.Report{
@@ -169,7 +202,8 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 			Commit:      commit,
 			Branch:      cfg.Branch,
 			Services:    result.Services,
-			HealthWatch: watchOpts.WatchDuration,
+			Stacks:      reportStacks(cfg, result.Stacks),
+			HealthWatch: result.HealthWatch,
 			Duration:    time.Since(start),
 		})
 		result.Notification = &embed
@@ -177,10 +211,10 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	}
 
 	deps.Log.Warn("health watch failed, reverting", "reason", watchResult.Reason)
-	return failAndRevert(ctx, deps, st, result, fmt.Sprintf("applied %s failed health watch (%s)", shortCommit(commit), watchResult.Reason), start)
+	return failAndRevert(ctx, deps, st, changedStacks, result, fmt.Sprintf("applied %s failed health watch (%s)", shortCommit(commit), watchResult.Reason), start)
 }
 
-func failAndRevert(ctx context.Context, deps Deps, st *state.State, result Result, reason string, start time.Time) Result {
+func failAndRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.Stack, result Result, reason string, start time.Time) Result {
 	st.LastFailedCommit = result.NewCommit
 	st.LastFailedAt = deps.Clock.Now()
 	st.LastResult = state.ResultFailedApply
@@ -188,7 +222,7 @@ func failAndRevert(ctx context.Context, deps Deps, st *state.State, result Resul
 		deps.Log.Error("saving state before revert", "err", err)
 	}
 
-	revertResult := doRevert(ctx, deps, st, result.NewCommit, reason, start)
+	revertResult := doRevert(ctx, deps, st, stacks, result.NewCommit, reason, start)
 	result.Reverted = revertResult.Reverted
 	result.Degraded = revertResult.Degraded
 	result.RolledBackTo = revertResult.RolledBackTo
@@ -227,16 +261,51 @@ func restoreCheckout(ctx context.Context, deps Deps, commit string) {
 	}
 }
 
-func composeFileChanged(repoPath, composeFile string, changedFiles []string) bool {
-	target := composeFile
-	if !filepath.IsAbs(target) {
-		target = filepath.Join(repoPath, target)
+func relevantChange(cfg *config.Config, changedFiles []string) bool {
+	if cfg.ComposeDir != "" {
+		return composeDirRelevant(cfg.RepoPath, cfg.ComposeDir, changedFiles)
 	}
-	target = filepath.Clean(target)
+	return composeFileChanged(cfg.RepoPath, cfg.ComposeFile, changedFiles)
+}
+
+func composeFileChanged(repoPath, composeFile string, changedFiles []string) bool {
+	return stackFilesChanged(repoPath, []string{composeFile}, changedFiles)
+}
+
+func stackFilesChanged(repoPath string, files []string, changedFiles []string) bool {
+	targets := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		targets[resolveUnderRepo(repoPath, f)] = struct{}{}
+	}
 	for _, f := range changedFiles {
-		if filepath.Clean(filepath.Join(repoPath, f)) == target {
+		if _, ok := targets[resolveUnderRepo(repoPath, f)]; ok {
 			return true
 		}
 	}
 	return false
+}
+
+func composeDirRelevant(repoPath, composeDir string, changedFiles []string) bool {
+	dir := resolveUnderRepo(repoPath, composeDir)
+	for _, f := range changedFiles {
+		abs := resolveUnderRepo(repoPath, f)
+		rel, err := filepath.Rel(dir, abs)
+		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+			continue
+		}
+		if !compose.IsComposeFile(filepath.Base(rel)) {
+			continue
+		}
+		if strings.Count(rel, string(filepath.Separator)) <= 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveUnderRepo(repoPath, p string) string {
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(repoPath, p)
+	}
+	return filepath.Clean(p)
 }

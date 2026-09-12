@@ -15,7 +15,7 @@ GOARCH ?= $(shell go env GOARCH)
 
 IMAGE ?= composelock
 
-.PHONY: build run test smoke lint vuln fmt tidy clean install image
+.PHONY: build run test smoke smoke-compose-dir lint vuln fmt tidy clean install image
 
 build:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
@@ -28,6 +28,9 @@ test:
 
 smoke:
 	./scripts/smoke.sh
+
+smoke-compose-dir:
+	./scripts/smoke-compose-dir.sh
 
 lint:
 	go vet ./...
