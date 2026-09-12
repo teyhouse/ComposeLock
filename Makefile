@@ -13,7 +13,9 @@ LDFLAGS := -s -w \
 GOOS   ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
-.PHONY: build run test smoke lint vuln fmt tidy clean install
+IMAGE ?= composelock
+
+.PHONY: build run test smoke lint vuln fmt tidy clean install image
 
 build:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
@@ -45,3 +47,8 @@ clean:
 
 install: build
 	install -m 0755 bin/$(BINARY) /usr/local/bin/$(BINARY)
+
+image:
+	docker build \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg DATE=$(DATE) \
+		-t $(IMAGE):$(VERSION) -t $(IMAGE):latest .

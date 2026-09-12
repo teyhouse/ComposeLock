@@ -38,3 +38,6 @@ go.work.sum
 # Planning docs (local only)
 architecture.md
 plan.md
+
+# Personal registry push script (local only)
+/scripts/push.sh

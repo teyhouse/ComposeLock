@@ -182,6 +182,38 @@ Notes for cron specifically:
 - Do not run `composelock poll` from cron. `poll` is a long-running loop
   and will simply pile up one process per cron tick.
 
+## Run as a container
+
+The published image bundles the binary and `git`; it talks to the
+host's Docker daemon over the mounted socket, so no `docker`/`docker
+compose` CLI, and no `git` on the host, is needed. `repo_path` must
+already be a cloned checkout. ComposeLock never clones on its own,
+so clone once using the image's own `git` before the first run:
+
+```sh
+docker run --rm \
+  -v /share/CACHEDEV1_DATA/composelock:/share/CACHEDEV1_DATA/composelock \
+  --entrypoint git ghcr.io/teyhouse/composelock:latest \
+  clone <repo-url> /share/CACHEDEV1_DATA/composelock/repo
+```
+
+Then run ComposeLock itself:
+
+```sh
+docker run -d --name composelock \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /share/CACHEDEV1_DATA/composelock:/share/CACHEDEV1_DATA/composelock \
+  ghcr.io/teyhouse/composelock:latest \
+  --config /share/CACHEDEV1_DATA/composelock/composelock.json poll
+```
+
+That one bind mount holds the repo checkout, `composelock.json`, and
+`state.json`, at the same path inside the container as on the host
+required so bind-mount paths inside the target `docker-compose.yml`
+still resolve correctly, since the host daemon (not this container)
+creates those containers. Every tagged release publishes this image;
+build it locally instead with `make image`.
+
 ## Smoke test
 
 `make smoke` runs the real binary end to end against the local Docker
@@ -235,7 +267,9 @@ under the race detector, and `govulncheck`. Pull requests against
 Releases are manual: trigger them via the **Run workflow** button on
 the Release workflow, or push a version tag (e.g. `git tag v0.1.2 && git push origin v0.1.2`).
 The Release workflow reads `VERSION`, builds a `linux/amd64` binary,
-publishes a GitHub Release, then bumps `VERSION` for the next patch.
+publishes a GitHub Release, builds and pushes the container image to
+`ghcr.io/teyhouse/composelock` (tagged with the version and `latest`),
+then bumps `VERSION` for the next patch.
 
 See `.github/workflows/ci.yml` and `.github/workflows/release.yml`.
 
