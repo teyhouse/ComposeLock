@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=$VERSION -X main.comm
     -o /out/composelock ./cmd/composelock
 
 FROM cgr.dev/chainguard/wolfi-base:latest
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache git ca-certificates openssh-client
 COPY --from=build /out/composelock /usr/local/bin/composelock
 ENTRYPOINT ["composelock"]
 CMD ["poll"]
