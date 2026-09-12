@@ -107,6 +107,7 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 	}
 
 	deadline := clock.Now().Add(opts.WatchDuration)
+	log = log.With("project", opts.ProjectName)
 	log.Info("health watch: starting",
 		"commit", opts.Commit,
 		"duration", opts.WatchDuration.String(),

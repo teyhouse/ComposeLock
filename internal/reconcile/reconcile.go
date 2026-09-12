@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
 
+	"github.com/teyhouse/ComposeLock/internal/compose"
 	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/git"
 	"github.com/teyhouse/ComposeLock/internal/health"
@@ -37,6 +39,7 @@ type Result struct {
 	NewCommit    string
 	RolledBackTo string
 	Services     []string
+	Stacks       []string
 	ChangedFiles []string
 	HealthWatch  time.Duration
 	Duration     time.Duration
@@ -46,7 +49,7 @@ type Result struct {
 }
 
 type ComposeService interface {
-	LoadProject(ctx context.Context, composeFile, projectName string) (*types.Project, error)
+	LoadProject(ctx context.Context, composeFiles []string, projectName string) (*types.Project, error)
 	Up(ctx context.Context, project *types.Project) error
 	Down(ctx context.Context, projectName string) error
 }
@@ -102,9 +105,9 @@ func reconcileLocked(ctx context.Context, opts Options, deps Deps, start time.Ti
 	return runNormal(ctx, opts, deps, st, start)
 }
 
-func healthOptions(cfg *config.Config, commit string) health.Options {
+func healthOptions(cfg *config.Config, projectName, commit string) health.Options {
 	return health.Options{
-		ProjectName:          cfg.ProjectName,
+		ProjectName:          projectName,
 		Commit:               commit,
 		WatchDuration:        time.Duration(cfg.HealthWatchSeconds) * time.Second,
 		PollInterval:         time.Duration(cfg.HealthPollIntervalSeconds) * time.Second,
@@ -122,4 +125,122 @@ func shortCommit(c string) string {
 
 func serviceNames(project *types.Project) []string {
 	return slices.Sorted(maps.Keys(project.Services))
+}
+
+func StacksFor(cfg *config.Config) ([]compose.Stack, error) {
+	if cfg.ComposeDir != "" {
+		return compose.Discover(resolveUnderRepo(cfg.RepoPath, cfg.ComposeDir), cfg.ProjectName)
+	}
+	return []compose.Stack{{ProjectName: cfg.ProjectName, Files: []string{cfg.ComposeFile}}}, nil
+}
+
+func stackNames(stacks []compose.Stack) []string {
+	names := make([]string, len(stacks))
+	for i, s := range stacks {
+		names[i] = s.ProjectName
+	}
+	return names
+}
+
+func reportStacks(cfg *config.Config, names []string) []string {
+	if cfg.ComposeDir == "" {
+		return nil
+	}
+	return names
+}
+
+func filterChanged(repoPath string, stacks []compose.Stack, changedFiles []string) []compose.Stack {
+	changedDirs := changedComposeDirs(repoPath, changedFiles)
+	var changed []compose.Stack
+	for _, s := range stacks {
+		if s.Dir == "" {
+			if stackFilesChanged(repoPath, s.Files, changedFiles) {
+				changed = append(changed, s)
+			}
+			continue
+		}
+		if _, ok := changedDirs[resolveUnderRepo(repoPath, s.Dir)]; ok {
+			changed = append(changed, s)
+		}
+	}
+	return changed
+}
+
+func changedComposeDirs(repoPath string, changedFiles []string) map[string]struct{} {
+	dirs := make(map[string]struct{}, len(changedFiles))
+	for _, f := range changedFiles {
+		if !compose.IsComposeFile(filepath.Base(f)) {
+			continue
+		}
+		dirs[filepath.Dir(resolveUnderRepo(repoPath, f))] = struct{}{}
+	}
+	return dirs
+}
+
+func intersectByProjectName(a, b []compose.Stack) []compose.Stack {
+	names := make(map[string]struct{}, len(b))
+	for _, s := range b {
+		names[s.ProjectName] = struct{}{}
+	}
+	var out []compose.Stack
+	for _, s := range a {
+		if _, ok := names[s.ProjectName]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func vanishedStacks(previous, current []compose.Stack) []compose.Stack {
+	currentNames := make(map[string]struct{}, len(current))
+	for _, s := range current {
+		currentNames[s.ProjectName] = struct{}{}
+	}
+	var gone []compose.Stack
+	for _, s := range previous {
+		if _, ok := currentNames[s.ProjectName]; !ok {
+			gone = append(gone, s)
+		}
+	}
+	return gone
+}
+
+func tearDownStacks(ctx context.Context, deps Deps, stacks []compose.Stack, reason string) {
+	for _, s := range stacks {
+		deps.Log.Info("tearing down compose stack", "project", s.ProjectName, "reason", reason)
+		if err := deps.Compose.Down(ctx, s.ProjectName); err != nil {
+			deps.Log.Error("tearing down compose stack failed", "project", s.ProjectName, "err", err)
+		}
+	}
+}
+
+func evaluateLive(ctx context.Context, deps Deps, stacks []compose.Stack) (bool, string, error) {
+	names := stackNames(stacks)
+	if len(names) == 0 {
+		names = []string{deps.Config.ProjectName}
+	}
+	for _, name := range names {
+		snap, err := deps.Health.Snapshot(ctx, name)
+		if err != nil {
+			return false, "", fmt.Errorf("snapshot of %s: %w", name, err)
+		}
+		if healthy, reason := health.Evaluate(snap); !healthy {
+			return false, name + ": " + reason, nil
+		}
+	}
+	return true, "", nil
+}
+
+func promoteHealthy(deps Deps, st *state.State, commit string) error {
+	st.LastHealthyCommit = commit
+	st.LastHealthyAt = deps.Clock.Now()
+	st.PendingCommit = ""
+	st.PendingSince = time.Time{}
+	st.LastFailedCommit = ""
+	st.LastFailedAt = time.Time{}
+	st.LastResult = state.ResultSuccess
+	if err := deps.State.Save(st); err != nil {
+		return fmt.Errorf("saving state: %w", err)
+	}
+	return nil
 }

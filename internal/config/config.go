@@ -30,6 +30,7 @@ type Config struct {
 	Remote      string `json:"remote"`
 	Branch      string `json:"branch"`
 	ComposeFile string `json:"compose_file"`
+	ComposeDir  string `json:"compose_dir"`
 	ProjectName string `json:"project_name"`
 	SSHKey      string `json:"ssh_key"`
 
@@ -126,6 +127,12 @@ func Load(path string, overrides Overrides, logger *slog.Logger) (*Config, error
 	if err := cfg.Apply(overrides); err != nil {
 		return nil, err
 	}
+
+	composeFileExplicit := rawFieldString(raw, "compose_file") != "" || overrides.ComposeFile != nil
+	if cfg.ComposeDir != "" && composeFileExplicit {
+		logger.Warn("compose_dir is set: ignoring compose_file")
+	}
+
 	if err := cfg.Validate(logger); err != nil {
 		return nil, err
 	}
@@ -142,7 +149,7 @@ func warnUnknownFields(raw map[string]json.RawMessage, logger *slog.Logger) {
 }
 
 func validateRequired(raw map[string]json.RawMessage) error {
-	for _, field := range []string{"repo_path", "compose_file", "project_name"} {
+	for _, field := range []string{"repo_path", "project_name"} {
 		val, ok := raw[field]
 		if !ok {
 			return fmt.Errorf("config: %s is required", field)
@@ -152,7 +159,22 @@ func validateRequired(raw map[string]json.RawMessage) error {
 			return fmt.Errorf("config: %s is required", field)
 		}
 	}
+	if rawFieldString(raw, "compose_file") == "" && rawFieldString(raw, "compose_dir") == "" {
+		return fmt.Errorf("config: one of compose_file or compose_dir is required")
+	}
 	return nil
+}
+
+func rawFieldString(raw map[string]json.RawMessage, field string) string {
+	val, ok := raw[field]
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(val, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 func knownTopLevelFields() map[string]bool {

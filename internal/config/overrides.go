@@ -11,6 +11,7 @@ type Overrides struct {
 	Remote      *string
 	Branch      *string
 	ComposeFile *string
+	ComposeDir  *string
 	ProjectName *string
 	StateFile   *string
 	SSHKey      *string
@@ -30,6 +31,7 @@ func (c *Config) Apply(o Overrides) error {
 	setString(&c.Remote, o.Remote)
 	setString(&c.Branch, o.Branch)
 	setString(&c.ComposeFile, o.ComposeFile)
+	setString(&c.ComposeDir, o.ComposeDir)
 	setString(&c.ProjectName, o.ProjectName)
 	setString(&c.StateFile, o.StateFile)
 	setString(&c.SSHKey, o.SSHKey)

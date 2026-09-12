@@ -89,7 +89,7 @@ Minimum fields to edit:
 | Field           | Meaning                                    |
 |-----------------|---------------------------------------------|
 | `repo_path`     | Path to the local Git checkout               |
-| `compose_file`  | Path to the `docker-compose.yml` to apply    |
+| `compose_file`  | Path to the `docker-compose.yml` to apply (or use `compose_dir` instead, see below) |
 | `project_name`  | Compose project name (required by the SDK)   |
 
 Everything else has a sane default:
@@ -98,6 +98,7 @@ Everything else has a sane default:
 |---------------------------------|-----------------------|-------------------------------------------------|
 | `remote`                        | `origin`              | Git remote to fetch                             |
 | `branch`                        | `main`                | Branch to track                                 |
+| `compose_dir`                   | (disabled)            | Directory of compose files; overrides `compose_file` when set, see below |
 | `ssh_key`                       | (system agent)        | SSH key for Git, if not using the agent         |
 | `state_file`                    | `./state.json`        | Where reconcile state is stored                 |
 | `retry_attempts`                | `3`                   | Git fetch retry attempts                        |
@@ -121,6 +122,77 @@ seconds (`30s`, `5m`).
 
 The config file can hold `webhook.secret` and `discord_webhook`, so
 `--init` creates it with mode `0600`.
+
+### Multiple compose files (`compose_dir`)
+
+Instead of one `compose_file`, point `compose_dir` at a directory of
+compose files. When set, `compose_dir` takes precedence and `compose_file`
+is ignored (a warning is logged if both are set).
+
+Discovery rule: files directly inside `compose_dir` are merged into one
+stack named `project_name`, the same way `docker compose -f a.yaml -f
+b.yaml` merges multiple files into one project. Each immediate
+subdirectory's files are merged into their own stack, named
+`project_name-<subdirectory>`. Nesting deeper than one level is never
+scanned. For example:
+
+```
+deployment/
+├── service-a.yaml
+├── service-b.yaml
+├── service-c.yml
+└── db/
+    ├── docker-compose.yaml
+    └── frontend-proxy.yaml
+```
+
+produces two stacks: `project_name` (service-a/b/c merged as one project)
+and `project_name-db`.
+
+A relative `compose_dir` is resolved against `repo_path`, so
+`"compose_dir": "deployment"` means `<repo_path>/deployment` regardless of
+which directory ComposeLock is started from.
+
+Which files are picked up:
+
+- Only `*.yaml` and `*.yml`, and only at depth 0 or 1. Dot entries are
+  skipped, so pointing `compose_dir` at a repository root does not turn
+  `.github/dependabot.yml` into a stack.
+- A YAML file whose top level is not Compose Spec shaped (it has no
+  `services:` or `include:`, and holds keys the spec does not define) is
+  some other tool's config file sitting next to a compose file, such as a
+  `prometheus.yml`. It is skipped, not merged, and does not fail the sync.
+  Empty files are skipped too.
+- Every remaining file is schema-validated on its own, before merging, so a
+  file that is meant to be a compose file but is broken fails loudly with
+  its own file name in the error instead of a generic merged-load failure.
+  Unparsable YAML fails the same way.
+- Two subdirectory names that normalize to the same project name (`my db`
+  and `my-db`) are rejected with an error, because Compose would otherwise
+  treat both as one project and remove the other's containers.
+
+Before anything is touched, the pre-flight gate snapshots every stack that
+is currently deployed, not just `project_name`, so a broken sub-stack stops
+a new commit from being applied on top of it.
+
+Only the stack(s) whose files actually changed in a commit are applied and
+health-watched, the same skip logic described above for a single
+`compose_file`, generalized per stack. A change to any `*.yaml` or `*.yml`
+at depth 0 or 1 counts as a change to that directory's stack, including a
+file the commit deleted. The changed stacks are health-watched
+concurrently, so a cycle costs about one watch window no matter how many
+stacks changed, and the first stack to fail stops the others rather than
+delaying the rollback until their windows expire.
+
+If a stack's health watch fails, only the stack(s) touched in that cycle
+revert; a stack untouched this cycle is never affected by another stack's
+failure. The revert re-applies each stack from the rollback target's own
+file list, and a stack that only exists in the failing commit is torn down,
+so the deployment ends up as the rollback target describes it.
+
+A subdirectory removed entirely has its stack torn down, but only once the
+cycle it was removed in is known to be healthy: if that cycle reverts, the
+rollback target still describes the stack and its containers stay up.
 
 ## Commands
 
@@ -220,7 +292,7 @@ If a service in the target compose file has an `env_file:` pointing
 somewhere other than inside the mounted data directory, mount that path
 too, at the identical location. `CheckEnvFiles` and the Compose SDK read
 `env_file:` contents from inside this container, before anything talks
-to the Docker daemon a path that only exists on the host, unmounted,
+to the Docker daemon. A path that only exists on the host, unmounted,
 fails with `env file ... not found` even though `ls` on the host finds
 it fine. For example, if `docker-compose.yml` has:
 
@@ -262,6 +334,19 @@ COMPOSELOCK_SMOKE_DISCORD_WEBHOOK='https://discord.com/api/webhooks/...' make sm
 Six notifications arrive: deployed, reverted, `env_file` failure,
 deployed, git sync failed, DEGRADED. Set `SMOKE_KEEP=1` to keep the work
 directory and its logs.
+
+`make smoke-compose-dir` covers `compose_dir` mode the same way: three
+independent stacks (root, `db/`, `c/`), a change touching only one stack
+(confirms the others are never recreated), a stack that crashes and
+reverts (confirms unrelated stacks stay untouched), an invalid file added
+anywhere in `compose_dir` (confirms the whole cycle fails loudly before
+touching Docker), a subdirectory removed entirely (confirms its stack is
+torn down via `Down` and that the commit is still recorded as the new
+rollback target), a non-compose YAML file next to a compose file (confirms
+it is skipped rather than failing the sync), and a compose file added to an
+existing stack that then crashes (confirms the revert re-applies that stack
+from the rollback target's file list instead of going DEGRADED). Same
+`SMOKE_KEEP`/`SMOKE_WORKDIR` knobs apply.
 
 ## Versioning
 

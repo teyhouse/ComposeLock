@@ -9,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/teyhouse/ComposeLock/internal/compose"
 	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/reconcile"
 	"github.com/teyhouse/ComposeLock/internal/state"
@@ -74,14 +75,29 @@ func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps 
 	}
 	fmt.Printf("state:\n%s\n", data)
 
+	stacks, err := reconcile.StacksFor(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "discovering compose stacks:", err)
+		stacks = []compose.Stack{{ProjectName: cfg.ProjectName}}
+	}
+
+	for _, s := range stacks {
+		if code := printStackContainers(ctx, deps, s.ProjectName); code != 0 {
+			return code
+		}
+	}
+	return 0
+}
+
+func printStackContainers(ctx context.Context, deps reconcile.Deps, projectName string) int {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	snap, err := deps.Health.Snapshot(ctx, cfg.ProjectName)
+	snap, err := deps.Health.Snapshot(ctx, projectName)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "live health snapshot:", err)
 		return 1
 	}
-	fmt.Println("live containers:")
+	fmt.Printf("live containers (%s):\n", projectName)
 	for _, c := range snap.Containers {
 		fmt.Printf("  %s (%s): state=%s health=%s restarts=%d\n", c.Service, c.ID, c.State, c.Health, c.RestartCount)
 	}

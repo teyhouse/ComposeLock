@@ -7,11 +7,15 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	ctypes "github.com/compose-spec/compose-go/v2/types"
 
+	"github.com/teyhouse/ComposeLock/internal/compose"
 	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/git"
 	"github.com/teyhouse/ComposeLock/internal/health"
@@ -22,9 +26,10 @@ import (
 // ---- fakes ----
 
 type fakeGit struct {
-	head      string
-	remote    string
-	diffFiles string // git diff --name-only output; defaults to "docker-compose.yml" when empty
+	head       string
+	remote     string
+	diffFiles  string // git diff --name-only output; defaults to "docker-compose.yml" when empty
+	onCheckout func(commit string)
 }
 
 func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ...string) ([]byte, []byte, error) {
@@ -43,20 +48,31 @@ func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ..
 		return []byte("docker-compose.yml"), nil, nil
 	case "checkout":
 		g.head = args[1]
+		if g.onCheckout != nil {
+			g.onCheckout(args[1])
+		}
 		return nil, nil, nil
 	}
 	return nil, nil, fmt.Errorf("unexpected git command: %v", args)
 }
 
-type fakeCompose struct {
-	loadErr error
-	upErrs  []error
-	onUp    func(call int)
-	project *ctypes.Project
-	upCalls int
+type loadCall struct {
+	files       []string
+	projectName string
 }
 
-func (f *fakeCompose) LoadProject(_ context.Context, _, projectName string) (*ctypes.Project, error) {
+type fakeCompose struct {
+	loadErr   error
+	upErrs    []error
+	onUp      func(call int)
+	project   *ctypes.Project
+	upCalls   int
+	loadCalls []loadCall
+	downCalls []string
+}
+
+func (f *fakeCompose) LoadProject(_ context.Context, files []string, projectName string) (*ctypes.Project, error) {
+	f.loadCalls = append(f.loadCalls, loadCall{files: files, projectName: projectName})
 	if f.loadErr != nil {
 		return nil, f.loadErr
 	}
@@ -80,17 +96,23 @@ func (f *fakeCompose) Up(ctx context.Context, _ *ctypes.Project) error {
 	return nil
 }
 
-func (f *fakeCompose) Down(context.Context, string) error { return nil }
+func (f *fakeCompose) Down(_ context.Context, projectName string) error {
+	f.downCalls = append(f.downCalls, projectName)
+	return nil
+}
 
 // fakeSnapshotter returns snapshots[i] on the i-th call, clamped to the
 // last entry once exhausted.
 type fakeSnapshotter struct {
+	mu        sync.Mutex
 	snapshots []health.Snapshot
 	err       error
 	call      int
 }
 
 func (f *fakeSnapshotter) Snapshot(context.Context, string) (health.Snapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.err != nil {
 		return health.Snapshot{}, f.err
 	}
@@ -101,6 +123,30 @@ func (f *fakeSnapshotter) Snapshot(context.Context, string) (health.Snapshot, er
 
 func snapshots(s ...health.Snapshot) *fakeSnapshotter {
 	return &fakeSnapshotter{snapshots: s}
+}
+
+type perProjectSnapshotter struct {
+	mu   sync.Mutex
+	byID map[string]*fakeSnapshotter
+}
+
+func (p *perProjectSnapshotter) set(projectName string, snap *fakeSnapshotter) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.byID == nil {
+		p.byID = map[string]*fakeSnapshotter{}
+	}
+	p.byID[projectName] = snap
+}
+
+func (p *perProjectSnapshotter) Snapshot(ctx context.Context, projectName string) (health.Snapshot, error) {
+	p.mu.Lock()
+	snap := p.byID[projectName]
+	p.mu.Unlock()
+	if snap == nil {
+		return health.Snapshot{}, fmt.Errorf("unexpected Snapshot call for project %q", projectName)
+	}
+	return snap.Snapshot(ctx, projectName)
 }
 
 func healthySnapshot() health.Snapshot {
@@ -115,10 +161,19 @@ func unhealthySnapshot() health.Snapshot {
 	}}
 }
 
-type fakeClock struct{ now time.Time }
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
 
-func (c *fakeClock) Now() time.Time { return c.now }
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
 func (c *fakeClock) Sleep(_ context.Context, d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
 	return true
 }
@@ -179,6 +234,54 @@ func withHealthy(commit string) *state.State {
 	st := state.New()
 	st.LastHealthyCommit = commit
 	return st
+}
+
+const validComposeYAML = `
+services:
+  web:
+    image: nginx:alpine
+`
+
+const invalidComposeYAML = `
+services: web
+`
+
+func writeComposeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testDirDeps(t *testing.T, g *fakeGit, compose ComposeService, snap health.Snapshotter, st *state.State, repoPath, composeDir string) (Deps, *state.MemStore) {
+	t.Helper()
+	cfg := &config.Config{
+		RepoPath:                  repoPath,
+		Remote:                    "origin",
+		Branch:                    "main",
+		ComposeDir:                composeDir,
+		ProjectName:               "test-stack",
+		RetryAttempts:             1,
+		RetryDelaySeconds:         0,
+		HealthWatchSeconds:        5,
+		HealthPollIntervalSeconds: 5,
+		HealthUnhealthyStreak:     3,
+		HealthRestartTolerance:    1,
+	}
+	store := &state.MemStore{State: st}
+	return Deps{
+		Config:   cfg,
+		Git:      &git.Syncer{Runner: g, RepoPath: cfg.RepoPath, Remote: cfg.Remote, Branch: cfg.Branch},
+		Compose:  compose,
+		Health:   snap,
+		Clock:    &fakeClock{},
+		State:    store,
+		Notifier: notify.New("", slog.New(slog.DiscardHandler)),
+		Log:      slog.New(slog.DiscardHandler),
+	}, store
 }
 
 // ---- tests ----
@@ -758,5 +861,419 @@ func TestComposeFileChanged(t *testing.T) {
 					tc.repoPath, tc.composeFile, tc.changedFiles, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReconcileDirModeMultiStackAllHealthy(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/service-a.yaml\ndeployment/db/docker-compose.yaml"
+	compose := &fakeCompose{}
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), state.New(), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected Applied = true, result = %+v", result)
+	}
+	if compose.upCalls != 2 {
+		t.Errorf("Up called %d times, want 2 (one per stack)", compose.upCalls)
+	}
+	gotStacks := append([]string(nil), result.Stacks...)
+	sort.Strings(gotStacks)
+	if want := []string{"test-stack", "test-stack-db"}; !equalStringSlices(gotStacks, want) {
+		t.Errorf("Stacks = %v, want %v", gotStacks, want)
+	}
+	if store.State.LastHealthyCommit != "new222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "new222")
+	}
+}
+
+func TestReconcileDirModePartialChangeOnlyAppliesChangedStack(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/db/docker-compose.yaml"
+	compose := &fakeCompose{}
+	deps, _ := testDirDeps(t, g, compose, snapshots(healthySnapshot()), state.New(), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected Applied = true, result = %+v", result)
+	}
+	if compose.upCalls != 1 {
+		t.Errorf("Up called %d times, want 1 (root stack must not be touched)", compose.upCalls)
+	}
+	if len(compose.loadCalls) != 1 || compose.loadCalls[0].projectName != "test-stack-db" {
+		t.Errorf("loadCalls = %+v, want exactly one call for test-stack-db", compose.loadCalls)
+	}
+}
+
+func TestReconcileDirModeOneStackFailureRevertsOnlyThatCycle(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "c", "docker-compose.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/service-a.yaml"
+	compose := &fakeCompose{}
+
+	perProject := &perProjectSnapshotter{}
+	perProject.set("test-stack", snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot(), healthySnapshot()))
+	perProject.set("test-stack-c", snapshots(healthySnapshot()))
+
+	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Reverted {
+		t.Fatalf("expected Reverted = true, result = %+v", result)
+	}
+	for _, call := range compose.loadCalls {
+		if call.projectName == "test-stack-c" {
+			t.Fatalf("test-stack-c must never be touched, loadCalls = %+v", compose.loadCalls)
+		}
+	}
+	if compose.upCalls != 2 {
+		t.Errorf("Up called %d times, want 2 (failed apply + revert apply of test-stack only)", compose.upCalls)
+	}
+	if store.State.LastHealthyCommit != "old111" {
+		t.Errorf("LastHealthyCommit = %q, want unchanged %q", store.State.LastHealthyCommit, "old111")
+	}
+}
+
+func TestReconcileDirModeInvalidFileFailsLoudly(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "broken.yaml"), invalidComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/service-a.yaml"
+	compose := &fakeCompose{}
+	deps, _ := testDirDeps(t, g, compose, snapshots(healthySnapshot()), state.New(), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if result.Err == nil {
+		t.Fatal("expected an error for the invalid compose file")
+	}
+	if compose.upCalls != 0 {
+		t.Errorf("Up called %d times, want 0 (must fail before touching Docker)", compose.upCalls)
+	}
+}
+
+func TestVanishedStacksTearDownOnlyRemoved(t *testing.T) {
+	compose := &fakeCompose{}
+	deps := Deps{Compose: compose, Log: slog.New(slog.DiscardHandler)}
+
+	previous := stackFixtures("test-stack", "test-stack-db", "test-stack-old")
+	current := stackFixtures("test-stack", "test-stack-db")
+
+	tearDownStacks(t.Context(), deps, vanishedStacks(previous, current), "removed")
+
+	if len(compose.downCalls) != 1 || compose.downCalls[0] != "test-stack-old" {
+		t.Errorf("downCalls = %v, want exactly [test-stack-old]", compose.downCalls)
+	}
+}
+
+func stackFixtures(projectNames ...string) []compose.Stack {
+	stacks := make([]compose.Stack, len(projectNames))
+	for i, name := range projectNames {
+		stacks[i] = compose.Stack{ProjectName: name}
+	}
+	return stacks
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestReconcileDirModeRevertUsesRollbackTargetFileList(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	added := filepath.Join(composeDir, "service-b.yaml")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/service-a.yaml\ndeployment/service-b.yaml"
+	g.onCheckout = func(commit string) {
+		switch commit {
+		case "new222":
+			writeComposeFile(t, added, validComposeYAML)
+		case "old111":
+			if err := os.Remove(added); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+
+	compose := &fakeCompose{}
+	perProject := &perProjectSnapshotter{}
+	perProject.set("test-stack", snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot(), healthySnapshot()))
+	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Reverted || result.Degraded {
+		t.Fatalf("expected a clean revert, result = %+v", result)
+	}
+	if len(compose.loadCalls) != 2 {
+		t.Fatalf("loadCalls = %+v, want one for the apply and one for the revert", compose.loadCalls)
+	}
+	revertFiles := compose.loadCalls[1].files
+	for _, f := range revertFiles {
+		if _, err := os.Stat(f); err != nil {
+			t.Errorf("revert loaded %s, which does not exist at the rollback target: %v", f, err)
+		}
+	}
+	if len(revertFiles) != 1 {
+		t.Errorf("revert files = %v, want only the file present at the rollback target", revertFiles)
+	}
+}
+
+func TestReconcileDirModeDeletedComposeFileReappliesStack(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	removed := filepath.Join(composeDir, "service-b.yaml")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, removed, validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/service-b.yaml"
+	g.onCheckout = func(commit string) {
+		if commit == "new222" {
+			if err := os.Remove(removed); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+
+	compose := &fakeCompose{}
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected the stack to be re-applied without its deleted file, result = %+v", result)
+	}
+	if len(compose.loadCalls) != 1 || len(compose.loadCalls[0].files) != 1 {
+		t.Errorf("loadCalls = %+v, want one call with only the surviving file", compose.loadCalls)
+	}
+	if store.State.LastHealthyCommit != "new222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "new222")
+	}
+}
+
+func TestReconcileDirModeRemovedStackTornDownAndCommitRecorded(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/db/docker-compose.yaml"
+	g.onCheckout = func(commit string) {
+		if commit == "new222" {
+			if err := os.RemoveAll(filepath.Join(composeDir, "db")); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+
+	compose := &fakeCompose{}
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if result.Err != nil || result.Applied {
+		t.Fatalf("expected a clean no-apply cycle, result = %+v", result)
+	}
+	if !result.Skipped {
+		t.Errorf("expected Skipped = true when no stack changed")
+	}
+	if len(compose.downCalls) != 1 || compose.downCalls[0] != "test-stack-db" {
+		t.Errorf("downCalls = %v, want exactly [test-stack-db]", compose.downCalls)
+	}
+	if compose.upCalls != 0 {
+		t.Errorf("Up called %d times, want 0", compose.upCalls)
+	}
+	if store.State.LastHealthyCommit != "new222" {
+		t.Errorf("LastHealthyCommit = %q, want %q (the checkout moved)", store.State.LastHealthyCommit, "new222")
+	}
+}
+
+func TestReconcileDirModeRemovedStackSurvivesRevert(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/service-a.yaml\ndeployment/db/docker-compose.yaml"
+	g.onCheckout = func(commit string) {
+		switch commit {
+		case "new222":
+			if err := os.RemoveAll(filepath.Join(composeDir, "db")); err != nil {
+				t.Error(err)
+			}
+		case "old111":
+			writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
+		}
+	}
+
+	compose := &fakeCompose{}
+	perProject := &perProjectSnapshotter{}
+	perProject.set("test-stack", snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot(), healthySnapshot()))
+	perProject.set("test-stack-db", snapshots(healthySnapshot()))
+	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Reverted {
+		t.Fatalf("expected Reverted = true, result = %+v", result)
+	}
+	if len(compose.downCalls) != 0 {
+		t.Errorf("downCalls = %v, want none: the rollback target still has that stack", compose.downCalls)
+	}
+}
+
+func TestReconcileDirModeNewStackTornDownOnRevert(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/new/docker-compose.yaml"
+	g.onCheckout = func(commit string) {
+		switch commit {
+		case "new222":
+			writeComposeFile(t, filepath.Join(composeDir, "new", "docker-compose.yaml"), validComposeYAML)
+		case "old111":
+			if err := os.RemoveAll(filepath.Join(composeDir, "new")); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+
+	compose := &fakeCompose{}
+	perProject := &perProjectSnapshotter{}
+	perProject.set("test-stack", snapshots(healthySnapshot()))
+	perProject.set("test-stack-new", snapshots(healthySnapshot(), unhealthySnapshot()))
+	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Reverted || result.Degraded {
+		t.Fatalf("expected a clean revert, result = %+v", result)
+	}
+	if len(compose.downCalls) != 1 || compose.downCalls[0] != "test-stack-new" {
+		t.Errorf("downCalls = %v, want exactly [test-stack-new]", compose.downCalls)
+	}
+}
+
+func TestReconcileDirModePreflightChecksEveryStack(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/service-a.yaml"
+	compose := &fakeCompose{}
+
+	perProject := &perProjectSnapshotter{}
+	perProject.set("test-stack", snapshots(healthySnapshot()))
+	perProject.set("test-stack-db", snapshots(unhealthySnapshot(), healthySnapshot()))
+
+	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if result.Applied {
+		t.Fatalf("expected the pre-flight gate to block the apply, result = %+v", result)
+	}
+	if !result.Reverted {
+		t.Errorf("expected the pre-flight gate to revert, result = %+v", result)
+	}
+	if store.State.LastHealthyCommit != "old111" {
+		t.Errorf("LastHealthyCommit = %q, want unchanged %q", store.State.LastHealthyCommit, "old111")
+	}
+}
+
+func TestReconcileDirModeIgnoresNonComposeYAML(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "db", "prometheus.yml"), "global:\n  scrape_interval: 15s\n")
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/db/prometheus.yml"
+	compose := &fakeCompose{}
+	deps, _ := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if result.Err != nil {
+		t.Fatalf("unexpected error: %v", result.Err)
+	}
+	if len(compose.loadCalls) != 1 || len(compose.loadCalls[0].files) != 1 {
+		t.Fatalf("loadCalls = %+v, want one call with only the compose file", compose.loadCalls)
+	}
+	if !strings.HasSuffix(compose.loadCalls[0].files[0], "docker-compose.yaml") {
+		t.Errorf("loaded %q, want only the compose file", compose.loadCalls[0].files[0])
+	}
+}
+
+func TestWatchStacksReportsEveryFailingStackAndStopsEarly(t *testing.T) {
+	perProject := &perProjectSnapshotter{}
+	perProject.set("stack-a", snapshots(healthySnapshot()))
+	perProject.set("stack-b", snapshots(healthySnapshot(), unhealthySnapshot()))
+
+	deps, _ := testDirDeps(t, gitChange("old111", "new222"), &fakeCompose{}, perProject, state.New(), t.TempDir(), t.TempDir())
+
+	result, err := watchStacks(t.Context(), deps, stackFixtures("stack-a", "stack-b"), "new222")
+	if err != nil {
+		t.Fatalf("watchStacks: %v", err)
+	}
+	if result.Outcome != health.Unhealthy {
+		t.Fatalf("Outcome = %v, want unhealthy", result.Outcome)
+	}
+	if !strings.Contains(result.Reason, "stack-b") {
+		t.Errorf("Reason = %q, want it to name the failing stack", result.Reason)
+	}
+	for _, f := range result.Failures {
+		if !strings.HasPrefix(f, "stack-b: ") {
+			t.Errorf("failure %q is not attributed to its stack", f)
+		}
+	}
+}
+
+func TestWatchStacksNoStacksIsHealthy(t *testing.T) {
+	deps, _ := testDirDeps(t, gitChange("old111", "new222"), &fakeCompose{}, snapshots(healthySnapshot()), state.New(), t.TempDir(), t.TempDir())
+
+	result, err := watchStacks(t.Context(), deps, nil, "new222")
+	if err != nil {
+		t.Fatalf("watchStacks: %v", err)
+	}
+	if result.Outcome != health.Healthy {
+		t.Errorf("Outcome = %v, want healthy", result.Outcome)
 	}
 }

@@ -258,3 +258,72 @@ func TestInitWritesPrivateFile(t *testing.T) {
 		t.Errorf("config file mode = %o, want 600", perm)
 	}
 }
+
+func TestLoadComposeDirAloneIsSufficient(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, []byte(`{
+		"repo_path": ".",
+		"compose_dir": "./deployment",
+		"project_name": "my-stack"
+	}`))
+
+	var buf bytes.Buffer
+	cfg, err := Load(path, Overrides{}, testLogger(&buf))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ComposeDir != "./deployment" {
+		t.Errorf("ComposeDir = %q, want %q", cfg.ComposeDir, "./deployment")
+	}
+	if bytes.Contains(buf.Bytes(), []byte("ignoring compose_file")) {
+		t.Errorf("expected no warning when compose_file was never set, got: %s", buf.String())
+	}
+}
+
+func TestLoadComposeDirAndComposeFileBothSetWarns(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, []byte(`{
+		"repo_path": ".",
+		"compose_file": "./docker-compose.yml",
+		"compose_dir": "./deployment",
+		"project_name": "my-stack"
+	}`))
+
+	var buf bytes.Buffer
+	cfg, err := Load(path, Overrides{}, testLogger(&buf))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ComposeDir != "./deployment" {
+		t.Errorf("ComposeDir = %q, want %q", cfg.ComposeDir, "./deployment")
+	}
+	if !bytes.Contains(buf.Bytes(), []byte("ignoring compose_file")) {
+		t.Errorf("expected a warning that compose_file is ignored, got: %s", buf.String())
+	}
+}
+
+func TestLoadComposeDirViaOverrideDoesNotWarnWithoutExplicitComposeFile(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, []byte(`{
+		"repo_path": ".",
+		"compose_dir": "./deployment",
+		"project_name": "my-stack"
+	}`))
+
+	var buf bytes.Buffer
+	if _, err := Load(path, Overrides{}, testLogger(&buf)); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if bytes.Contains(buf.Bytes(), []byte("ignoring compose_file")) {
+		t.Errorf("expected no warning, got: %s", buf.String())
+	}
+}
+
+func TestLoadMissingBothComposeFileAndComposeDirErrors(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, []byte(`{"repo_path": ".", "project_name": "y"}`))
+
+	if _, err := Load(path, Overrides{}, testLogger(&bytes.Buffer{})); err == nil {
+		t.Fatal("expected an error when neither compose_file nor compose_dir is set")
+	}
+}

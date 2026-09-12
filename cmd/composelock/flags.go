@@ -15,6 +15,7 @@ type cliFlags struct {
 	remote      string
 	branch      string
 	composeFile string
+	composeDir  string
 	projectName string
 	stateFile   string
 	discord     string
@@ -44,6 +45,7 @@ func newCLIFlags() *cliFlags {
 	f.fs.StringVar(&f.remote, "remote", "", "Git remote name")
 	f.fs.StringVar(&f.branch, "branch", "", "Branch to track")
 	f.fs.StringVar(&f.composeFile, "compose-file", "", "Path to docker-compose.yml")
+	f.fs.StringVar(&f.composeDir, "compose-dir", "", "Directory of compose files (see README); overrides -compose-file")
 	f.fs.StringVar(&f.projectName, "project-name", "", "Compose project name (required for SDK)")
 	f.fs.StringVar(&f.stateFile, "state-file", "", "Path to state JSON")
 	f.fs.StringVar(&f.discord, "discord", "", "Discord webhook URL")
@@ -76,6 +78,8 @@ func (f *cliFlags) overrides() config.Overrides {
 			o.Branch = &f.branch
 		case "compose-file":
 			o.ComposeFile = &f.composeFile
+		case "compose-dir":
+			o.ComposeDir = &f.composeDir
 		case "project-name":
 			o.ProjectName = &f.projectName
 		case "state-file":
