@@ -33,7 +33,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, failedCommit, rea
 		return revertFailed(ctx, deps, st, failedCommit, target, fmt.Errorf("compose up during revert: %w", err), start)
 	}
 
-	watchOpts := healthOptions(cfg)
+	watchOpts := healthOptions(cfg, target)
 	watchResult, err := health.Watch(ctx, deps.Health, deps.Clock, watchOpts, deps.Log)
 	if err != nil {
 		// ctx cancelled: state is left as-is (pending_commit still set),

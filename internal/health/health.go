@@ -83,6 +83,7 @@ func (o Outcome) String() string {
 
 type Options struct {
 	ProjectName          string
+	Commit               string
 	WatchDuration        time.Duration
 	PollInterval         time.Duration
 	UnhealthyStreakLimit int
@@ -105,9 +106,12 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 		baselineRestarts[c.ID] = c.RestartCount
 	}
 
-	log.Info("health watch: starting", "duration", opts.WatchDuration, "poll_interval", opts.PollInterval)
-
 	deadline := clock.Now().Add(opts.WatchDuration)
+	log.Info("health watch: starting",
+		"commit", opts.Commit,
+		"duration", opts.WatchDuration.String(),
+		"poll_interval", opts.PollInterval.String(),
+		"healthy_at", deadline.Format(time.RFC3339))
 	result := Result{}
 	unhealthyStreak := 0
 	var last Snapshot

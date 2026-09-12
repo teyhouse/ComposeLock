@@ -143,7 +143,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	result.Applied = true
 	result.Services = serviceNames(project)
 
-	watchOpts := healthOptions(cfg)
+	watchOpts := healthOptions(cfg, commit)
 	watchResult, err := health.Watch(ctx, deps.Health, deps.Clock, watchOpts, deps.Log)
 	if err != nil {
 		result.Err = fmt.Errorf("health watch: %w", err)

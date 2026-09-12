@@ -102,9 +102,10 @@ func reconcileLocked(ctx context.Context, opts Options, deps Deps, start time.Ti
 	return runNormal(ctx, opts, deps, st, start)
 }
 
-func healthOptions(cfg *config.Config) health.Options {
+func healthOptions(cfg *config.Config, commit string) health.Options {
 	return health.Options{
 		ProjectName:          cfg.ProjectName,
+		Commit:               commit,
 		WatchDuration:        time.Duration(cfg.HealthWatchSeconds) * time.Second,
 		PollInterval:         time.Duration(cfg.HealthPollIntervalSeconds) * time.Second,
 		UnhealthyStreakLimit: cfg.HealthUnhealthyStreak,
