@@ -22,8 +22,9 @@ import (
 // ---- fakes ----
 
 type fakeGit struct {
-	head   string
-	remote string
+	head      string
+	remote    string
+	diffFiles string // git diff --name-only output; defaults to "docker-compose.yml" when empty
 }
 
 func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ...string) ([]byte, []byte, error) {
@@ -36,6 +37,9 @@ func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ..
 		}
 		return []byte(g.remote), nil, nil
 	case "diff":
+		if g.diffFiles != "" {
+			return []byte(g.diffFiles), nil, nil
+		}
 		return []byte("docker-compose.yml"), nil, nil
 	case "checkout":
 		g.head = args[1]
@@ -190,6 +194,47 @@ func TestReconcileNoChange(t *testing.T) {
 	}
 	if compose.upCalls != 0 {
 		t.Errorf("Up called %d times, want 0", compose.upCalls)
+	}
+}
+
+func TestReconcileComposeFileUnchanged(t *testing.T) {
+	compose := &fakeCompose{}
+	g := gitChange("abc123", "def456")
+	g.diffFiles = "README.md"
+	deps, _ := testDeps(t, g, compose, snapshots(healthySnapshot()), state.New())
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Skipped {
+		t.Error("expected Skipped = true")
+	}
+	if result.Applied {
+		t.Error("expected Applied = false")
+	}
+	if result.Notification != nil {
+		t.Error("expected no notification")
+	}
+	if compose.upCalls != 0 {
+		t.Errorf("Up called %d times, want 0", compose.upCalls)
+	}
+}
+
+func TestReconcileComposeFileChangedAmongOthers(t *testing.T) {
+	compose := &fakeCompose{}
+	g := gitChange("abc123", "def456")
+	g.diffFiles = "README.md\ndocker-compose.yml"
+	deps, _ := testDeps(t, g, compose, snapshots(healthySnapshot()), state.New())
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if result.Skipped {
+		t.Error("expected Skipped = false")
+	}
+	if !result.Applied {
+		t.Error("expected Applied = true")
+	}
+	if compose.upCalls != 1 {
+		t.Errorf("Up called %d times, want 1", compose.upCalls)
 	}
 }
 
@@ -651,4 +696,67 @@ func (b *blockingSnapshotter) Snapshot(context.Context, string) (health.Snapshot
 		<-b.release
 	}
 	return b.healthy, nil
+}
+
+func TestComposeFileChanged(t *testing.T) {
+	cases := []struct {
+		name         string
+		repoPath     string
+		composeFile  string
+		changedFiles []string
+		want         bool
+	}{
+		{
+			name:         "relative compose file matches",
+			repoPath:     "/repo",
+			composeFile:  "docker-compose.yml",
+			changedFiles: []string{"docker-compose.yml"},
+			want:         true,
+		},
+		{
+			name:         "relative compose file with ./ prefix matches",
+			repoPath:     "/repo",
+			composeFile:  "./docker-compose.yml",
+			changedFiles: []string{"docker-compose.yml"},
+			want:         true,
+		},
+		{
+			name:         "absolute compose file matches (smoke.sh style config)",
+			repoPath:     "/repo",
+			composeFile:  "/repo/docker-compose.yml",
+			changedFiles: []string{"docker-compose.yml"},
+			want:         true,
+		},
+		{
+			name:         "unrelated file only",
+			repoPath:     "/repo",
+			composeFile:  "docker-compose.yml",
+			changedFiles: []string{"README.md"},
+			want:         false,
+		},
+		{
+			name:         "compose file among other changed files",
+			repoPath:     "/repo",
+			composeFile:  "docker-compose.yml",
+			changedFiles: []string{"README.md", "docker-compose.yml"},
+			want:         true,
+		},
+		{
+			name:         "no changed files",
+			repoPath:     "/repo",
+			composeFile:  "docker-compose.yml",
+			changedFiles: nil,
+			want:         false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := composeFileChanged(tc.repoPath, tc.composeFile, tc.changedFiles)
+			if got != tc.want {
+				t.Errorf("composeFileChanged(%q, %q, %v) = %v, want %v",
+					tc.repoPath, tc.composeFile, tc.changedFiles, got, tc.want)
+			}
+		})
+	}
 }

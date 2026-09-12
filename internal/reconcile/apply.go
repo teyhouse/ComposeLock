@@ -3,6 +3,7 @@ package reconcile
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/teyhouse/ComposeLock/internal/compose"
@@ -41,6 +42,13 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 	}
 	if !gitResult.Changed {
 		deps.Log.Info("nothing to do", "commit", gitResult.OldCommit)
+		return result
+	}
+
+	if !composeFileChanged(cfg.RepoPath, cfg.ComposeFile, gitResult.ChangedFiles) {
+		deps.Log.Info("compose file unchanged, skipping apply",
+			"commit", gitResult.NewCommit, "changed_files", gitResult.ChangedFiles)
+		result.Skipped = true
 		return result
 	}
 
@@ -217,4 +225,18 @@ func restoreCheckout(ctx context.Context, deps Deps, commit string) {
 	if err := deps.Git.Checkout(ctx, commit); err != nil {
 		deps.Log.Error("restoring previous checkout failed", "commit", commit, "err", err)
 	}
+}
+
+func composeFileChanged(repoPath, composeFile string, changedFiles []string) bool {
+	target := composeFile
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(repoPath, target)
+	}
+	target = filepath.Clean(target)
+	for _, f := range changedFiles {
+		if filepath.Clean(filepath.Join(repoPath, f)) == target {
+			return true
+		}
+	}
+	return false
 }
