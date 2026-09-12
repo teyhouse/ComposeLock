@@ -105,6 +105,8 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 		baselineRestarts[c.ID] = c.RestartCount
 	}
 
+	log.Info("health watch: starting", "duration", opts.WatchDuration, "poll_interval", opts.PollInterval)
+
 	deadline := clock.Now().Add(opts.WatchDuration)
 	result := Result{}
 	unhealthyStreak := 0
