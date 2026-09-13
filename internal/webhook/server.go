@@ -5,16 +5,22 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 )
 
-const maxBodyBytes = 1 << 20
+const (
+	maxBodyBytes  = 1 << 20
+	drainTimeout  = 30 * time.Second
+	refHeadPrefix = "refs/heads/"
+)
 
 type ReconcileFunc func(ctx context.Context)
 
@@ -22,6 +28,7 @@ type Config struct {
 	Addr   string
 	Path   string
 	Secret string
+	Branch string
 }
 
 type Server struct {
@@ -32,6 +39,9 @@ type Server struct {
 }
 
 func New(cfg Config, reconcile ReconcileFunc, log *slog.Logger) *Server {
+	if cfg.Secret == "" {
+		log.Warn("webhook: no secret configured, every request to the path triggers a reconcile")
+	}
 	return &Server{
 		cfg:       cfg,
 		reconcile: reconcile,
@@ -68,7 +78,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	var wg sync.WaitGroup
 	defer func() {
 		stopWorker()
-		wg.Wait()
+		s.waitBounded(&wg)
 	}()
 	wg.Go(func() { s.processTriggers(workerCtx) })
 
@@ -85,15 +95,39 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
+func (s *Server) waitBounded(wg *sync.WaitGroup) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		s.log.Error("webhook: reconcile did not stop in time, exiting anyway", "timeout", drainTimeout.String())
+	}
+}
+
 func (s *Server) processTriggers(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-s.triggers:
-			s.reconcile(ctx)
+			s.runReconcile(ctx)
 		}
 	}
+}
+
+func (s *Server) runReconcile(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.log.Error("webhook: reconcile panicked", "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	s.reconcile(ctx)
 }
 
 func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -110,12 +144,44 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if event := r.Header.Get("X-GitHub-Event"); event == "ping" {
+		w.WriteHeader(http.StatusOK)
+		return
+	} else if event != "" && event != "push" {
+		s.log.Info("webhook: ignoring event", "event", event)
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
+	if ref, ok := pushRef(body); ok && !s.refMatches(ref) {
+		s.log.Info("webhook: ignoring push to another branch", "ref", ref, "branch", s.cfg.Branch)
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+
 	select {
 	case s.triggers <- struct{}{}:
 	default:
 		s.log.Info("webhook: reconcile already queued, coalescing trigger")
 	}
 	w.WriteHeader(http.StatusAccepted)
+}
+
+func pushRef(body []byte) (string, bool) {
+	var payload struct {
+		Ref string `json:"ref"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Ref == "" {
+		return "", false
+	}
+	return payload.Ref, true
+}
+
+func (s *Server) refMatches(ref string) bool {
+	if s.cfg.Branch == "" {
+		return true
+	}
+	return strings.TrimPrefix(ref, refHeadPrefix) == s.cfg.Branch
 }
 
 func (s *Server) validSignature(header string, body []byte) bool {

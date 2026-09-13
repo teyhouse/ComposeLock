@@ -203,3 +203,106 @@ func TestServeWaitsForInFlightReconcileOnShutdown(t *testing.T) {
 		t.Error("Serve returned before the in-flight reconcile finished")
 	}
 }
+
+func TestWebhookIgnoresNonPushEvents(t *testing.T) {
+	reconciled := make(chan struct{}, 1)
+	s := testServer(t, "", reconciled)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/webhook", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("X-GitHub-Event", "issue_comment")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case <-reconciled:
+		t.Fatal("an issue_comment event must not trigger a deploy")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWebhookAnswersPingWithoutTriggering(t *testing.T) {
+	reconciled := make(chan struct{}, 1)
+	s := testServer(t, "", reconciled)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/webhook", bytes.NewReader([]byte(`{}`)))
+	req.Header.Set("X-GitHub-Event", "ping")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	select {
+	case <-reconciled:
+		t.Fatal("a ping must not trigger a deploy")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestWebhookIgnoresPushesToOtherBranches(t *testing.T) {
+	reconciled := make(chan struct{}, 1)
+	s := New(Config{Path: "/webhook", Branch: "main"}, func(context.Context) {
+		reconciled <- struct{}{}
+	}, slog.New(slog.DiscardHandler))
+	startWorker(t, s)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	post := func(ref string) {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/webhook", "application/json", bytes.NewReader([]byte(`{"ref":"`+ref+`"}`)))
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	post("refs/heads/feature")
+	select {
+	case <-reconciled:
+		t.Fatal("a push to another branch must not trigger a deploy")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	post("refs/heads/main")
+	waitFor(t, reconciled, "Reconcile for a push to the tracked branch")
+}
+
+func TestProcessTriggersSurvivesAPanickingReconcile(t *testing.T) {
+	calls := make(chan int, 2)
+	n := 0
+	s := New(Config{Path: "/webhook"}, func(context.Context) {
+		n++
+		calls <- n
+		if n == 1 {
+			panic("boom")
+		}
+	}, slog.New(slog.DiscardHandler))
+	startWorker(t, s)
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	postEmpty(t, srv.URL+"/webhook")
+	if got := <-calls; got != 1 {
+		t.Fatalf("first call = %d, want 1", got)
+	}
+	postEmpty(t, srv.URL+"/webhook")
+	select {
+	case got := <-calls:
+		if got != 2 {
+			t.Fatalf("second call = %d, want 2", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker died on the first panic instead of recovering")
+	}
+}
