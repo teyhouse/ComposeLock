@@ -50,6 +50,19 @@ jobs:
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
           echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      # git describe gives the previous release because the tag being built
+      # does not exist yet; --exclude covers the tag-push trigger, where it
+      # already points at HEAD.
+      - name: Build changelog
+        id: changelog
+        run: |
+          set -euo pipefail
+          PREV="$(git describe --tags --abbrev=0 --exclude="${{ steps.version.outputs.tag }}" HEAD 2>/dev/null || true)"
+          echo "Previous release tag: ${PREV:-<none>}"
+          bash scripts/changelog.sh "$PREV" HEAD > "$RUNNER_TEMP/changelog.md"
+          cat "$RUNNER_TEMP/changelog.md"
+          echo "path=$RUNNER_TEMP/changelog.md" >> "$GITHUB_OUTPUT"
+
       - name: Build linux/amd64
         run: make build GOOS=linux GOARCH=amd64 VERSION=${{ steps.version.outputs.tag }}
 
@@ -63,6 +76,8 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
+          body_path: ${{ steps.changelog.outputs.path }}
+          generate_release_notes: true
           files: dist/composelock-linux-amd64.tar.gz
 
       - name: Set up Docker Buildx
