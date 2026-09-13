@@ -16,7 +16,7 @@ func TestCheckEnvFilesMissing(t *testing.T) {
 		Services: types.Services{
 			"webapp": types.ServiceConfig{
 				Name:     "webapp",
-				EnvFiles: []types.EnvFile{{Path: "webapp.env"}},
+				EnvFiles: []types.EnvFile{{Path: "webapp.env", Required: true}},
 			},
 		},
 	}
@@ -44,12 +44,50 @@ func TestCheckEnvFilesPresent(t *testing.T) {
 		Services: types.Services{
 			"webapp": types.ServiceConfig{
 				Name:     "webapp",
-				EnvFiles: []types.EnvFile{{Path: "webapp.env"}},
+				EnvFiles: []types.EnvFile{{Path: "webapp.env", Required: true}},
 			},
 		},
 	}
 
 	if err := CheckEnvFiles(project); err != nil {
 		t.Fatalf("CheckEnvFiles: %v", err)
+	}
+}
+
+func TestCheckEnvFilesIgnoresOptionalMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	project := &types.Project{
+		WorkingDir: dir,
+		Services: types.Services{
+			"webapp": types.ServiceConfig{
+				Name:     "webapp",
+				EnvFiles: []types.EnvFile{{Path: "optional.env", Required: false}},
+			},
+		},
+	}
+
+	if err := CheckEnvFiles(project); err != nil {
+		t.Fatalf("CheckEnvFiles: %v, want no error for a missing env_file marked required: false", err)
+	}
+}
+
+func TestCheckEnvFilesRejectsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "webapp.env"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	project := &types.Project{
+		WorkingDir: dir,
+		Services: types.Services{
+			"webapp": types.ServiceConfig{
+				Name:     "webapp",
+				EnvFiles: []types.EnvFile{{Path: "webapp.env", Required: true}},
+			},
+		},
+	}
+
+	err := CheckEnvFiles(project)
+	if err == nil || !strings.Contains(err.Error(), "directory") {
+		t.Fatalf("err = %v, want a directory error", err)
 	}
 }

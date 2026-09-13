@@ -28,24 +28,26 @@ import (
 type fakeGit struct {
 	head       string
 	remote     string
-	diffFiles  string // git diff --name-only output; defaults to "docker-compose.yml" when empty
+	fetchErr   error
+	diffFiles  string // newline-separated for readability; emitted NUL-separated like `git diff -z`
 	onCheckout func(commit string)
 }
 
 func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "fetch":
-		return nil, nil, nil
+		return nil, nil, g.fetchErr
 	case "rev-parse":
 		if args[1] == "HEAD" {
 			return []byte(g.head), nil, nil
 		}
 		return []byte(g.remote), nil, nil
 	case "diff":
-		if g.diffFiles != "" {
-			return []byte(g.diffFiles), nil, nil
+		files := g.diffFiles
+		if files == "" {
+			files = "docker-compose.yml"
 		}
-		return []byte("docker-compose.yml"), nil, nil
+		return []byte(strings.ReplaceAll(files, "\n", "\x00")), nil, nil
 	case "checkout":
 		g.head = args[1]
 		if g.onCheckout != nil {
@@ -63,6 +65,7 @@ type loadCall struct {
 
 type fakeCompose struct {
 	loadErr   error
+	downErr   error
 	upErrs    []error
 	onUp      func(call int)
 	project   *ctypes.Project
@@ -98,7 +101,7 @@ func (f *fakeCompose) Up(ctx context.Context, _ *ctypes.Project) error {
 
 func (f *fakeCompose) Down(_ context.Context, projectName string) error {
 	f.downCalls = append(f.downCalls, projectName)
-	return nil
+	return f.downErr
 }
 
 // fakeSnapshotter returns snapshots[i] on the i-th call, clamped to the
@@ -464,7 +467,7 @@ func TestReconcileMissingEnvFileAbortsBeforeUp(t *testing.T) {
 			Name:       "test-stack",
 			WorkingDir: dir,
 			Services: ctypes.Services{
-				"web": ctypes.ServiceConfig{Name: "web", EnvFiles: []ctypes.EnvFile{{Path: "app.env"}}},
+				"web": ctypes.ServiceConfig{Name: "web", EnvFiles: []ctypes.EnvFile{{Path: "app.env", Required: true}}},
 			},
 		},
 	}
@@ -1249,7 +1252,7 @@ func TestWatchStacksReportsEveryFailingStackAndStopsEarly(t *testing.T) {
 
 	deps, _ := testDirDeps(t, gitChange("old111", "new222"), &fakeCompose{}, perProject, state.New(), t.TempDir(), t.TempDir())
 
-	result, err := watchStacks(t.Context(), deps, stackFixtures("stack-a", "stack-b"), "new222")
+	result, _, err := watchStacks(t.Context(), deps, stackFixtures("stack-a", "stack-b"), nil, "new222")
 	if err != nil {
 		t.Fatalf("watchStacks: %v", err)
 	}
@@ -1269,11 +1272,203 @@ func TestWatchStacksReportsEveryFailingStackAndStopsEarly(t *testing.T) {
 func TestWatchStacksNoStacksIsHealthy(t *testing.T) {
 	deps, _ := testDirDeps(t, gitChange("old111", "new222"), &fakeCompose{}, snapshots(healthySnapshot()), state.New(), t.TempDir(), t.TempDir())
 
-	result, err := watchStacks(t.Context(), deps, nil, "new222")
+	result, _, err := watchStacks(t.Context(), deps, nil, nil, "new222")
 	if err != nil {
 		t.Fatalf("watchStacks: %v", err)
 	}
 	if result.Outcome != health.Healthy {
 		t.Errorf("Outcome = %v, want healthy", result.Outcome)
 	}
+}
+
+func TestReconcileIrrelevantChangeAdvancesTheCheckout(t *testing.T) {
+	compose := &fakeCompose{}
+	g := gitChange("abc123", "def456")
+	g.diffFiles = "README.md"
+	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("abc123"))
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Skipped {
+		t.Error("expected Skipped = true")
+	}
+	if compose.upCalls != 0 {
+		t.Errorf("Up called %d times, want 0", compose.upCalls)
+	}
+	if g.head != "def456" {
+		t.Errorf("HEAD = %q, want the checkout to advance to %q so it stops re-diffing forever", g.head, "def456")
+	}
+	if store.State.LastHealthyCommit != "def456" {
+		t.Errorf("last_healthy_commit = %q, want %q", store.State.LastHealthyCommit, "def456")
+	}
+}
+
+func TestReconcileReAppliesWhenTheCheckoutDriftedFromState(t *testing.T) {
+	compose := &fakeCompose{}
+	g := gitNoChange("def456")
+	deps, _ := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("abc123"))
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected the drifted checkout to be re-applied, result = %+v", result)
+	}
+	if compose.upCalls != 1 {
+		t.Errorf("Up called %d times, want 1", compose.upCalls)
+	}
+}
+
+func TestReconcileGitFailureRecordsLastResult(t *testing.T) {
+	g := &fakeGit{head: "abc123", remote: "abc123", fetchErr: errors.New("network unreachable")}
+	deps, store := testDeps(t, g, &fakeCompose{}, snapshots(healthySnapshot()), withHealthy("abc123"))
+
+	if result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps); result.Err == nil {
+		t.Fatal("expected a git error")
+	}
+	if store.State.LastResult != state.ResultFailedGit {
+		t.Errorf("last_result = %q, want %q", store.State.LastResult, state.ResultFailedGit)
+	}
+}
+
+func TestReconcileKnownBadSkipRecordsLastResult(t *testing.T) {
+	g := gitChange("abc123", "bad456")
+	st := withHealthy("abc123")
+	st.LastFailedCommit = "bad456"
+	deps, store := testDeps(t, g, &fakeCompose{}, snapshots(healthySnapshot()), st)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Skipped {
+		t.Fatalf("expected the known-bad commit to be skipped, result = %+v", result)
+	}
+	if store.State.LastResult != state.ResultSkippedKnownBad {
+		t.Errorf("last_result = %q, want %q", store.State.LastResult, state.ResultSkippedKnownBad)
+	}
+	if store.State.LastAttemptCommit != "bad456" {
+		t.Errorf("last_attempt_commit = %q, want %q", store.State.LastAttemptCommit, "bad456")
+	}
+}
+
+func TestReconcileFailedTeardownIsNotPromoted(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
+	writeComposeFile(t, filepath.Join(composeDir, "c", "docker-compose.yaml"), validComposeYAML)
+
+	g := gitChange("old111", "new222")
+	g.diffFiles = "deployment/c/docker-compose.yaml"
+	g.onCheckout = func(commit string) {
+		if commit == "new222" {
+			if err := os.RemoveAll(filepath.Join(composeDir, "c")); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+
+	compose := &fakeCompose{downErr: errors.New("docker daemon unreachable")}
+	perProject := &perProjectSnapshotter{}
+	perProject.set("test-stack", snapshots(healthySnapshot()))
+	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if result.Err == nil {
+		t.Fatal("expected the failed teardown to surface as an error")
+	}
+	if store.State.LastHealthyCommit == "new222" {
+		t.Error("a stack that failed to come down must not be promoted as a healthy deploy")
+	}
+}
+
+func TestDegradeRecordsTheFailedCommit(t *testing.T) {
+	compose := &fakeCompose{}
+	g := gitChange("old111", "new222")
+	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot(), unhealthySnapshot()), state.New())
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Degraded {
+		t.Fatalf("expected DEGRADED without a rollback target, result = %+v", result)
+	}
+	if store.State.LastFailedCommit != "new222" {
+		t.Errorf("last_failed_commit = %q, want %q", store.State.LastFailedCommit, "new222")
+	}
+	if store.State.LastResult != state.ResultDegraded {
+		t.Errorf("last_result = %q, want %q", store.State.LastResult, state.ResultDegraded)
+	}
+}
+
+func twoServiceSnapshot(webID, dbID string) health.Snapshot {
+	return health.Snapshot{Containers: []health.ContainerStatus{
+		{ID: webID, Service: "web", State: health.StateRunning},
+		{ID: dbID, Service: "db", State: health.StateRunning},
+	}}
+}
+
+func TestReconcileReportsOnlyTheServicesThatWereRecreated(t *testing.T) {
+	compose := &fakeCompose{project: &ctypes.Project{
+		Name: "test-stack",
+		Services: ctypes.Services{
+			"web": ctypes.ServiceConfig{Name: "web"},
+			"db":  ctypes.ServiceConfig{Name: "db"},
+		},
+	}}
+	snap := snapshots(
+		twoServiceSnapshot("c1", "c2"),
+		twoServiceSnapshot("c9", "c2"),
+		twoServiceSnapshot("c9", "c2"),
+	)
+	deps, _ := testDeps(t, gitChange("old111", "new222"), compose, snap, withHealthy("old111"))
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected Applied = true, result = %+v", result)
+	}
+	if !equalStringSlices(result.Services, []string{"db", "web"}) {
+		t.Errorf("Services = %v, want both services listed", result.Services)
+	}
+	if !equalStringSlices(result.Updated, []string{"web"}) {
+		t.Errorf("Updated = %v, want only [web]: db kept its container", result.Updated)
+	}
+	if result.Notification == nil {
+		t.Fatal("expected a success notification")
+	}
+	if got := embedField(t, result.Notification, "Updated"); got != "web" {
+		t.Errorf("Updated field = %q, want %q", got, "web")
+	}
+}
+
+func TestReconcileReportsNoUpdatedServicesWhenNothingMoved(t *testing.T) {
+	compose := &fakeCompose{project: &ctypes.Project{
+		Name:     "test-stack",
+		Services: ctypes.Services{"web": ctypes.ServiceConfig{Name: "web"}},
+	}}
+	deps, _ := testDeps(t, gitChange("old111", "new222"), compose, snapshots(healthySnapshot()), withHealthy("old111"))
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected Applied = true, result = %+v", result)
+	}
+	if len(result.Updated) != 0 {
+		t.Errorf("Updated = %v, want none: the container was never replaced", result.Updated)
+	}
+	if got := embedField(t, result.Notification, "Updated"); got != "none" {
+		t.Errorf("Updated field = %q, want %q", got, "none")
+	}
+}
+
+func embedField(t *testing.T, embed *notify.Embed, name string) string {
+	t.Helper()
+	if embed == nil {
+		t.Fatal("no embed")
+	}
+	for _, f := range embed.Fields {
+		if f.Name == name {
+			return f.Value
+		}
+	}
+	t.Fatalf("embed has no %q field, fields = %+v", name, embed.Fields)
+	return ""
 }

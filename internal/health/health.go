@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 )
 
@@ -88,32 +89,44 @@ type Options struct {
 	PollInterval         time.Duration
 	UnhealthyStreakLimit int
 	RestartTolerance     int
+	ExpectContainers     bool
 }
 
 type Result struct {
 	Outcome  Outcome
 	Reason   string
 	Failures []string
+	Baseline Snapshot
 }
 
 func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log *slog.Logger) (Result, error) {
+	log = log.With("project", opts.ProjectName)
+	if opts.WatchDuration <= 0 {
+		log.Info("health watch: disabled, skipping verification", "commit", opts.Commit)
+		return Result{Outcome: Healthy}, nil
+	}
+
 	baseline, err := snap.Snapshot(ctx, opts.ProjectName)
 	if err != nil {
 		return Result{}, fmt.Errorf("baseline snapshot: %w", err)
 	}
+	if res, ok := checkPopulated(baseline, opts); !ok {
+		log.Warn("health watch: no containers for project", "commit", opts.Commit)
+		res.Baseline = baseline
+		return res, nil
+	}
 	baselineRestarts := make(map[string]int, len(baseline.Containers))
 	for _, c := range baseline.Containers {
-		baselineRestarts[c.ID] = c.RestartCount
+		baselineRestarts[c.Service] = max(baselineRestarts[c.Service], c.RestartCount)
 	}
 
 	deadline := clock.Now().Add(opts.WatchDuration)
-	log = log.With("project", opts.ProjectName)
 	log.Info("health watch: starting",
 		"commit", opts.Commit,
 		"duration", opts.WatchDuration.String(),
 		"poll_interval", opts.PollInterval.String(),
 		"healthy_at", deadline.Format(time.RFC3339))
-	result := Result{}
+	result := Result{Baseline: baseline}
 	unhealthyStreak := 0
 	var last Snapshot
 
@@ -128,7 +141,20 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 		}
 		last = cur
 
-		anyUnhealthy := false
+		if res, ok := checkPopulated(cur, opts); !ok {
+			log.Warn("health watch: all containers disappeared")
+			res.Baseline = baseline
+			return res, nil
+		}
+		if service, ok := missingService(baselineRestarts, cur); !ok {
+			result.Reason = fmt.Sprintf("container disappeared: %s", service)
+			result.Failures = append(result.Failures, result.Reason)
+			log.Warn("health watch: container disappeared", "service", service)
+			result.Outcome = Unhealthy
+			return result, nil
+		}
+
+		anyUnhealthy, anyStarting := false, false
 		for _, c := range cur.Containers {
 			if c.State == StateExited && !c.Completed() {
 				result.Reason = fmt.Sprintf("container exited: %s (exit code %d)", c.Service, c.ExitCode)
@@ -137,15 +163,18 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 				result.Outcome = Unhealthy
 				return result, nil
 			}
-			if c.RestartCount > baselineRestarts[c.ID]+opts.RestartTolerance {
-				result.Reason = fmt.Sprintf("restarted beyond tolerance: %s (restarts=%d, tolerance=%d)", c.Service, c.RestartCount-baselineRestarts[c.ID], opts.RestartTolerance)
+			if c.RestartCount > baselineRestarts[c.Service]+opts.RestartTolerance {
+				result.Reason = fmt.Sprintf("restarted beyond tolerance: %s (restarts=%d, tolerance=%d)", c.Service, c.RestartCount-baselineRestarts[c.Service], opts.RestartTolerance)
 				result.Failures = append(result.Failures, result.Reason)
-				log.Warn("health watch: restart tolerance exceeded", "service", c.Service, "restarts", c.RestartCount-baselineRestarts[c.ID])
+				log.Warn("health watch: restart tolerance exceeded", "service", c.Service, "restarts", c.RestartCount-baselineRestarts[c.Service])
 				result.Outcome = Unhealthy
 				return result, nil
 			}
-			if c.Health == HealthUnhealthy {
+			switch c.Health {
+			case HealthUnhealthy:
 				anyUnhealthy = true
+			case HealthStarting:
+				anyStarting = true
 			}
 		}
 
@@ -158,7 +187,7 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 				result.Outcome = Unhealthy
 				return result, nil
 			}
-		} else {
+		} else if !anyStarting {
 			unhealthyStreak = 0
 		}
 	}
@@ -176,6 +205,55 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 	return result, nil
 }
 
+func checkPopulated(snap Snapshot, opts Options) (Result, bool) {
+	if !opts.ExpectContainers || len(snap.Containers) > 0 {
+		return Result{}, true
+	}
+	reason := "no containers running for project " + opts.ProjectName
+	return Result{Outcome: Unhealthy, Reason: reason, Failures: []string{reason}}, false
+}
+
+func ChangedServices(before, after Snapshot) []string {
+	beforeIDs, afterIDs := containerIDs(before), containerIDs(after)
+	var changed []string
+	for service, ids := range afterIDs {
+		if !slices.Equal(ids, beforeIDs[service]) {
+			changed = append(changed, service)
+		}
+	}
+	for service := range beforeIDs {
+		if _, ok := afterIDs[service]; !ok {
+			changed = append(changed, service)
+		}
+	}
+	slices.Sort(changed)
+	return changed
+}
+
+func containerIDs(snap Snapshot) map[string][]string {
+	byService := make(map[string][]string, len(snap.Containers))
+	for _, c := range snap.Containers {
+		byService[c.Service] = append(byService[c.Service], c.ID)
+	}
+	for _, ids := range byService {
+		slices.Sort(ids)
+	}
+	return byService
+}
+
+func missingService(baseline map[string]int, cur Snapshot) (string, bool) {
+	present := make(map[string]struct{}, len(cur.Containers))
+	for _, c := range cur.Containers {
+		present[c.Service] = struct{}{}
+	}
+	for service := range baseline {
+		if _, ok := present[service]; !ok {
+			return service, false
+		}
+	}
+	return "", true
+}
+
 func Evaluate(snap Snapshot) (healthy bool, reason string) {
 	return evaluate(snap, false)
 }
@@ -186,7 +264,10 @@ func EvaluatePreflight(snap Snapshot) (healthy bool, reason string) {
 
 func evaluate(snap Snapshot, tolerateStarting bool) (healthy bool, reason string) {
 	for _, c := range snap.Containers {
-		if c.State != StateRunning && !c.Completed() {
+		if c.Completed() {
+			continue
+		}
+		if c.State != StateRunning {
 			return false, fmt.Sprintf("not running: %s (state=%s)", c.Service, c.State)
 		}
 		if tolerateStarting && c.Health == HealthStarting {

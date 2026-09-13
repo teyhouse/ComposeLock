@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/gofrs/flock"
 
@@ -34,7 +35,8 @@ func loadConfig(f *cliFlags, bootLogger *slog.Logger) (*config.Config, error) {
 }
 
 func buildDeps(cfg *config.Config, log *slog.Logger) (reconcile.Deps, error) {
-	composeSvc, err := compose.New()
+	dockerTimeout := time.Duration(cfg.DockerTimeoutSeconds) * time.Second
+	composeSvc, err := compose.New(dockerTimeout, time.Duration(cfg.DockerUpTimeoutSeconds)*time.Second)
 	if err != nil {
 		return reconcile.Deps{}, fmt.Errorf("initializing compose service: %w", err)
 	}
@@ -49,7 +51,7 @@ func buildDeps(cfg *config.Config, log *slog.Logger) (reconcile.Deps, error) {
 			SSHKey:   cfg.SSHKey,
 		},
 		Compose:  composeSvc,
-		Health:   &health.ComposeSnapshotter{Service: composeSvc},
+		Health:   &health.ComposeSnapshotter{Service: composeSvc, Timeout: dockerTimeout},
 		Clock:    health.RealClock{},
 		State:    state.FileStore{Path: cfg.StateFile},
 		Notifier: notify.New(cfg.DiscordWebhook, log),
@@ -85,7 +87,15 @@ func setup(f *cliFlags, writesState bool) (*config.Config, reconcile.Deps, int) 
 			return nil, reconcile.Deps{}, 2
 		}
 		deps.Lock = flock.New(cfg.StateFile + ".lock")
+	} else {
+		deps.Lock = sharedLock{flock.New(cfg.StateFile + ".lock")}
 	}
 
 	return cfg, deps, 0
 }
+
+type sharedLock struct {
+	*flock.Flock
+}
+
+func (l sharedLock) TryLock() (bool, error) { return l.Flock.TryRLock() }

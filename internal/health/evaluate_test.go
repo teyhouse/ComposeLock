@@ -42,3 +42,64 @@ func TestEvaluatePreflightAcceptsCompletedAndHealthy(t *testing.T) {
 		t.Errorf("EvaluatePreflight() = false (%s), want true", reason)
 	}
 }
+
+func TestEvaluateExemptsCompletedContainersFromTheHealthCheck(t *testing.T) {
+	snap := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: "migrate", State: StateExited, ExitCode: 0, Health: HealthUnhealthy},
+	}}
+
+	healthy, reason := Evaluate(snap)
+	if !healthy {
+		t.Errorf("Evaluate() = false (%s), want a one-shot that exited 0 to pass both checks", reason)
+	}
+}
+
+func TestChangedServicesNamesOnlyRecreatedContainers(t *testing.T) {
+	before := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: "web"},
+		{ID: "c2", Service: "db"},
+	}}
+	after := Snapshot{Containers: []ContainerStatus{
+		{ID: "c9", Service: "web"},
+		{ID: "c2", Service: "db"},
+	}}
+
+	got := ChangedServices(before, after)
+	if len(got) != 1 || got[0] != "web" {
+		t.Errorf("ChangedServices() = %v, want [web]: db kept its container", got)
+	}
+}
+
+func TestChangedServicesNamesAddedAndRemoved(t *testing.T) {
+	before := Snapshot{Containers: []ContainerStatus{{ID: "c1", Service: "old"}}}
+	after := Snapshot{Containers: []ContainerStatus{{ID: "c2", Service: "new"}}}
+
+	got := ChangedServices(before, after)
+	if len(got) != 2 || got[0] != "new" || got[1] != "old" {
+		t.Errorf("ChangedServices() = %v, want [new old]", got)
+	}
+}
+
+func TestChangedServicesIsEmptyWhenNothingMoved(t *testing.T) {
+	snap := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: "web"},
+		{ID: "c2", Service: "db"},
+	}}
+
+	if got := ChangedServices(snap, snap); len(got) != 0 {
+		t.Errorf("ChangedServices() = %v, want none", got)
+	}
+}
+
+func TestChangedServicesHandlesScaledServices(t *testing.T) {
+	before := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: "web"}, {ID: "c2", Service: "web"},
+	}}
+	after := Snapshot{Containers: []ContainerStatus{
+		{ID: "c2", Service: "web"}, {ID: "c1", Service: "web"},
+	}}
+
+	if got := ChangedServices(before, after); len(got) != 0 {
+		t.Errorf("ChangedServices() = %v, want none: the same two containers in another order", got)
+	}
+}

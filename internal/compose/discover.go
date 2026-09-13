@@ -1,10 +1,14 @@
 package compose
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -14,6 +18,8 @@ import (
 	"github.com/compose-spec/compose-go/v2/schema"
 	"go.yaml.in/yaml/v4"
 )
+
+var ErrNoStacks = errors.New("no compose stacks found")
 
 type Stack struct {
 	ProjectName string
@@ -30,15 +36,32 @@ func IsComposeFile(name string) bool {
 	}
 }
 
+func IsHiddenPath(rel string) bool {
+	for _, seg := range strings.FieldsFunc(rel, func(r rune) bool { return r == '/' || r == filepath.Separator }) {
+		if isHidden(seg) {
+			return true
+		}
+	}
+	return false
+}
+
 var composeTopLevelKeys = map[string]bool{
 	"configs":  true,
 	"include":  true,
+	"models":   true,
 	"name":     true,
 	"networks": true,
 	"secrets":  true,
 	"services": true,
 	"version":  true,
 	"volumes":  true,
+}
+
+var composeBaseNames = map[string]bool{
+	"compose.yaml":        true,
+	"compose.yml":         true,
+	"docker-compose.yaml": true,
+	"docker-compose.yml":  true,
 }
 
 type discoverCache struct {
@@ -61,7 +84,7 @@ func Discover(composeDir, baseProjectName string) ([]Stack, error) {
 		stacks, err := cache.stacks, cache.err
 		cache.mu.Unlock()
 		if hit {
-			return slices.Clone(stacks), err
+			return cloneStacks(stacks), err
 		}
 	}
 
@@ -72,7 +95,15 @@ func Discover(composeDir, baseProjectName string) ([]Stack, error) {
 		cache.key, cache.fingerprint, cache.stacks, cache.err = key, fp, stacks, err
 		cache.mu.Unlock()
 	}
-	return slices.Clone(stacks), err
+	return cloneStacks(stacks), err
+}
+
+func cloneStacks(stacks []Stack) []Stack {
+	out := slices.Clone(stacks)
+	for i := range out {
+		out[i].Files = slices.Clone(out[i].Files)
+	}
+	return out
 }
 
 func fingerprint(composeDir string) (string, error) {
@@ -86,10 +117,10 @@ func fingerprint(composeDir string) (string, error) {
 		return "", err
 	}
 	for _, e := range entries {
-		if isHidden(e.Name()) || !isDir(composeDir, e) {
+		subDir, ok := subDirOf(composeDir, e)
+		if !ok {
 			continue
 		}
-		subDir := filepath.Join(composeDir, e.Name())
 		subEntries, err := os.ReadDir(subDir)
 		if err != nil {
 			return "", err
@@ -104,10 +135,10 @@ func fingerprint(composeDir string) (string, error) {
 
 func hashComposeFiles(h hash.Hash, dir string, entries []os.DirEntry) error {
 	for _, e := range entries {
-		name := e.Name()
-		if isHidden(name) || !IsComposeFile(name) || isDir(dir, e) {
+		if !isComposeCandidate(dir, e) {
 			continue
 		}
+		name := e.Name()
 		data, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			return err
@@ -121,6 +152,9 @@ func hashComposeFiles(h hash.Hash, dir string, entries []os.DirEntry) error {
 func discover(composeDir, baseProjectName string) ([]Stack, error) {
 	entries, err := os.ReadDir(composeDir)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("reading compose_dir %s: %w: %w", composeDir, ErrNoStacks, err)
+		}
 		return nil, fmt.Errorf("reading compose_dir %s: %w", composeDir, err)
 	}
 
@@ -135,10 +169,10 @@ func discover(composeDir, baseProjectName string) ([]Stack, error) {
 	}
 
 	for _, e := range entries {
-		if isHidden(e.Name()) || !isDir(composeDir, e) {
+		subDir, ok := subDirOf(composeDir, e)
+		if !ok {
 			continue
 		}
-		subDir := filepath.Join(composeDir, e.Name())
 		subEntries, err := os.ReadDir(subDir)
 		if err != nil {
 			return nil, fmt.Errorf("reading %s: %w", subDir, err)
@@ -158,7 +192,7 @@ func discover(composeDir, baseProjectName string) ([]Stack, error) {
 	}
 
 	if len(stacks) == 0 {
-		return nil, fmt.Errorf("no compose files found in %s (or its immediate subdirectories)", composeDir)
+		return nil, fmt.Errorf("%w in %s (or its immediate subdirectories)", ErrNoStacks, composeDir)
 	}
 
 	slices.SortFunc(stacks, func(a, b Stack) int { return strings.Compare(a.ProjectName, b.ProjectName) })
@@ -175,11 +209,10 @@ func discover(composeDir, baseProjectName string) ([]Stack, error) {
 func composeFilesIn(dir string, entries []os.DirEntry) ([]string, error) {
 	var files []string
 	for _, e := range entries {
-		name := e.Name()
-		if isHidden(name) || !IsComposeFile(name) || isDir(dir, e) {
+		if !isComposeCandidate(dir, e) {
 			continue
 		}
-		path := filepath.Join(dir, name)
+		path := filepath.Join(dir, e.Name())
 		isCompose, err := checkComposeFile(path)
 		if err != nil {
 			return nil, err
@@ -188,8 +221,29 @@ func composeFilesIn(dir string, entries []os.DirEntry) ([]string, error) {
 			files = append(files, path)
 		}
 	}
-	slices.Sort(files)
+	sortByMergeOrder(files)
 	return files, nil
+}
+
+func sortByMergeOrder(files []string) {
+	slices.SortFunc(files, func(a, b string) int {
+		if ra, rb := mergeRank(filepath.Base(a)), mergeRank(filepath.Base(b)); ra != rb {
+			return ra - rb
+		}
+		return strings.Compare(a, b)
+	})
+}
+
+func mergeRank(name string) int {
+	name = strings.ToLower(name)
+	switch {
+	case composeBaseNames[name]:
+		return 0
+	case strings.HasSuffix(strings.TrimSuffix(name, filepath.Ext(name)), ".override"):
+		return 2
+	default:
+		return 1
+	}
 }
 
 func checkComposeFile(path string) (bool, error) {
@@ -197,20 +251,49 @@ func checkComposeFile(path string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("reading %s: %w", path, err)
 	}
-	var model map[string]any
-	if err := yaml.Unmarshal(data, &model); err != nil {
+	docs, err := yamlMappings(data)
+	if err != nil {
 		return false, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	if len(model) == 0 || !looksLikeCompose(model) {
+	if len(docs) == 0 || !looksLikeCompose(docs[0]) {
 		return false, nil
 	}
-	if err := schema.Validate(model); err != nil {
+	if len(docs) > 1 {
+		return false, fmt.Errorf("multi-document compose file %s: only the first document would be applied", path)
+	}
+	if err := schema.Validate(docs[0]); err != nil {
 		return false, fmt.Errorf("invalid compose file %s: %w", path, err)
 	}
 	return true, nil
 }
 
+func yamlMappings(data []byte) ([]map[string]any, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var docs []map[string]any
+	for {
+		var doc any
+		err := dec.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			return docs, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if doc == nil {
+			continue
+		}
+		mapping, ok := doc.(map[string]any)
+		if !ok {
+			return nil, nil
+		}
+		docs = append(docs, mapping)
+	}
+}
+
 func looksLikeCompose(model map[string]any) bool {
+	if len(model) == 0 {
+		return false
+	}
 	if _, ok := model["services"]; ok {
 		return true
 	}
@@ -225,15 +308,34 @@ func looksLikeCompose(model map[string]any) bool {
 	return true
 }
 
-func isDir(parent string, e os.DirEntry) bool {
-	if e.IsDir() {
-		return true
-	}
-	if e.Type()&os.ModeSymlink == 0 {
+func isComposeCandidate(parent string, e os.DirEntry) bool {
+	name := e.Name()
+	if isHidden(name) || !IsComposeFile(name) {
 		return false
 	}
+	isDir, ok := entryIsDir(parent, e)
+	return ok && !isDir
+}
+
+func subDirOf(parent string, e os.DirEntry) (string, bool) {
+	if isHidden(e.Name()) {
+		return "", false
+	}
+	if isDir, ok := entryIsDir(parent, e); !ok || !isDir {
+		return "", false
+	}
+	return filepath.Join(parent, e.Name()), true
+}
+
+func entryIsDir(parent string, e os.DirEntry) (bool, bool) {
+	if e.Type()&os.ModeSymlink == 0 {
+		return e.IsDir(), true
+	}
 	info, err := os.Stat(filepath.Join(parent, e.Name()))
-	return err == nil && info.IsDir()
+	if err != nil {
+		return false, false
+	}
+	return info.IsDir(), true
 }
 
 func isHidden(name string) bool {

@@ -1,6 +1,7 @@
 package compose
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -293,5 +294,108 @@ func TestDiscoverRejectsCollidingStackNames(t *testing.T) {
 	_, err := Discover(dir, "myproject")
 	if err == nil || !strings.Contains(err.Error(), "myproject-my-db") {
 		t.Fatalf("err = %v, want a collision error naming the shared project name", err)
+	}
+}
+
+func TestDiscoverPutsOverrideFileLast(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "docker-compose.yml"), validComposeYAML)
+	writeFile(t, filepath.Join(dir, "docker-compose.override.yml"), validComposeYAML)
+
+	stacks, err := Discover(dir, "myproject")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(stacks) != 1 || len(stacks[0].Files) != 2 {
+		t.Fatalf("expected one stack with two files, got %+v", stacks)
+	}
+	if base := filepath.Base(stacks[0].Files[0]); base != "docker-compose.yml" {
+		t.Errorf("Files[0] = %q, want the base file first", base)
+	}
+	if base := filepath.Base(stacks[0].Files[1]); base != "docker-compose.override.yml" {
+		t.Errorf("Files[1] = %q, want the override file last so it wins the merge", base)
+	}
+}
+
+func TestDiscoverSkipsNonMappingYAML(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "docker-compose.yaml"), validComposeYAML)
+	writeFile(t, filepath.Join(dir, "hosts.yaml"), "- one\n- two\n")
+
+	stacks, err := Discover(dir, "myproject")
+	if err != nil {
+		t.Fatalf("Discover: %v, want a top-level list to be skipped, not to fail the sync", err)
+	}
+	if len(stacks) != 1 || len(stacks[0].Files) != 1 {
+		t.Fatalf("expected only the compose file, got %+v", stacks)
+	}
+}
+
+func TestDiscoverAcceptsModelsOnlyFragment(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "docker-compose.yaml"), validComposeYAML)
+	writeFile(t, filepath.Join(dir, "models.yaml"), "models:\n  llm:\n    model: ai/smol\n")
+
+	stacks, err := Discover(dir, "myproject")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if len(stacks) != 1 || len(stacks[0].Files) != 2 {
+		t.Fatalf("expected models.yaml to be merged, got %+v", stacks)
+	}
+}
+
+func TestDiscoverSkipsDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "docker-compose.yaml"), validComposeYAML)
+	if err := os.Symlink(filepath.Join(dir, "gone.yaml"), filepath.Join(dir, "broken.yaml")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	stacks, err := Discover(dir, "myproject")
+	if err != nil {
+		t.Fatalf("Discover: %v, want a dangling symlink to be skipped", err)
+	}
+	if len(stacks) != 1 || len(stacks[0].Files) != 1 {
+		t.Fatalf("expected only the real compose file, got %+v", stacks)
+	}
+}
+
+func TestDiscoverMissingDirReportsErrNoStacks(t *testing.T) {
+	_, err := Discover(filepath.Join(t.TempDir(), "absent"), "myproject")
+	if !errors.Is(err, ErrNoStacks) {
+		t.Fatalf("err = %v, want it to wrap ErrNoStacks", err)
+	}
+}
+
+func TestDiscoverInvalidComposeFileStillFailsLoudly(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "broken.yaml"), "services: not-a-mapping\n")
+
+	_, err := Discover(dir, "myproject")
+	if err == nil || !strings.Contains(err.Error(), "broken.yaml") {
+		t.Fatalf("err = %v, want a loud failure naming broken.yaml", err)
+	}
+	if errors.Is(err, ErrNoStacks) {
+		t.Error("a broken compose file must not look like an empty compose_dir")
+	}
+}
+
+func TestDiscoverCachedStacksAreNotAliased(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "docker-compose.yaml"), validComposeYAML)
+
+	first, err := Discover(dir, "myproject")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	first[0].Files[0] = "tampered"
+
+	second, err := Discover(dir, "myproject")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if second[0].Files[0] == "tampered" {
+		t.Error("mutating a returned stack corrupted the cache")
 	}
 }

@@ -79,17 +79,19 @@ type Payload struct {
 }
 
 type Report struct {
-	Outcome     Outcome
-	Title       string
-	Commit      string
-	RepoURL     string
-	Branch      string
-	Services    []string
-	Stacks      []string
-	HealthWatch time.Duration
-	Duration    time.Duration
-	Err         error
-	StderrTail  string
+	Outcome      Outcome
+	Title        string
+	Commit       string
+	RepoURL      string
+	Branch       string
+	Services     []string
+	Updated      []string
+	UpdatedKnown bool
+	Stacks       []string
+	HealthWatch  time.Duration
+	Duration     time.Duration
+	Err          error
+	StderrTail   string
 }
 
 const (
@@ -118,6 +120,13 @@ func BuildEmbed(r Report) Embed {
 		{Name: "Commit", Value: orDash(commitValue), Inline: true},
 		{Name: "Branch", Value: orDash(r.Branch), Inline: true},
 		{Name: "Services", Value: services, Inline: true},
+	}
+	if r.UpdatedKnown {
+		updated := "none"
+		if len(r.Updated) > 0 {
+			updated = strings.Join(r.Updated, ", ")
+		}
+		fields = append(fields, Field{Name: "Updated", Value: updated, Inline: true})
 	}
 	if len(r.Stacks) > 0 {
 		fields = append(fields, Field{Name: "Stacks", Value: strings.Join(r.Stacks, ", "), Inline: true})
@@ -196,9 +205,8 @@ type Notifier struct {
 	client     *http.Client
 	log        *slog.Logger
 
-	mu       sync.Mutex
-	lastKey  string
-	lastSent time.Time
+	mu   sync.Mutex
+	sent map[string]time.Time
 }
 
 func New(webhookURL string, log *slog.Logger) *Notifier {
@@ -209,6 +217,7 @@ func New(webhookURL string, log *slog.Logger) *Notifier {
 		webhookURL: webhookURL,
 		client:     &http.Client{Timeout: 10 * time.Second},
 		log:        log,
+		sent:       make(map[string]time.Time),
 	}
 }
 
@@ -222,59 +231,74 @@ func (n *Notifier) SendThrottled(ctx context.Context, key string, embed Embed) {
 	}
 	if key == "" {
 		n.reset()
-	} else if !n.claim(key) {
+	} else if !n.allow(key) {
 		n.log.Info("discord notify: suppressing repeated notification", "key", key, "repeat_interval", RepeatInterval.String())
 		return
 	}
-	n.Send(ctx, embed)
+	if n.send(ctx, embed) && key != "" {
+		n.markSent(key)
+	}
 }
 
 func (n *Notifier) reset() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.lastKey, n.lastSent = "", time.Time{}
+	clear(n.sent)
 }
 
-func (n *Notifier) claim(key string) bool {
+func (n *Notifier) allow(key string) bool {
 	now := time.Now()
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.lastKey == key && now.Sub(n.lastSent) < RepeatInterval {
-		return false
+	for k, at := range n.sent {
+		if now.Sub(at) >= RepeatInterval {
+			delete(n.sent, k)
+		}
 	}
-	n.lastKey, n.lastSent = key, now
-	return true
+	_, blocked := n.sent[key]
+	return !blocked
+}
+
+func (n *Notifier) markSent(key string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.sent[key] = time.Now()
 }
 
 func (n *Notifier) Send(ctx context.Context, embed Embed) {
+	n.send(ctx, embed)
+}
+
+func (n *Notifier) send(ctx context.Context, embed Embed) bool {
 	if !n.Enabled() {
-		return
+		return false
 	}
 
 	data, err := json.Marshal(Payload{Embeds: []Embed{embed}})
 	if err != nil {
 		n.log.Warn("discord notify: marshaling payload failed", "err", err)
-		return
+		return false
 	}
 
 	for attempt := range 2 {
 		retryAfter, err := n.post(ctx, data)
 		if err != nil {
 			n.log.Warn("discord notify: request failed", "err", err)
-			return
+			return false
 		}
 		if retryAfter <= 0 {
-			return
+			return true
 		}
 		if attempt > 0 {
 			n.log.Warn("discord notify: still rate limited, dropping notification")
-			return
+			return false
 		}
 		n.log.Warn("discord notify: rate limited, retrying", "retry_after", retryAfter.String())
 		if !sleepCtx(ctx, retryAfter) {
-			return
+			return false
 		}
 	}
+	return false
 }
 
 func (n *Notifier) post(ctx context.Context, data []byte) (time.Duration, error) {
@@ -297,7 +321,7 @@ func (n *Notifier) post(ctx context.Context, data []byte) (time.Duration, error)
 		return rateLimitDelay(resp.Header.Get("Retry-After")), nil
 	}
 	if resp.StatusCode >= 300 {
-		n.log.Warn("discord notify: non-2xx response", "status", resp.StatusCode)
+		return 0, fmt.Errorf("non-2xx response: %d", resp.StatusCode)
 	}
 	return 0, nil
 }

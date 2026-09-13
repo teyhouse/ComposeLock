@@ -4,17 +4,22 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/teyhouse/ComposeLock/internal/compose"
 	"github.com/teyhouse/ComposeLock/internal/config"
+	"github.com/teyhouse/ComposeLock/internal/health"
 	"github.com/teyhouse/ComposeLock/internal/reconcile"
 	"github.com/teyhouse/ComposeLock/internal/state"
 	"github.com/teyhouse/ComposeLock/internal/webhook"
 )
+
+const notifyDrainTimeout = 30 * time.Second
 
 func exitCode(result reconcile.Result) int {
 	switch {
@@ -31,14 +36,50 @@ func logResult(log *slog.Logger, msg string, result reconcile.Result) {
 	log.Info(msg,
 		"changed", result.Changed,
 		"skipped", result.Skipped,
+		"skip_reason", result.SkipReason,
 		"applied", result.Applied,
 		"reverted", result.Reverted,
 		"degraded", result.Degraded,
 		"old_commit", result.OldCommit,
 		"new_commit", result.NewCommit,
+		"updated_services", result.Updated,
 		"duration_ms", result.Duration.Milliseconds(),
 		"err", result.Err,
 	)
+}
+
+func sendNotification(ctx context.Context, deps reconcile.Deps, result reconcile.Result) {
+	if result.Notification != nil {
+		deps.Notifier.SendThrottled(ctx, result.NotificationKey, *result.Notification)
+	}
+}
+
+type asyncNotifier struct {
+	deps reconcile.Deps
+	wg   sync.WaitGroup
+}
+
+func (a *asyncNotifier) send(ctx context.Context, result reconcile.Result) {
+	if result.Notification == nil {
+		return
+	}
+	ctx = context.WithoutCancel(ctx)
+	a.wg.Go(func() { sendNotification(ctx, a.deps, result) })
+}
+
+func (a *asyncNotifier) drain() {
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(notifyDrainTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		a.deps.Log.Warn("discord notify: pending notifications did not finish before exit")
+	}
 }
 
 func cmdInit(f *cliFlags) int {
@@ -50,12 +91,22 @@ func cmdInit(f *cliFlags) int {
 	fmt.Println("wrote", path)
 
 	if f.withState {
-		cfg := config.Default()
-		if err := state.Save(cfg.StateFile, state.New()); err != nil {
+		statePath := f.stateFile
+		if statePath == "" {
+			statePath = config.Default().StateFile
+		}
+		if _, err := os.Stat(statePath); err == nil && !f.force {
+			fmt.Fprintf(os.Stderr, "state file %s already exists (use --force to overwrite)\n", statePath)
+			return 2
+		} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			fmt.Fprintln(os.Stderr, err)
 			return 2
 		}
-		fmt.Println("wrote", cfg.StateFile)
+		if err := state.Save(statePath, state.New()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		fmt.Println("wrote", statePath)
 	}
 	return 0
 }
@@ -78,15 +129,16 @@ func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps 
 	stacks, err := reconcile.StacksFor(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "discovering compose stacks:", err)
-		stacks = []compose.Stack{{ProjectName: cfg.ProjectName}}
+		return 1
 	}
 
+	code := 0
 	for _, s := range stacks {
-		if code := printStackContainers(ctx, deps, s.ProjectName); code != 0 {
-			return code
+		if c := printStackContainers(ctx, deps, s.ProjectName); c != 0 {
+			code = c
 		}
 	}
-	return 0
+	return code
 }
 
 func printStackContainers(ctx context.Context, deps reconcile.Deps, projectName string) int {
@@ -97,7 +149,14 @@ func printStackContainers(ctx context.Context, deps reconcile.Deps, projectName 
 		fmt.Fprintln(os.Stderr, "live health snapshot:", err)
 		return 1
 	}
-	fmt.Printf("live containers (%s):\n", projectName)
+	healthy, reason := health.Evaluate(snap)
+	verdict := "HEALTHY"
+	if !healthy {
+		verdict = "UNHEALTHY: " + reason
+	} else if len(snap.Containers) == 0 {
+		verdict = "NO CONTAINERS"
+	}
+	fmt.Printf("live containers (%s): %s\n", projectName, verdict)
 	for _, c := range snap.Containers {
 		fmt.Printf("  %s (%s): state=%s health=%s restarts=%d\n", c.Service, c.ID, c.State, c.Health, c.RestartCount)
 	}
@@ -112,6 +171,7 @@ func cmdReconcile(ctx context.Context, trigger string, dryRun, force bool, deps 
 	}, deps)
 
 	logResult(deps.Log, "reconcile complete", result)
+	sendNotification(context.WithoutCancel(ctx), deps, result)
 	return exitCode(result)
 }
 
@@ -125,12 +185,16 @@ func cmdPoll(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 	stopPprof := startPprof(ctx, cfg.PprofListen, deps.Log)
 	defer stopPprof()
 
+	notifier := &asyncNotifier{deps: deps}
+	defer notifier.drain()
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		result := reconcile.Reconcile(ctx, reconcile.Options{Trigger: "poll"}, deps)
 		logResult(deps.Log, "poll tick complete", result)
+		notifier.send(ctx, result)
 
 		select {
 		case <-ctx.Done():
@@ -144,13 +208,18 @@ func cmdWebhook(ctx context.Context, cfg *config.Config, deps reconcile.Deps) in
 	stopPprof := startPprof(ctx, cfg.PprofListen, deps.Log)
 	defer stopPprof()
 
+	notifier := &asyncNotifier{deps: deps}
+	defer notifier.drain()
+
 	srv := webhook.New(webhook.Config{
 		Addr:   cfg.Webhook.Listen,
 		Path:   cfg.Webhook.Path,
 		Secret: cfg.Webhook.Secret,
+		Branch: cfg.Branch,
 	}, func(rctx context.Context) {
 		result := reconcile.Reconcile(rctx, reconcile.Options{Trigger: "webhook"}, deps)
 		logResult(deps.Log, "webhook reconcile complete", result)
+		notifier.send(rctx, result)
 	}, deps.Log)
 
 	deps.Log.Info("webhook server starting", "addr", cfg.Webhook.Listen, "path", cfg.Webhook.Path)

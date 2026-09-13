@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,7 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		if ctx.Err() != nil {
 			return Result{Err: err}
 		}
+		recordOutcome(deps, st, state.ResultFailedGit, "")
 		embed := notify.BuildEmbed(notify.Report{
 			Outcome: notify.OutcomeFailure,
 			Title:   "ComposeLock: git sync failed",
@@ -45,15 +47,19 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		ChangedFiles: gitResult.ChangedFiles,
 	}
 	if !gitResult.Changed {
-		deps.Log.Info("nothing to do", "commit", gitResult.OldCommit)
-		return result
-	}
-
-	if !relevantChange(cfg, gitResult.ChangedFiles) {
-		deps.Log.Info("compose file(s) unchanged, skipping apply",
+		if !checkoutDrifted(st, gitResult.OldCommit) {
+			deps.Log.Info("nothing to do", "commit", gitResult.OldCommit)
+			return result
+		}
+		deps.Log.Warn("checkout does not match last_healthy_commit, re-applying",
+			"head", gitResult.OldCommit, "last_healthy_commit", st.LastHealthyCommit)
+		result.Changed = true
+		result.ChangedFiles = nil
+	} else if !relevantChange(cfg, gitResult.ChangedFiles) {
+		deps.Log.Info("compose file(s) unchanged, advancing checkout without applying",
 			"commit", gitResult.NewCommit, "changed_files", gitResult.ChangedFiles)
 		result.Skipped = true
-		return result
+		return advanceCheckout(ctx, deps, st, result)
 	}
 
 	// A revert moves the local checkout back to last_healthy_commit but
@@ -62,22 +68,39 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 	// commit forever.
 	if gitResult.NewCommit == st.LastFailedCommit && !opts.Force {
 		deps.Log.Info("skipping known-bad commit", "commit", gitResult.NewCommit)
+		recordOutcome(deps, st, state.ResultSkippedKnownBad, gitResult.NewCommit)
 		result.Skipped = true
 		return result
 	}
 
-	previousStacks, previousStacksErr := StacksFor(cfg)
-	if previousStacksErr != nil {
-		deps.Log.Info("no compose stacks discovered at the current checkout", "err", previousStacksErr)
+	previousStacks, err := previousStacksAt(deps)
+	if err != nil {
+		deps.Log.Error("discovering compose stacks at the current checkout", "err", err)
+		result.Err = fmt.Errorf("discovering compose stacks: %w", err)
+		if ctx.Err() != nil {
+			return result
+		}
+		recordOutcome(deps, st, state.ResultFailedPreflight, gitResult.NewCommit)
+		embed := notify.BuildEmbed(notify.Report{
+			Outcome: notify.OutcomeFailure,
+			Title:   "ComposeLock: pre-flight check failed",
+			Commit:  gitResult.NewCommit,
+			Branch:  cfg.Branch,
+			Err:     result.Err,
+		})
+		result.Notification = &embed
+		result.NotificationKey = "preflight:" + gitResult.NewCommit
+		return result
 	}
 
-	liveHealthy, reason, err := evaluateLive(ctx, deps, previousStacks)
+	live, err := evaluateLive(ctx, deps, previousStacks)
 	if err != nil {
 		deps.Log.Error("pre-flight snapshot failed", "err", err)
 		result.Err = fmt.Errorf("pre-flight snapshot: %w", err)
 		if ctx.Err() != nil {
 			return result
 		}
+		recordOutcome(deps, st, state.ResultFailedPreflight, gitResult.NewCommit)
 		embed := notify.BuildEmbed(notify.Report{
 			Outcome: notify.OutcomeFailure,
 			Title:   "ComposeLock: pre-flight check failed",
@@ -91,17 +114,13 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 	}
 
 	if opts.DryRun {
-		deps.Log.Info("dry run: would apply", "old_commit", gitResult.OldCommit, "new_commit", gitResult.NewCommit, "live_healthy", liveHealthy, "gate_reason", reason)
+		deps.Log.Info("dry run: would apply", "old_commit", gitResult.OldCommit, "new_commit", gitResult.NewCommit, "live_healthy", live.healthy, "gate_reason", live.reason)
 		return result
 	}
 
-	if !liveHealthy {
-		deps.Log.Warn("pre-flight gate: live stack unhealthy, not applying", "reason", reason)
-		if previousStacksErr != nil {
-			result.Err = fmt.Errorf("discovering compose stacks for pre-flight revert: %w", previousStacksErr)
-			return result
-		}
-		revertResult := doRevert(ctx, deps, st, previousStacks, gitResult.NewCommit, "pre-flight: live stack unhealthy: "+reason, start)
+	if !live.healthy {
+		deps.Log.Warn("pre-flight gate: live stack unhealthy, not applying", "reason", live.reason)
+		revertResult := doRevert(ctx, deps, st, previousStacks, preflightRecovery, "pre-flight: live stack unhealthy: "+live.reason, start)
 		revertResult.Changed = result.Changed
 		revertResult.OldCommit = result.OldCommit
 		revertResult.NewCommit = result.NewCommit
@@ -109,20 +128,43 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		return revertResult
 	}
 
-	return applyAndWatch(ctx, deps, st, result, previousStacks, start)
+	return applyAndWatch(ctx, deps, st, result, previousStacks, live.snapshots, start)
 }
 
-func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Result, previousStacks []compose.Stack, start time.Time) Result {
+func checkoutDrifted(st *state.State, head string) bool {
+	return st.LastHealthyCommit != "" && head != "" && head != st.LastHealthyCommit
+}
+
+func advanceCheckout(ctx context.Context, deps Deps, st *state.State, result Result) Result {
+	if err := deps.Git.Checkout(ctx, result.NewCommit); err != nil {
+		return abortBeforeUp(ctx, deps, st, result, "checkout failed", err)
+	}
+	if err := promoteHealthy(deps, st, result.NewCommit); err != nil {
+		result.Err = err
+	}
+	return result
+}
+
+func previousStacksAt(deps Deps) ([]compose.Stack, error) {
+	stacks, err := StacksFor(deps.Config)
+	if errors.Is(err, compose.ErrNoStacks) {
+		deps.Log.Info("no compose stacks deployed at the current checkout", "err", err)
+		return nil, nil
+	}
+	return stacks, err
+}
+
+func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Result, previousStacks []compose.Stack, before map[string]health.Snapshot, start time.Time) Result {
 	cfg := deps.Config
 	commit := result.NewCommit
 
 	if err := deps.Git.Checkout(ctx, commit); err != nil {
-		return abortBeforeUp(ctx, deps, result, "checkout failed", err)
+		return abortBeforeUp(ctx, deps, st, result, "checkout failed", err)
 	}
 
 	stacks, err := StacksFor(cfg)
 	if err != nil {
-		return abortBeforeUp(ctx, deps, result, "discovering compose stacks failed", err)
+		return abortBeforeUp(ctx, deps, st, result, "discovering compose stacks failed", err)
 	}
 	vanished := vanishedStacks(previousStacks, stacks)
 
@@ -131,7 +173,10 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 		changedStacks = filterChanged(cfg.RepoPath, stacks, result.ChangedFiles)
 	}
 	if len(changedStacks) == 0 {
-		tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir")
+		if err := tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir"); err != nil {
+			result.Err = err
+			return result
+		}
 		deps.Log.Info("no compose stack changed, nothing to apply", "commit", commit)
 		result.Skipped = true
 		if err := promoteHealthy(deps, st, commit); err != nil {
@@ -144,10 +189,10 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	for i, s := range changedStacks {
 		project, err := deps.Compose.LoadProject(ctx, s.Files, s.ProjectName)
 		if err != nil {
-			return abortBeforeUp(ctx, deps, result, "loading compose project failed", fmt.Errorf("loading project %s: %w", s.ProjectName, err))
+			return abortBeforeUp(ctx, deps, st, result, "loading compose project failed", fmt.Errorf("loading project %s: %w", s.ProjectName, err))
 		}
 		if err := compose.CheckEnvFiles(project); err != nil {
-			return abortBeforeUp(ctx, deps, result, "env_file missing", err)
+			return abortBeforeUp(ctx, deps, st, result, "env_file missing", err)
 		}
 		projects[i] = project
 	}
@@ -167,7 +212,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 		st.LastFailedAt = time.Time{}
 	}
 	if err := deps.State.Save(st); err != nil {
-		return abortBeforeUp(ctx, deps, result, "saving state failed", fmt.Errorf("saving state: %w", err))
+		return abortBeforeUp(ctx, deps, st, result, "saving state failed", fmt.Errorf("saving state: %w", err))
 	}
 
 	var allServices []string
@@ -187,7 +232,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	result.Services = allServices
 	result.Stacks = stackNames(changedStacks)
 
-	watchResult, err := watchStacks(ctx, deps, changedStacks, commit)
+	watchResult, baselines, err := watchStacks(ctx, deps, changedStacks, projects, commit)
 	if err != nil {
 		result.Err = fmt.Errorf("health watch: %w", err)
 		return result
@@ -195,20 +240,27 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	result.HealthWatch = time.Duration(cfg.HealthWatchSeconds) * time.Second
 
 	if watchResult.Outcome == health.Healthy {
-		tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir")
+		if err := tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir"); err != nil {
+			result.Err = err
+			return result
+		}
 		if err := promoteHealthy(deps, st, commit); err != nil {
 			result.Err = err
 			return result
 		}
+		updated, updatedKnown := updatedServices(cfg, before, baselines, changedStacks)
+		result.Updated = updated
 		embed := notify.BuildEmbed(notify.Report{
-			Outcome:     notify.OutcomeSuccess,
-			Title:       "ComposeLock: deployed successfully",
-			Commit:      commit,
-			Branch:      cfg.Branch,
-			Services:    result.Services,
-			Stacks:      reportStacks(cfg, result.Stacks),
-			HealthWatch: result.HealthWatch,
-			Duration:    time.Since(start),
+			Outcome:      notify.OutcomeSuccess,
+			Title:        "ComposeLock: deployed successfully",
+			Commit:       commit,
+			Branch:       cfg.Branch,
+			Services:     result.Services,
+			Updated:      updated,
+			UpdatedKnown: updatedKnown,
+			Stacks:       reportStacks(cfg, result.Stacks),
+			HealthWatch:  result.HealthWatch,
+			Duration:     time.Since(start),
 		})
 		result.Notification = &embed
 		return result
@@ -237,34 +289,37 @@ func failAndRevert(ctx context.Context, deps Deps, st *state.State, stacks []com
 	return result
 }
 
-func abortBeforeUp(ctx context.Context, deps Deps, result Result, title string, err error) Result {
+func abortBeforeUp(ctx context.Context, deps Deps, st *state.State, result Result, title string, err error) Result {
 	deps.Log.Error(title, "err", err)
-	restoreCheckout(ctx, deps, result.OldCommit)
-	result.Err = err
+	restoreErr := restoreCheckout(ctx, deps, result.OldCommit)
+	result.Err = errors.Join(err, restoreErr)
 	if ctx.Err() != nil {
 		return result
 	}
+	recordOutcome(deps, st, state.ResultFailedApply, result.NewCommit)
 	embed := notify.BuildEmbed(notify.Report{
 		Outcome: notify.OutcomeFailure,
 		Title:   "ComposeLock: " + title,
 		Commit:  result.NewCommit,
 		Branch:  deps.Config.Branch,
-		Err:     err,
+		Err:     result.Err,
 	})
 	result.Notification = &embed
 	result.NotificationKey = "abort:" + title + ":" + result.NewCommit
 	return result
 }
 
-func restoreCheckout(ctx context.Context, deps Deps, commit string) {
+func restoreCheckout(ctx context.Context, deps Deps, commit string) error {
 	if commit == "" {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restoreCheckoutTimeout)
 	defer cancel()
 	if err := deps.Git.Checkout(ctx, commit); err != nil {
 		deps.Log.Error("restoring previous checkout failed", "commit", commit, "err", err)
+		return fmt.Errorf("restoring checkout to %s: %w", shortCommit(commit), err)
 	}
+	return nil
 }
 
 func relevantChange(cfg *config.Config, changedFiles []string) bool {
@@ -294,19 +349,22 @@ func stackFilesChanged(repoPath string, files []string, changedFiles []string) b
 func composeDirRelevant(repoPath, composeDir string, changedFiles []string) bool {
 	dir := resolveUnderRepo(repoPath, composeDir)
 	for _, f := range changedFiles {
-		abs := resolveUnderRepo(repoPath, f)
-		rel, err := filepath.Rel(dir, abs)
-		if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-			continue
-		}
-		if !compose.IsComposeFile(filepath.Base(rel)) {
-			continue
-		}
-		if strings.Count(rel, string(filepath.Separator)) <= 1 {
+		if relevantComposeDirEntry(dir, resolveUnderRepo(repoPath, f)) {
 			return true
 		}
 	}
 	return false
+}
+
+func relevantComposeDirEntry(dir, abs string) bool {
+	rel, err := filepath.Rel(dir, abs)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	if compose.IsHiddenPath(rel) || !compose.IsComposeFile(filepath.Base(rel)) {
+		return false
+	}
+	return strings.Count(rel, string(filepath.Separator)) <= 1
 }
 
 func resolveUnderRepo(repoPath, p string) string {

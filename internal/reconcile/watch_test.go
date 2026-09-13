@@ -68,7 +68,7 @@ func TestWatchStacksRespectsConcurrencyLimit(t *testing.T) {
 	snap := &concurrencySnapshotter{delay: 20 * time.Millisecond}
 	deps := watchTestDeps(snap)
 
-	result, err := watchStacks(t.Context(), deps, stacks, "abc123")
+	result, _, err := watchStacks(t.Context(), deps, stacks, nil, "abc123")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestWatchStacksFailsOnAStackPastTheConcurrencyLimit(t *testing.T) {
 	bad := stacks[len(stacks)-1].ProjectName
 	deps := watchTestDeps(&concurrencySnapshotter{unhealthy: map[string]bool{bad: true}})
 
-	result, err := watchStacks(t.Context(), deps, stacks, "abc123")
+	result, _, err := watchStacks(t.Context(), deps, stacks, nil, "abc123")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestWatchStacksStopsEarlyWhenCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	if _, err := watchStacks(ctx, deps, stacks, "abc123"); err == nil {
+	if _, _, err := watchStacks(ctx, deps, stacks, nil, "abc123"); err == nil {
 		t.Fatal("expected an error when the parent context is already cancelled")
 	}
 }

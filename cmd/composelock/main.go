@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/teyhouse/ComposeLock/internal/config"
@@ -27,9 +28,17 @@ func printVersion() {
 	fmt.Printf("composelock %s (commit %s, built %s)\n", version, commit, date)
 }
 
+func splitCommand(args []string) (string, []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:]
+	}
+	return "", args
+}
+
 func run(args []string) int {
 	f := newCLIFlags()
-	if err := f.fs.Parse(args); err != nil {
+	command, rest := splitCommand(args)
+	if err := f.fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -41,12 +50,15 @@ func run(args []string) int {
 		return 0
 	}
 
-	command := "sync"
-	switch rest := f.fs.Args(); {
-	case len(rest) > 0:
-		command = rest[0]
-	case f.initFlag:
-		command = "init"
+	if command == "" {
+		switch {
+		case f.fs.NArg() > 0:
+			command = f.fs.Arg(0)
+		case f.initFlag:
+			command = "init"
+		default:
+			command = "sync"
+		}
 	}
 
 	switch command {
@@ -55,6 +67,11 @@ func run(args []string) int {
 		return 0
 	case "init":
 		return cmdInit(f)
+	}
+
+	if err := checkFlagsFor(command, f); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
 	}
 
 	readOnly := command == "status" || command == "check" || (command == "sync" && f.dryRun)
@@ -88,4 +105,20 @@ func run(args []string) int {
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", command)
 		return 2
 	}
+}
+
+func checkFlagsFor(command string, f *cliFlags) error {
+	if command != "poll" && command != "webhook" {
+		return nil
+	}
+	var rejected []string
+	f.fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "dry-run" || fl.Name == "force" {
+			rejected = append(rejected, "-"+fl.Name)
+		}
+	})
+	if len(rejected) > 0 {
+		return fmt.Errorf("%s does not accept %s: it always reconciles for real", command, strings.Join(rejected, " and "))
+	}
+	return nil
 }

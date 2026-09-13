@@ -5,11 +5,15 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/compose-spec/compose-go/v2/types"
+
 	"github.com/teyhouse/ComposeLock/internal/compose"
 	"github.com/teyhouse/ComposeLock/internal/health"
 	"github.com/teyhouse/ComposeLock/internal/notify"
 	"github.com/teyhouse/ComposeLock/internal/state"
 )
+
+const preflightRecovery = ""
 
 func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.Stack, failedCommit, reason string, start time.Time) Result {
 	cfg := deps.Config
@@ -31,10 +35,13 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 	}
 	revertStacks := intersectByProjectName(targetStacks, stacks)
 
-	tearDownStacks(ctx, deps, vanishedStacks(stacks, targetStacks), "stack does not exist at rollback target")
+	if err := tearDownStacks(ctx, deps, vanishedStacks(stacks, targetStacks), "stack does not exist at rollback target"); err != nil {
+		return revertFailed(ctx, deps, st, failedCommit, target, revertStacks, err, start)
+	}
 
 	var allServices []string
-	for _, s := range revertStacks {
+	projects := make([]*types.Project, len(revertStacks))
+	for i, s := range revertStacks {
 		project, err := deps.Compose.LoadProject(ctx, s.Files, s.ProjectName)
 		if err != nil {
 			return revertFailed(ctx, deps, st, failedCommit, target, revertStacks, fmt.Errorf("loading project %s for revert: %w", s.ProjectName, err), start)
@@ -42,10 +49,11 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 		if err := deps.Compose.Up(ctx, project); err != nil {
 			return revertFailed(ctx, deps, st, failedCommit, target, revertStacks, fmt.Errorf("compose up during revert of %s: %w", s.ProjectName, err), start)
 		}
+		projects[i] = project
 		allServices = append(allServices, serviceNames(project)...)
 	}
 
-	watchResult, err := watchStacks(ctx, deps, revertStacks, target)
+	watchResult, _, err := watchStacks(ctx, deps, revertStacks, projects, target)
 	if err != nil {
 		// ctx cancelled: state is left as-is (pending_commit still set),
 		// so the next run picks this back up via crash recovery.
@@ -62,16 +70,24 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 	st.PendingCommit = ""
 	st.PendingSince = time.Time{}
 	st.PendingAttempts = 0
+	st.LastAttemptAt = deps.Clock.Now()
+	if failedCommit != preflightRecovery {
+		st.LastAttemptCommit = failedCommit
+	}
 	st.LastResult = state.ResultReverted
 	if err := deps.State.Save(st); err != nil {
 		return Result{Reverted: true, RolledBackTo: target, HealthWatch: watchDuration, Err: fmt.Errorf("saving state: %w", err)}
 	}
 
-	revertErr := fmt.Errorf("%s, reverted to %s — healthy again", reason, shortCommit(target))
+	title, key := "ComposeLock: reverted, healthy again", "reverted:"+failedCommit
+	if failedCommit == preflightRecovery {
+		title, key = "ComposeLock: restored last healthy commit", "preflight-recovered:"+target
+	}
+	revertErr := fmt.Errorf("%s, reverted to %s: healthy again", reason, shortCommit(target))
 	embed := notify.BuildEmbed(notify.Report{
 		Outcome:     notify.OutcomeRecovered,
-		Title:       "ComposeLock: reverted, healthy again",
-		Commit:      failedCommit,
+		Title:       title,
+		Commit:      reportedCommit(failedCommit, target),
 		Branch:      cfg.Branch,
 		Services:    allServices,
 		Stacks:      reportStacks(cfg, stackNames(revertStacks)),
@@ -79,7 +95,14 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 		Duration:    time.Since(start),
 		Err:         revertErr,
 	})
-	return Result{Reverted: true, RolledBackTo: target, HealthWatch: watchDuration, Err: revertErr, Notification: &embed, NotificationKey: "reverted:" + failedCommit}
+	return Result{Reverted: true, RolledBackTo: target, HealthWatch: watchDuration, Err: revertErr, Notification: &embed, NotificationKey: key}
+}
+
+func reportedCommit(failedCommit, target string) string {
+	if failedCommit == preflightRecovery {
+		return target
+	}
+	return failedCommit
 }
 
 func revertFailed(ctx context.Context, deps Deps, st *state.State, failedCommit, target string, stacks []compose.Stack, err error, start time.Time) Result {
@@ -93,13 +116,21 @@ func revertFailed(ctx context.Context, deps Deps, st *state.State, failedCommit,
 func degrade(deps Deps, st *state.State, failedCommit, target string, stacks []string, err error, start time.Time) Result {
 	cfg := deps.Config
 	st.LastResult = state.ResultDegraded
-	if saveErr := deps.State.Save(st); saveErr != nil {
+	st.LastAttemptAt = deps.Clock.Now()
+	if failedCommit != preflightRecovery {
+		st.LastFailedCommit = failedCommit
+		st.LastFailedAt = deps.Clock.Now()
+		st.LastAttemptCommit = failedCommit
+	}
+	saveErr := deps.State.Save(st)
+	if saveErr != nil {
 		deps.Log.Error("saving degraded state", "err", saveErr)
+		err = fmt.Errorf("%w (saving degraded state also failed: %w)", err, saveErr)
 	}
 	embed := notify.BuildEmbed(notify.Report{
 		Outcome:  notify.OutcomeFailure,
-		Title:    "ComposeLock: DEGRADED — manual intervention required",
-		Commit:   failedCommit,
+		Title:    "ComposeLock: DEGRADED, manual intervention required",
+		Commit:   reportedCommit(failedCommit, target),
 		Branch:   cfg.Branch,
 		Stacks:   reportStacks(cfg, stacks),
 		Duration: time.Since(start),

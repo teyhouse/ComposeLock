@@ -9,8 +9,11 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
+
+	"github.com/compose-spec/compose-go/v2/loader"
 )
 
 const schemaVersion = 1
@@ -38,6 +41,9 @@ type Config struct {
 
 	RetryAttempts     int `json:"retry_attempts"`
 	RetryDelaySeconds int `json:"retry_delay_seconds"`
+
+	DockerTimeoutSeconds   int `json:"docker_timeout_seconds"`
+	DockerUpTimeoutSeconds int `json:"docker_up_timeout_seconds"`
 
 	PollIntervalSeconds int `json:"poll_interval_seconds"`
 
@@ -69,6 +75,9 @@ func Default() *Config {
 		RetryAttempts:     3,
 		RetryDelaySeconds: 20,
 
+		DockerTimeoutSeconds:   60,
+		DockerUpTimeoutSeconds: 1800,
+
 		PollIntervalSeconds: 0,
 
 		HealthWatchSeconds:        300,
@@ -88,6 +97,14 @@ func Default() *Config {
 	}
 }
 
+func loadDefaults() *Config {
+	cfg := Default()
+	cfg.RepoPath = ""
+	cfg.ProjectName = ""
+	cfg.ComposeFile = ""
+	return cfg
+}
+
 func ResolvePath(flagValue string) string {
 	if flagValue != "" {
 		return flagValue
@@ -104,19 +121,13 @@ func Load(path string, overrides Overrides, logger *slog.Logger) (*Config, error
 		return nil, fmt.Errorf("reading config file %s: %w", path, err)
 	}
 
-	// Checked against the raw JSON, not the merged Config below: Default()
-	// pre-fills repo_path/compose_file/project_name, so validating against
-	// the merged struct would never catch an omitted key.
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parsing config file %s: %w", path, err)
 	}
 	warnUnknownFields(raw, logger)
-	if err := validateRequired(raw); err != nil {
-		return nil, err
-	}
 
-	cfg := Default()
+	cfg := loadDefaults()
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parsing config file %s: %w", path, err)
 	}
@@ -148,19 +159,51 @@ func warnUnknownFields(raw map[string]json.RawMessage, logger *slog.Logger) {
 	}
 }
 
-func validateRequired(raw map[string]json.RawMessage) error {
-	for _, field := range []string{"repo_path", "project_name"} {
-		val, ok := raw[field]
-		if !ok {
-			return fmt.Errorf("config: %s is required", field)
-		}
-		var s string
-		if err := json.Unmarshal(val, &s); err != nil || s == "" {
-			return fmt.Errorf("config: %s is required", field)
+func (c *Config) validateRequired() error {
+	for _, f := range []struct {
+		name  string
+		value string
+	}{
+		{"repo_path", c.RepoPath},
+		{"project_name", c.ProjectName},
+		{"remote", c.Remote},
+		{"branch", c.Branch},
+		{"state_file", c.StateFile},
+	} {
+		if f.value == "" {
+			return fmt.Errorf("config: %s is required", f.name)
 		}
 	}
-	if rawFieldString(raw, "compose_file") == "" && rawFieldString(raw, "compose_dir") == "" {
+	if c.ComposeFile == "" && c.ComposeDir == "" {
 		return fmt.Errorf("config: one of compose_file or compose_dir is required")
+	}
+	if c.ProjectName != loader.NormalizeProjectName(c.ProjectName) {
+		return fmt.Errorf("config: project_name %q must consist only of lowercase letters, digits, hyphens and underscores, and start with a letter or digit", c.ProjectName)
+	}
+	return c.validateComposePath()
+}
+
+func (c *Config) validateComposePath() error {
+	field, path, wantDir := "compose_file", c.ComposeFile, false
+	if c.ComposeDir != "" {
+		field, path, wantDir = "compose_dir", c.ComposeDir, true
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(c.RepoPath, path)
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("config: checking %s %s: %w", field, path, err)
+	}
+	if info.IsDir() != wantDir {
+		kind := "a file"
+		if wantDir {
+			kind = "a directory"
+		}
+		return fmt.Errorf("config: %s %s must be %s", field, path, kind)
 	}
 	return nil
 }
@@ -191,6 +234,9 @@ func knownTopLevelFields() map[string]bool {
 }
 
 func (c *Config) Validate(logger *slog.Logger) error {
+	if err := c.validateRequired(); err != nil {
+		return err
+	}
 	if c.HealthWatchSeconds < 0 {
 		return fmt.Errorf("config: health_watch_seconds must be >= 0")
 	}
@@ -214,6 +260,12 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	}
 	if c.PollIntervalSeconds < 0 {
 		return fmt.Errorf("config: poll_interval_seconds must be >= 0")
+	}
+	if c.DockerTimeoutSeconds < 0 {
+		return fmt.Errorf("config: docker_timeout_seconds must be >= 0")
+	}
+	if c.DockerUpTimeoutSeconds < 0 {
+		return fmt.Errorf("config: docker_up_timeout_seconds must be >= 0")
 	}
 	if c.PprofListen != "" && !isLoopback(c.PprofListen) {
 		return fmt.Errorf("config: pprof_listen must be a loopback address, got %q", c.PprofListen)

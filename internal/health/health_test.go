@@ -220,3 +220,103 @@ func TestWatchStuckStartingForWholeWindowFails(t *testing.T) {
 		t.Fatalf("Outcome = %v, want Unhealthy (stuck starting for full window)", result.Outcome)
 	}
 }
+
+func TestWatchEmptySnapshotFailsWhenContainersAreExpected(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{{}}}
+	opts := baseOpts()
+	opts.ExpectContainers = true
+
+	result, err := Watch(t.Context(), snap, &fakeClock{}, opts, testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if result.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want Unhealthy: a project with services and no containers is not a healthy deploy", result.Outcome)
+	}
+}
+
+func TestWatchEmptySnapshotStaysHealthyForAServicelessProject(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{{}}}
+
+	result, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if result.Outcome != Healthy {
+		t.Fatalf("Outcome = %v, want Healthy", result.Outcome)
+	}
+}
+
+func TestWatchContainersDisappearingMidWindowFails(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web"), running("c2", "db")}},
+		{Containers: []ContainerStatus{running("c1", "web")}},
+	}}
+	opts := baseOpts()
+	opts.ExpectContainers = true
+
+	result, err := Watch(t.Context(), snap, &fakeClock{}, opts, testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if result.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want Unhealthy when a service's container vanishes", result.Outcome)
+	}
+}
+
+func TestWatchRecreatedContainerKeepsItsRestartBudget(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRunning, RestartCount: 3}}},
+		{Containers: []ContainerStatus{{ID: "c2", Service: "web", State: StateRunning, RestartCount: 5}}},
+	}}
+	opts := baseOpts()
+	opts.RestartTolerance = 1
+
+	result, err := Watch(t.Context(), snap, &fakeClock{}, opts, testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if result.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want Unhealthy: a new container ID must not reset the restart baseline", result.Outcome)
+	}
+}
+
+func TestWatchAlternatingStartingAndUnhealthyReachesTheStreakLimit(t *testing.T) {
+	unhealthyC := ContainerStatus{ID: "c1", Service: "web", State: StateRunning, Health: HealthUnhealthy}
+	startingC := ContainerStatus{ID: "c1", Service: "web", State: StateRunning, Health: HealthStarting}
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
+		{Containers: []ContainerStatus{unhealthyC}},
+		{Containers: []ContainerStatus{startingC}},
+		{Containers: []ContainerStatus{unhealthyC}},
+		{Containers: []ContainerStatus{startingC}},
+		{Containers: []ContainerStatus{unhealthyC}},
+	}}
+	opts := baseOpts()
+	opts.UnhealthyStreakLimit = 3
+
+	result, err := Watch(t.Context(), snap, &fakeClock{}, opts, testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if result.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want Unhealthy: a starting poll must not clear the unhealthy streak", result.Outcome)
+	}
+}
+
+func TestWatchDisabledSkipsTheBaselineSnapshot(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{{}}}
+	opts := baseOpts()
+	opts.WatchDuration = 0
+
+	result, err := Watch(t.Context(), snap, &fakeClock{}, opts, testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if result.Outcome != Healthy {
+		t.Fatalf("Outcome = %v, want Healthy", result.Outcome)
+	}
+	if snap.call != 0 {
+		t.Errorf("took %d snapshots, want 0 when the watch is disabled", snap.call)
+	}
+}

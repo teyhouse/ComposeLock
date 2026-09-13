@@ -15,9 +15,15 @@ const maxConcurrentInspects = 16
 
 type ComposeSnapshotter struct {
 	Service *compose.Service
+	Timeout time.Duration
 }
 
 func (s *ComposeSnapshotter) Snapshot(ctx context.Context, projectName string) (Snapshot, error) {
+	if s.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
+		defer cancel()
+	}
 	summaries, err := s.Service.Ps(ctx, projectName)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("listing containers: %w", err)

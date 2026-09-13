@@ -35,7 +35,7 @@ func recoverFromCrash(ctx context.Context, opts Options, deps Deps, st *state.St
 		return Result{NewCommit: commit, Err: fmt.Errorf("saving state: %w", err)}
 	}
 
-	stacks, stacksErr := StacksFor(deps.Config)
+	stacks, stacksErr := previousStacksAt(deps)
 
 	if st.RevertInProgress() {
 		deps.Log.Warn("crash recovery: resuming interrupted revert", "pending_commit", commit, "attempt", st.PendingAttempts)
@@ -47,21 +47,22 @@ func recoverFromCrash(ctx context.Context, opts Options, deps Deps, st *state.St
 		return result
 	}
 
-	liveHealthy, reason, err := evaluateLive(ctx, deps, stacks)
+	if stacksErr != nil {
+		return Result{NewCommit: commit, Err: fmt.Errorf("discovering compose stacks: %w", stacksErr)}
+	}
+
+	live, err := evaluateLive(ctx, deps, stacks)
 	if err != nil {
 		return Result{NewCommit: commit, Err: fmt.Errorf("crash recovery: live snapshot: %w", err)}
 	}
-	if !liveHealthy {
-		deps.Log.Warn("crash recovery: live stack unhealthy, reverting immediately", "reason", reason)
-		if stacksErr != nil {
-			return Result{NewCommit: commit, Err: fmt.Errorf("discovering compose stacks: %w", stacksErr)}
-		}
-		result := doRevert(ctx, deps, st, stacks, commit, "crash recovery: live stack unhealthy: "+reason, start)
+	if !live.healthy {
+		deps.Log.Warn("crash recovery: live stack unhealthy, reverting immediately", "reason", live.reason)
+		result := doRevert(ctx, deps, st, stacks, commit, "crash recovery: live stack unhealthy: "+live.reason, start)
 		result.NewCommit = commit
 		return result
 	}
 
 	deps.Log.Info("crash recovery: live stack healthy, re-applying pending commit",
 		"pending_commit", commit, "attempt", st.PendingAttempts)
-	return applyAndWatch(ctx, deps, st, Result{NewCommit: commit, OldCommit: st.LastHealthyCommit}, stacks, start)
+	return applyAndWatch(ctx, deps, st, Result{NewCommit: commit, OldCommit: st.LastHealthyCommit}, stacks, live.snapshots, start)
 }

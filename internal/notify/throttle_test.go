@@ -43,10 +43,44 @@ func TestSendThrottledLetsDifferentKeysThrough(t *testing.T) {
 
 	n.SendThrottled(t.Context(), "git-sync", Embed{Title: "a"})
 	n.SendThrottled(t.Context(), "preflight:abc", Embed{Title: "b"})
-	n.SendThrottled(t.Context(), "git-sync", Embed{Title: "c"})
 
-	if got := posts.Load(); got != 3 {
-		t.Errorf("posted %d times, want 3", got)
+	if got := posts.Load(); got != 2 {
+		t.Errorf("posted %d times, want 2", got)
+	}
+}
+
+func TestSendThrottledSuppressesPerKeyNotJustTheLastOne(t *testing.T) {
+	var posts atomic.Int64
+	srv := countingServer(t, &posts)
+	n := New(srv.URL, slog.New(slog.DiscardHandler))
+
+	for range 3 {
+		n.SendThrottled(t.Context(), "git-sync", Embed{Title: "a"})
+		n.SendThrottled(t.Context(), "preflight:abc", Embed{Title: "b"})
+	}
+
+	if got := posts.Load(); got != 2 {
+		t.Errorf("posted %d times, want 2: alternating keys must each stay suppressed", got)
+	}
+}
+
+func TestSendThrottledDoesNotClaimTheWindowOnAFailedPost(t *testing.T) {
+	var posts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if posts.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	n := New(srv.URL, slog.New(slog.DiscardHandler))
+
+	n.SendThrottled(t.Context(), "git-sync", Embed{Title: "a"})
+	n.SendThrottled(t.Context(), "git-sync", Embed{Title: "a"})
+
+	if got := posts.Load(); got != 2 {
+		t.Errorf("posted %d times, want 2: a rejected notification must not suppress the retry", got)
 	}
 }
 

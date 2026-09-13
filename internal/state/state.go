@@ -14,10 +14,13 @@ const schemaVersion = 1
 type Result string
 
 const (
-	ResultSuccess     Result = "success"
-	ResultFailedApply Result = "failed_apply"
-	ResultReverted    Result = "reverted"
-	ResultDegraded    Result = "degraded"
+	ResultSuccess         Result = "success"
+	ResultFailedGit       Result = "failed_git"
+	ResultFailedPreflight Result = "failed_preflight"
+	ResultSkippedKnownBad Result = "skipped_known_bad"
+	ResultFailedApply     Result = "failed_apply"
+	ResultReverted        Result = "reverted"
+	ResultDegraded        Result = "degraded"
 )
 
 type State struct {
@@ -58,6 +61,9 @@ func Load(path string) (*State, error) {
 	}
 	if st.SchemaVersion == 0 {
 		st.SchemaVersion = schemaVersion
+	}
+	if st.SchemaVersion > schemaVersion {
+		return nil, fmt.Errorf("state file %s has schema_version %d, this build understands %d: upgrade composelock", path, st.SchemaVersion, schemaVersion)
 	}
 	return &st, nil
 }

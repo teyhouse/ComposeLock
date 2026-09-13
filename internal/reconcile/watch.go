@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/compose-spec/compose-go/v2/types"
+
 	"github.com/teyhouse/ComposeLock/internal/compose"
 	"github.com/teyhouse/ComposeLock/internal/health"
 )
@@ -19,9 +21,9 @@ type stackWatchOutcome struct {
 	err    error
 }
 
-func watchStacks(ctx context.Context, deps Deps, stacks []compose.Stack, commit string) (health.Result, error) {
+func watchStacks(ctx context.Context, deps Deps, stacks []compose.Stack, projects []*types.Project, commit string) (health.Result, map[string]health.Snapshot, error) {
 	if len(stacks) == 0 {
-		return health.Result{Outcome: health.Healthy}, nil
+		return health.Result{Outcome: health.Healthy}, nil, nil
 	}
 
 	cfg := deps.Config
@@ -41,7 +43,7 @@ func watchStacks(ctx context.Context, deps Deps, stacks []compose.Stack, commit 
 		}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			opts := healthOptions(cfg, s.ProjectName, commit)
+			opts := healthOptions(cfg, s.ProjectName, commit, expectsContainers(projects, i))
 			res, err := health.Watch(watchCtx, deps.Health, deps.Clock, opts, deps.Log)
 			outcomes[i] = stackWatchOutcome{stack: s, result: res, err: err}
 			if err == nil && res.Outcome != health.Healthy {
@@ -52,15 +54,18 @@ func watchStacks(ctx context.Context, deps Deps, stacks []compose.Stack, commit 
 	wg.Wait()
 
 	combined := health.Result{Outcome: health.Healthy}
-	var reasons []string
+	baselines := make(map[string]health.Snapshot, len(outcomes))
+	var reasons, notEvaluated []string
 	for _, o := range outcomes {
 		if o.err != nil {
 			if ctx.Err() == nil && errors.Is(o.err, context.Canceled) {
 				deps.Log.Info("health watch: stopped early, another stack already failed", "project", o.stack.ProjectName)
+				notEvaluated = append(notEvaluated, o.stack.ProjectName)
 				continue
 			}
-			return health.Result{}, fmt.Errorf("stack %s: %w", o.stack.ProjectName, o.err)
+			return health.Result{}, nil, fmt.Errorf("stack %s: %w", o.stack.ProjectName, o.err)
 		}
+		baselines[o.stack.ProjectName] = o.result.Baseline
 		if o.result.Outcome != health.Healthy {
 			combined.Outcome = health.Unhealthy
 			reasons = append(reasons, o.stack.ProjectName+": "+o.result.Reason)
@@ -69,6 +74,13 @@ func watchStacks(ctx context.Context, deps Deps, stacks []compose.Stack, commit 
 			}
 		}
 	}
+	if len(notEvaluated) > 0 {
+		reasons = append(reasons, "not evaluated, stopped early: "+strings.Join(notEvaluated, ", "))
+	}
 	combined.Reason = strings.Join(reasons, "; ")
-	return combined, nil
+	return combined, baselines, nil
+}
+
+func expectsContainers(projects []*types.Project, i int) bool {
+	return i < len(projects) && projects[i] != nil && len(projects[i].Services) > 0
 }
