@@ -93,11 +93,10 @@ func TestCheckEnvFilesRejectsDirectory(t *testing.T) {
 	}
 }
 
-func TestProjectPathsCollectsEveryRuntimeInput(t *testing.T) {
+func TestProjectInputsCollectsEveryRuntimeInput(t *testing.T) {
 	project := &types.Project{
-		Name:         "app",
-		WorkingDir:   "/repo/stack",
-		ComposeFiles: []string{"/repo/stack/docker-compose.yml"},
+		Name:       "app",
+		WorkingDir: "/repo/stack",
 		Services: types.Services{
 			"web": types.ServiceConfig{
 				Name:     "web",
@@ -111,26 +110,28 @@ func TestProjectPathsCollectsEveryRuntimeInput(t *testing.T) {
 		},
 	}
 
-	got := ProjectPaths(project)
+	got, complete := ProjectInputs(project)
 	want := []string{
 		"/etc/secrets/shared.env",
 		"/repo/stack/.env",
-		"/repo/stack/docker-compose.yml",
 		"/repo/stack/src",
 		"/repo/stack/src/Dockerfile",
 		"/repo/stack/web.env",
 	}
 	if !slices.Equal(got, want) {
-		t.Errorf("ProjectPaths = %q, want %q", got, want)
+		t.Errorf("ProjectInputs = %q, want %q", got, want)
+	}
+	if !complete {
+		t.Error("expected the input set to be complete")
 	}
 }
 
-func TestProjectPathsSkipsRelativePathsWithoutAWorkingDir(t *testing.T) {
+func TestProjectInputsSkipsRelativePathsWithoutAWorkingDir(t *testing.T) {
 	project := &types.Project{
 		Name:     "app",
 		Services: types.Services{"web": types.ServiceConfig{Name: "web", EnvFiles: []types.EnvFile{{Path: "web.env"}}}},
 	}
-	if got := ProjectPaths(project); len(got) != 0 {
-		t.Errorf("ProjectPaths = %q, want empty when the project has no working directory", got)
+	if got, _ := ProjectInputs(project); len(got) != 0 {
+		t.Errorf("ProjectInputs = %q, want empty when the project has no working directory", got)
 	}
 }

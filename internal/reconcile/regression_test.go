@@ -3,11 +3,13 @@ package reconcile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	ctypes "github.com/compose-spec/compose-go/v2/types"
@@ -361,7 +363,12 @@ func (s *toggleSnapshotter) Snapshot(context.Context, string) (health.Snapshot, 
 	return healthySnapshot(), nil
 }
 
-func singleFileProject(dir string) *ctypes.Project {
+func singleFileProject(t *testing.T, dir string) *ctypes.Project {
+	t.Helper()
+	writeComposeFile(t, filepath.Join(dir, "docker-compose.yml"), validComposeYAML)
+	if err := os.WriteFile(filepath.Join(dir, "app.env"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	return &ctypes.Project{
 		Name:         "test-stack",
 		WorkingDir:   dir,
@@ -387,10 +394,7 @@ func singleFileDeps(t *testing.T, g *fakeGit, compose *fakeCompose, snap health.
 
 func TestReconcileSingleFileEnvFileChangeIsApplied(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "app.env"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	compose := &fakeCompose{project: singleFileProject(dir)}
+	compose := &fakeCompose{project: singleFileProject(t, dir)}
 	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "app.env"
 	deps, store := singleFileDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
@@ -407,10 +411,7 @@ func TestReconcileSingleFileEnvFileChangeIsApplied(t *testing.T) {
 
 func TestReconcileSingleFileBuildContextChangeIsApplied(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "app.env"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	compose := &fakeCompose{project: singleFileProject(dir)}
+	compose := &fakeCompose{project: singleFileProject(t, dir)}
 	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "app/src/main.go"
 	deps, _ := singleFileDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
@@ -422,10 +423,7 @@ func TestReconcileSingleFileBuildContextChangeIsApplied(t *testing.T) {
 
 func TestReconcileSingleFileUnrelatedChangeStillSkips(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "app.env"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	compose := &fakeCompose{project: singleFileProject(dir)}
+	compose := &fakeCompose{project: singleFileProject(t, dir)}
 	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "docs/README.md"
 	deps, store := singleFileDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
@@ -552,5 +550,97 @@ func TestReconcileDryRunReportsAPreflightBlock(t *testing.T) {
 	}
 	if store.State.PreflightBlocks != 0 || store.State.LastResult == state.ResultDegraded {
 		t.Errorf("a dry run must not write state, got %+v", store.State)
+	}
+}
+
+func TestReconcileInfraErrorDuringUpDoesNotBlameTheCommit(t *testing.T) {
+	compose := &fakeCompose{upErrs: []error{fmt.Errorf("compose up: %w", syscall.ECONNREFUSED)}}
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if result.Err == nil {
+		t.Fatal("expected the daemon failure to surface")
+	}
+	if result.Degraded || result.Reverted {
+		t.Errorf("a daemon outage must not trigger a revert or DEGRADED, result = %+v", result)
+	}
+	if store.State.IsKnownBad("bbb222") {
+		t.Errorf("bbb222 must stay eligible for a retry, state = %+v", store.State)
+	}
+	if !store.State.Pending() {
+		t.Error("the apply must stay pending so the next run recovers it")
+	}
+	if result.Notification == nil {
+		t.Error("expected a notification for the infrastructure failure")
+	}
+}
+
+func TestReconcileInfraErrorDuringLoadDoesNotBlameTheCommit(t *testing.T) {
+	compose := &fakeCompose{loadErr: fmt.Errorf("loading compose project: %w", context.DeadlineExceeded)}
+	g := gitChange("aaa111", "bbb222")
+	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
+
+	if first := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); first.Err == nil {
+		t.Fatal("expected the load timeout to surface")
+	}
+	if store.State.IsKnownBad("bbb222") {
+		t.Fatalf("bbb222 must stay eligible for a retry, state = %+v", store.State)
+	}
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want the checkout restored to %q", g.head, "aaa111")
+	}
+
+	compose.loadErr = nil
+	if second := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); !second.Applied {
+		t.Errorf("expected the next tick to apply once the timeout cleared, result = %+v", second)
+	}
+}
+
+func TestReconcileParseErrorDuringLoadStillBlamesTheCommit(t *testing.T) {
+	compose := &fakeCompose{loadErr: errors.New("yaml: mapping values are not allowed in this context")}
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
+
+	if result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); result.Err == nil {
+		t.Fatal("expected the parse error to surface")
+	}
+	if !store.State.IsKnownBad("bbb222") {
+		t.Errorf("a commit that cannot be parsed must be recorded as known-bad, state = %+v", store.State)
+	}
+}
+
+func TestReconcileSingleFileIncludedFragmentChangeIsApplied(t *testing.T) {
+	dir := t.TempDir()
+	project := singleFileProject(t, dir)
+	writeComposeFile(t, filepath.Join(dir, "docker-compose.yml"), "include:\n  - shared/base.yaml\n"+validComposeYAML)
+	writeComposeFile(t, filepath.Join(dir, "shared", "base.yaml"), validComposeYAML)
+
+	compose := &fakeCompose{project: project}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "shared/base.yaml"
+	deps, store := singleFileDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected a change to an included fragment to be applied, result = %+v", result)
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}
+
+func TestReconcileSingleFileUnresolvableIncludeIsTreatedAsRelevant(t *testing.T) {
+	dir := t.TempDir()
+	project := singleFileProject(t, dir)
+	writeComposeFile(t, filepath.Join(dir, "docker-compose.yml"), "include:\n  - ${FRAGMENT_DIR}/base.yaml\n"+validComposeYAML)
+
+	compose := &fakeCompose{project: project}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "docs/README.md"
+	deps, _ := singleFileDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
+
+	if result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps); !result.Applied {
+		t.Fatalf("an input set that cannot be enumerated must fall back to applying, result = %+v", result)
 	}
 }

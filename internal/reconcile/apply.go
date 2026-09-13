@@ -205,7 +205,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 
 	stacks, err := stacksAllowingEmpty(deps)
 	if err != nil {
-		return abortBadCommit(ctx, deps, st, result, "discovering compose stacks failed", err)
+		return abortApply(ctx, deps, st, result, "discovering compose stacks failed", err)
 	}
 	vanished := vanishedStacks(previousStacks, stacks)
 
@@ -235,10 +235,10 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	for i, s := range changedStacks {
 		project, err := deps.Compose.LoadProject(ctx, s.Files, s.ProjectName)
 		if err != nil {
-			return abortBadCommit(ctx, deps, st, result, "loading compose project failed", fmt.Errorf("loading project %s: %w", s.ProjectName, err))
+			return abortApply(ctx, deps, st, result, "loading compose project failed", fmt.Errorf("loading project %s: %w", s.ProjectName, err))
 		}
 		if err := compose.CheckEnvFiles(project); err != nil {
-			return abortBadCommit(ctx, deps, st, result, "env_file missing", err)
+			return abortApply(ctx, deps, st, result, "env_file missing", err)
 		}
 		projects[i] = project
 	}
@@ -268,6 +268,9 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 			if ctx.Err() != nil {
 				result.Err = fmt.Errorf("compose up interrupted: %w", err)
 				return result
+			}
+			if compose.IsInfraError(err) {
+				return applyInterrupted(deps, st, result, s.ProjectName, err)
 			}
 			deps.Log.Error("compose up failed, reverting", "stack", s.ProjectName, "err", err)
 			return failAndRevert(ctx, deps, st, changedStacks, result, fmt.Sprintf("applying %s (%s) failed: %v", shortCommit(commit), s.ProjectName, err), start)
@@ -337,9 +340,30 @@ func failAndRevert(ctx context.Context, deps Deps, st *state.State, stacks []com
 	return result
 }
 
-func abortBadCommit(ctx context.Context, deps Deps, st *state.State, result Result, title string, err error) Result {
+func abortApply(ctx context.Context, deps Deps, st *state.State, result Result, title string, err error) Result {
+	if compose.IsInfraError(err) {
+		deps.Log.Warn("aborting on an infrastructure error, the commit stays eligible for a retry", "err", err)
+		return abortBeforeUp(ctx, deps, st, result, title, err)
+	}
 	st.MarkFailed(result.NewCommit, deps.Clock.Now())
 	return abortBeforeUp(ctx, deps, st, result, title, err)
+}
+
+func applyInterrupted(deps Deps, st *state.State, result Result, projectName string, err error) Result {
+	result.Err = fmt.Errorf("compose up of %s hit an infrastructure error: %w", projectName, err)
+	deps.Log.Error("compose up failed on infrastructure, leaving the apply pending for the next run",
+		"stack", projectName, "commit", result.NewCommit, "err", err)
+	recordOutcome(deps, st, state.ResultFailedApply, result.NewCommit)
+	embed := notify.BuildEmbed(notify.Report{
+		Outcome: notify.OutcomeFailure,
+		Title:   "ComposeLock: infrastructure error during apply, will retry",
+		Commit:  result.NewCommit,
+		Branch:  deps.Config.Branch,
+		Err:     result.Err,
+	})
+	result.Notification = &embed
+	result.NotificationKey = "infra:" + result.NewCommit
+	return result
 }
 
 func abortBeforeUp(ctx context.Context, deps Deps, st *state.State, result Result, title string, err error) Result {
@@ -393,7 +417,11 @@ func composeFileRelevant(ctx context.Context, deps Deps, changedFiles []string) 
 		deps.Log.Warn("loading the compose project to weigh a change failed, treating the commit as relevant", "err", err)
 		return true
 	}
-	inputs := compose.ProjectPaths(project)
+	inputs, complete := compose.ProjectInputs(project)
+	if !complete {
+		deps.Log.Info("compose project has inputs that cannot be resolved without applying it, treating the commit as relevant", "inputs", inputs)
+		return true
+	}
 	deps.Log.Debug("weighing changed files against the project's inputs", "inputs", inputs)
 	return dependencyChanged(cfg.RepoPath, inputs, changedFiles)
 }

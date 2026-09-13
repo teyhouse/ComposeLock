@@ -502,3 +502,36 @@ func TestRestartedServicesNamesInPlaceRestarts(t *testing.T) {
 		t.Errorf("ChangedServices = %v, want empty: the container kept its id", got)
 	}
 }
+
+func TestWatchContainerReplacedWithAFreshIDFails(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRunning, RestartCount: 4}}},
+		{Containers: []ContainerStatus{{ID: "c9", Service: "web", State: StateRunning, RestartCount: 0}}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want unhealthy: a container swapped out mid-window is not the one that was deployed", res.Outcome)
+	}
+	if !strings.Contains(res.Reason, "replaced") {
+		t.Errorf("Reason = %q, want it to name the replacement", res.Reason)
+	}
+}
+
+func TestWatchScalingUpKeepsTheBaselineContainers(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
+		{Containers: []ContainerStatus{running("c1", "web"), running("c2", "web")}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Healthy {
+		t.Errorf("Outcome = %v (%s), want healthy: an extra replica alongside the baseline is not a replacement", res.Outcome, res.Reason)
+	}
+}

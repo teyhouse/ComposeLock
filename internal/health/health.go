@@ -122,9 +122,11 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 		return res, nil
 	}
 	baselineRestarts := make(map[string]int, len(baseline.Containers))
+	baselineService := make(map[string]string, len(baseline.Containers))
 	baselineCounts := make(map[string]int, len(baseline.Containers))
 	for _, c := range baseline.Containers {
 		baselineRestarts[c.ID] = c.RestartCount
+		baselineService[c.ID] = c.Service
 		baselineCounts[c.Service]++
 	}
 
@@ -154,7 +156,7 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 			res.Baseline = baseline
 			return res, nil
 		}
-		if reason, ok := missingReplicas(baselineCounts, cur); !ok {
+		if reason, ok := missingContainers(baselineService, baselineCounts, cur); !ok {
 			result.Reason = fmt.Sprintf("container disappeared: %s", reason)
 			result.Failures = append(result.Failures, result.Reason)
 			log.Warn("health watch: container disappeared", "detail", reason)
@@ -272,18 +274,31 @@ func containerIDs(snap Snapshot) map[string][]string {
 	return byService
 }
 
-func missingReplicas(baselineCounts map[string]int, cur Snapshot) (string, bool) {
-	present := make(map[string]int, len(cur.Containers))
+func missingContainers(baselineService map[string]string, baselineCounts map[string]int, cur Snapshot) (string, bool) {
+	present := make(map[string]struct{}, len(cur.Containers))
+	counts := make(map[string]int, len(cur.Containers))
 	for _, c := range cur.Containers {
-		present[c.Service]++
+		present[c.ID] = struct{}{}
+		counts[c.Service]++
 	}
-	for _, service := range slices.Sorted(maps.Keys(baselineCounts)) {
-		want := baselineCounts[service]
-		if got := present[service]; got < want {
+	for _, id := range slices.Sorted(maps.Keys(baselineService)) {
+		if _, ok := present[id]; ok {
+			continue
+		}
+		service := baselineService[id]
+		if got, want := counts[service], baselineCounts[service]; got < want {
 			return fmt.Sprintf("%s (%d of %d replicas)", service, got, want), false
 		}
+		return fmt.Sprintf("%s (container %s was replaced)", service, shortID(id)), false
 	}
 	return "", true
+}
+
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 func RestartedServices(before, after Snapshot) []string {

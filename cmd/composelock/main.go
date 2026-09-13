@@ -69,6 +69,10 @@ func run(args []string) int {
 		return cmdInit(f)
 	}
 
+	if f.withState {
+		fmt.Fprintf(os.Stderr, "warning: -with-state only applies to the init command, ignoring it for %s\n", command)
+	}
+
 	if err := checkFlagsFor(command, f); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
@@ -113,9 +117,15 @@ func checkFlagsFor(command string, f *cliFlags) error {
 	}
 	var rejected []string
 	f.fs.Visit(func(fl *flag.Flag) {
-		if fl.Name == "dry-run" || fl.Name == "force" {
-			rejected = append(rejected, "-"+fl.Name)
+		if fl.Name != "dry-run" && fl.Name != "force" {
+			return
 		}
+		if getter, ok := fl.Value.(flag.Getter); ok {
+			if on, isBool := getter.Get().(bool); isBool && !on {
+				return
+			}
+		}
+		rejected = append(rejected, "-"+fl.Name)
 	})
 	if len(rejected) > 0 {
 		return fmt.Errorf("%s does not accept %s: it always reconciles for real", command, strings.Join(rejected, " and "))
