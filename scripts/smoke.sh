@@ -23,6 +23,8 @@ BIN="$WORK/composelock"
 CFG="$WORK/composelock.json"
 SEED="$WORK/seed"
 REPO="$WORK/repo"
+REC_STATE="$WORK/recovery-state.json"
+LOCK_STATE="$WORK/lock-state.json"
 SUCCESS=0
 
 remove_stack() {
@@ -111,6 +113,24 @@ expect_log() {
 	fi
 }
 
+expect_head() {
+	local label=$1 want=$2 got
+	got=$(git -C "$REPO" rev-parse HEAD)
+	if [ "$got" != "$want" ]; then
+		echo "FAIL $label: repo HEAD is $got, want $want" >&2
+		exit 1
+	fi
+}
+
+expect_state_field() {
+	local label=$1 file=$2 field=$3 want=$4 got
+	got=$(sed -n "s/.*\"$field\": \{0,1\}\(.*\),\{0,1\}$/\1/p" "$file" | tr -d '", ')
+	if [ "$got" != "$want" ]; then
+		echo "FAIL $label: $field is '$got', want '$want'" >&2
+		exit 1
+	fi
+}
+
 if [ -z "$WEBHOOK" ]; then
 	echo "COMPOSELOCK_SMOKE_DISCORD_WEBHOOK is not set: running without Discord notifications"
 fi
@@ -163,6 +183,58 @@ expect_log 07-degraded '"degraded":true'
 run_step 08-degraded-refuses 3 --state-file "$WORK/fresh-state.json" sync
 expect_log 08-degraded-refuses 'refusing to reconcile'
 
+remove_stack
+write_compose '["sleep", "infinity"]'
+publish "v5: healthy baseline for crash recovery"
+run_step 09-recovery-baseline 0 --state-file "$REC_STATE" sync
+expect_log 09-recovery-baseline '"applied":true'
+GOOD_COMMIT=$(git -C "$REPO" rev-parse HEAD)
+
+cat >"$SEED/docker-compose.yml" <<'EOF'
+services: not-a-valid-services-mapping
+EOF
+publish "v6: unloadable compose, never synced"
+BAD_COMMIT=$(git -C "$SEED" rev-parse HEAD)
+git -C "$REPO" fetch -q origin main
+
+cat >"$REC_STATE" <<EOF
+{
+  "schema_version": 1,
+  "last_healthy_commit": "$GOOD_COMMIT",
+  "last_result": "success",
+  "pending_commit": "$BAD_COMMIT"
+}
+EOF
+
+for attempt in 1 2 3; do
+	run_step "10-recovery-attempt-$attempt" 1 --state-file "$REC_STATE" sync
+	expect_log "10-recovery-attempt-$attempt" 'crash recovery'
+	expect_head "10-recovery-attempt-$attempt" "$GOOD_COMMIT"
+	expect_state_field "10-recovery-attempt-$attempt" "$REC_STATE" pending_attempts "$attempt"
+done
+
+run_step 11-recovery-gives-up 3 --state-file "$REC_STATE" sync
+expect_log 11-recovery-gives-up 'attempt limit reached'
+expect_log 11-recovery-gives-up '"degraded":true'
+run_step 12-recovery-stays-degraded 3 --state-file "$REC_STATE" sync
+expect_log 12-recovery-stays-degraded 'refusing to reconcile'
+
+write_compose '["sleep", "2147483647"]'
+publish "v7: healthy change that keeps the health watch busy"
+"$BIN" --config "$CFG" --state-file "$LOCK_STATE" sync >"$WORK/logs/14-lock-holder.log" 2>&1 &
+HOLDER_PID=$!
+sleep 4
+run_step 13-lock-skipped 0 --state-file "$LOCK_STATE" sync
+expect_log 13-lock-skipped 'holds the state lock'
+HOLDER_RC=0
+wait "$HOLDER_PID" || HOLDER_RC=$?
+if [ "$HOLDER_RC" -ne 0 ]; then
+	echo "FAIL 14-lock-holder: exit $HOLDER_RC, want 0 (log: $WORK/logs/14-lock-holder.log)" >&2
+	tail -n 5 "$WORK/logs/14-lock-holder.log" >&2
+	exit 1
+fi
+echo "ok   14-lock-holder (exit $HOLDER_RC)"
+
 if grep -h 'discord notify:' "$WORK"/logs/*.log >&2; then
 	echo "FAIL: Discord rejected or never received a notification" >&2
 	exit 1
@@ -175,5 +247,5 @@ fi
 SUCCESS=1
 echo "smoke test passed"
 if [ -n "$WEBHOOK" ]; then
-	echo "expect 6 Discord notifications: deployed, reverted, env_file failure, deployed, git sync failed, DEGRADED"
+	echo "expect 12 Discord notifications: deployed, reverted, env_file failure, deployed, git sync failed, DEGRADED, deployed, 3x crash-recovery failure, DEGRADED, deployed"
 fi

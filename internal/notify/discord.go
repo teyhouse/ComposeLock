@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type Color int
@@ -88,7 +92,12 @@ type Report struct {
 	StderrTail  string
 }
 
-const maxErrorFieldLen = 500
+const (
+	maxErrorFieldLen = 500
+	maxFieldValueLen = 1024
+	maxTitleLen      = 256
+	maxFields        = 25
+)
 
 func BuildEmbed(r Report) Embed {
 	commit := r.Commit
@@ -134,8 +143,16 @@ func BuildEmbed(r Report) Embed {
 		title += " " + r.Title
 	}
 
+	if len(fields) > maxFields {
+		fields = fields[:maxFields]
+	}
+	for i := range fields {
+		fields[i].Name = truncate(fields[i].Name, maxFieldValueLen)
+		fields[i].Value = orDash(truncate(fields[i].Value, maxFieldValueLen))
+	}
+
 	return Embed{
-		Title:  title,
+		Title:  truncate(title, maxTitleLen),
 		Color:  int(r.Outcome.color()),
 		Fields: fields,
 	}
@@ -155,17 +172,33 @@ func orDash(s string) string {
 	return s
 }
 
+const ellipsis = "…"
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	cut := max(n-len(ellipsis), 0)
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + ellipsis
 }
+
+const (
+	RepeatInterval   = time.Hour
+	maxRateLimitWait = 15 * time.Second
+	drainLimit       = 8 << 10
+)
 
 type Notifier struct {
 	webhookURL string
 	client     *http.Client
 	log        *slog.Logger
+
+	mu       sync.Mutex
+	lastKey  string
+	lastSent time.Time
 }
 
 func New(webhookURL string, log *slog.Logger) *Notifier {
@@ -183,6 +216,36 @@ func (n *Notifier) Enabled() bool {
 	return n.webhookURL != ""
 }
 
+func (n *Notifier) SendThrottled(ctx context.Context, key string, embed Embed) {
+	if !n.Enabled() {
+		return
+	}
+	if key == "" {
+		n.reset()
+	} else if !n.claim(key) {
+		n.log.Info("discord notify: suppressing repeated notification", "key", key, "repeat_interval", RepeatInterval.String())
+		return
+	}
+	n.Send(ctx, embed)
+}
+
+func (n *Notifier) reset() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.lastKey, n.lastSent = "", time.Time{}
+}
+
+func (n *Notifier) claim(key string) bool {
+	now := time.Now()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.lastKey == key && now.Sub(n.lastSent) < RepeatInterval {
+		return false
+	}
+	n.lastKey, n.lastSent = key, now
+	return true
+}
+
 func (n *Notifier) Send(ctx context.Context, embed Embed) {
 	if !n.Enabled() {
 		return
@@ -194,22 +257,67 @@ func (n *Notifier) Send(ctx context.Context, embed Embed) {
 		return
 	}
 
+	for attempt := range 2 {
+		retryAfter, err := n.post(ctx, data)
+		if err != nil {
+			n.log.Warn("discord notify: request failed", "err", err)
+			return
+		}
+		if retryAfter <= 0 {
+			return
+		}
+		if attempt > 0 {
+			n.log.Warn("discord notify: still rate limited, dropping notification")
+			return
+		}
+		n.log.Warn("discord notify: rate limited, retrying", "retry_after", retryAfter.String())
+		if !sleepCtx(ctx, retryAfter) {
+			return
+		}
+	}
+}
+
+func (n *Notifier) post(ctx context.Context, data []byte) (time.Duration, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.webhookURL, bytes.NewReader(data))
 	if err != nil {
-		n.log.Warn("discord notify: building request failed", "err", redactURL(err))
-		return
+		return 0, redactURL(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := n.client.Do(req)
 	if err != nil {
-		n.log.Warn("discord notify: request failed", "err", redactURL(err))
-		return
+		return 0, redactURL(err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
+		resp.Body.Close()
+	}()
 
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return rateLimitDelay(resp.Header.Get("Retry-After")), nil
+	}
 	if resp.StatusCode >= 300 {
 		n.log.Warn("discord notify: non-2xx response", "status", resp.StatusCode)
+	}
+	return 0, nil
+}
+
+func rateLimitDelay(retryAfter string) time.Duration {
+	secs, err := strconv.ParseFloat(strings.TrimSpace(retryAfter), 64)
+	if err != nil || secs <= 0 {
+		return time.Second
+	}
+	return min(time.Duration(secs*float64(time.Second)), maxRateLimitWait)
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 

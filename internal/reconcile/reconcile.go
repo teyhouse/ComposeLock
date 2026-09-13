@@ -45,13 +45,19 @@ type Result struct {
 	Duration     time.Duration
 	Err          error
 
-	Notification *notify.Embed
+	Notification    *notify.Embed
+	NotificationKey string
 }
 
 type ComposeService interface {
 	LoadProject(ctx context.Context, composeFiles []string, projectName string) (*types.Project, error)
 	Up(ctx context.Context, project *types.Project) error
 	Down(ctx context.Context, projectName string) error
+}
+
+type Locker interface {
+	TryLock() (bool, error)
+	Unlock() error
 }
 
 type Deps struct {
@@ -62,6 +68,7 @@ type Deps struct {
 	Clock    health.Clock
 	State    state.Store
 	Notifier *notify.Notifier
+	Lock     Locker
 	Log      *slog.Logger
 }
 
@@ -76,13 +83,31 @@ func Reconcile(ctx context.Context, opts Options, deps Deps) Result {
 	}
 	result := func() Result {
 		defer singleFlight.Unlock()
+
+		if deps.Lock != nil {
+			held, err := deps.Lock.TryLock()
+			if err != nil {
+				deps.Log.Error("acquiring state lock", "err", err)
+				return Result{Err: fmt.Errorf("acquiring state lock: %w", err)}
+			}
+			if !held {
+				deps.Log.Info("another composelock process holds the state lock, skipped", "trigger", opts.Trigger)
+				return Result{Skipped: true}
+			}
+			defer func() {
+				if err := deps.Lock.Unlock(); err != nil {
+					deps.Log.Error("releasing state lock", "err", err)
+				}
+			}()
+		}
+
 		return reconcileLocked(ctx, opts, deps, start)
 	}()
 
 	result.Duration = time.Since(start)
 
 	if result.Notification != nil {
-		deps.Notifier.Send(context.WithoutCancel(ctx), *result.Notification)
+		deps.Notifier.SendThrottled(context.WithoutCancel(ctx), result.NotificationKey, *result.Notification)
 	}
 	return result
 }
@@ -224,7 +249,7 @@ func evaluateLive(ctx context.Context, deps Deps, stacks []compose.Stack) (bool,
 		if err != nil {
 			return false, "", fmt.Errorf("snapshot of %s: %w", name, err)
 		}
-		if healthy, reason := health.Evaluate(snap); !healthy {
+		if healthy, reason := health.EvaluatePreflight(snap); !healthy {
 			return false, name + ": " + reason, nil
 		}
 	}
@@ -236,6 +261,7 @@ func promoteHealthy(deps Deps, st *state.State, commit string) error {
 	st.LastHealthyAt = deps.Clock.Now()
 	st.PendingCommit = ""
 	st.PendingSince = time.Time{}
+	st.PendingAttempts = 0
 	st.LastFailedCommit = ""
 	st.LastFailedAt = time.Time{}
 	st.LastResult = state.ResultSuccess

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -60,6 +61,13 @@ func run(args []string) int {
 	cfg, deps, code := setup(f, !readOnly)
 	if code != 0 {
 		return code
+	}
+	if closer, ok := deps.Compose.(io.Closer); ok {
+		defer func() {
+			if err := closer.Close(); err != nil {
+				deps.Log.Warn("closing docker client", "err", err)
+			}
+		}()
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -33,14 +33,14 @@ func watchStacks(ctx context.Context, deps Deps, stacks []compose.Stack, commit 
 
 	var wg sync.WaitGroup
 	for i, s := range stacks {
+		select {
+		case sem <- struct{}{}:
+		case <-watchCtx.Done():
+			outcomes[i] = stackWatchOutcome{stack: s, err: watchCtx.Err()}
+			continue
+		}
 		wg.Go(func() {
-			select {
-			case sem <- struct{}{}:
-				defer func() { <-sem }()
-			case <-watchCtx.Done():
-				outcomes[i] = stackWatchOutcome{stack: s, err: watchCtx.Err()}
-				return
-			}
+			defer func() { <-sem }()
 			opts := healthOptions(cfg, s.ProjectName, commit)
 			res, err := health.Watch(watchCtx, deps.Health, deps.Clock, opts, deps.Log)
 			outcomes[i] = stackWatchOutcome{stack: s, result: res, err: err}

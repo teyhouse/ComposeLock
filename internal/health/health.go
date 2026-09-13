@@ -177,9 +177,20 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 }
 
 func Evaluate(snap Snapshot) (healthy bool, reason string) {
+	return evaluate(snap, false)
+}
+
+func EvaluatePreflight(snap Snapshot) (healthy bool, reason string) {
+	return evaluate(snap, true)
+}
+
+func evaluate(snap Snapshot, tolerateStarting bool) (healthy bool, reason string) {
 	for _, c := range snap.Containers {
 		if c.State != StateRunning && !c.Completed() {
 			return false, fmt.Sprintf("not running: %s (state=%s)", c.Service, c.State)
+		}
+		if tolerateStarting && c.Health == HealthStarting {
+			continue
 		}
 		if c.Health != "" && c.Health != HealthNone && c.Health != HealthHealthy {
 			return false, fmt.Sprintf("not healthy: %s (health=%s)", c.Service, c.Health)

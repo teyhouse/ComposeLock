@@ -6,9 +6,12 @@ import (
 	"time"
 
 	"github.com/moby/moby/client"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/teyhouse/ComposeLock/internal/compose"
 )
+
+const maxConcurrentInspects = 16
 
 type ComposeSnapshotter struct {
 	Service *compose.Service
@@ -21,19 +24,27 @@ func (s *ComposeSnapshotter) Snapshot(ctx context.Context, projectName string) (
 	}
 
 	containers := make([]ContainerStatus, len(summaries))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxConcurrentInspects)
 	for i, cs := range summaries {
-		restartCount, err := s.restartCount(ctx, cs.ID)
-		if err != nil {
-			return Snapshot{}, fmt.Errorf("inspecting container %s: %w", cs.ID, err)
-		}
-		containers[i] = ContainerStatus{
-			ID:           cs.ID,
-			Service:      cs.Service,
-			State:        string(cs.State),
-			Health:       string(cs.Health),
-			RestartCount: restartCount,
-			ExitCode:     cs.ExitCode,
-		}
+		g.Go(func() error {
+			restartCount, err := s.restartCount(gctx, cs.ID)
+			if err != nil {
+				return fmt.Errorf("inspecting container %s: %w", cs.ID, err)
+			}
+			containers[i] = ContainerStatus{
+				ID:           cs.ID,
+				Service:      cs.Service,
+				State:        string(cs.State),
+				Health:       string(cs.Health),
+				RestartCount: restartCount,
+				ExitCode:     cs.ExitCode,
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return Snapshot{}, err
 	}
 
 	return Snapshot{Containers: containers, Taken: time.Now()}, nil

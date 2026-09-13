@@ -34,8 +34,9 @@ type State struct {
 	LastAttemptCommit string    `json:"last_attempt_commit"`
 	LastAttemptAt     time.Time `json:"last_attempt_at,omitzero"`
 
-	PendingCommit string    `json:"pending_commit"`
-	PendingSince  time.Time `json:"pending_since,omitzero"`
+	PendingCommit   string    `json:"pending_commit"`
+	PendingSince    time.Time `json:"pending_since,omitzero"`
+	PendingAttempts int       `json:"pending_attempts,omitzero"`
 }
 
 func New() *State {

@@ -41,3 +41,5 @@ plan.md
 
 # Personal registry push script (local only)
 /scripts/push.sh
+
+*.json.lock

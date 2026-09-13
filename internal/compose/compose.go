@@ -89,6 +89,10 @@ func (s *Service) Client() client.APIClient {
 	return s.cli.Client()
 }
 
+func (s *Service) Close() error {
+	return s.cli.Client().Close()
+}
+
 // CheckEnvFiles verifies referenced env_file paths exist. Existence check
 // only — it never opens, reads, or logs their contents.
 func CheckEnvFiles(project *types.Project) error {

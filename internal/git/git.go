@@ -10,6 +10,12 @@ import (
 	"github.com/teyhouse/ComposeLock/internal/execx"
 )
 
+const (
+	FetchTimeout    = 2 * time.Minute
+	QueryTimeout    = 30 * time.Second
+	CheckoutTimeout = 60 * time.Second
+)
+
 type Syncer struct {
 	Runner   execx.Runner
 	RepoPath string
@@ -36,22 +42,24 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func (s *Syncer) git(ctx context.Context, args ...string) (string, error) {
+func (s *Syncer) git(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	stdout, _, err := s.Runner.Run(ctx, s.RepoPath, s.env(), "git", args...)
 	return strings.TrimSpace(string(stdout)), err
 }
 
 func (s *Syncer) Preview(ctx context.Context) (Result, error) {
-	if _, err := s.git(ctx, "fetch", s.Remote, s.Branch); err != nil {
+	if _, err := s.git(ctx, FetchTimeout, "fetch", s.Remote, s.Branch); err != nil {
 		return Result{}, fmt.Errorf("git fetch: %w", err)
 	}
 
-	oldCommit, err := s.git(ctx, "rev-parse", "HEAD")
+	oldCommit, err := s.git(ctx, QueryTimeout, "rev-parse", "HEAD")
 	if err != nil {
 		return Result{}, fmt.Errorf("git rev-parse HEAD: %w", err)
 	}
 
-	newCommit, err := s.git(ctx, "rev-parse", s.Remote+"/"+s.Branch)
+	newCommit, err := s.git(ctx, QueryTimeout, "rev-parse", s.Remote+"/"+s.Branch)
 	if err != nil {
 		return Result{}, fmt.Errorf("git rev-parse %s/%s: %w", s.Remote, s.Branch, err)
 	}
@@ -60,7 +68,7 @@ func (s *Syncer) Preview(ctx context.Context) (Result, error) {
 		return Result{Changed: false, OldCommit: oldCommit, NewCommit: newCommit}, nil
 	}
 
-	changedOut, err := s.git(ctx, "diff", "--name-only", oldCommit, newCommit)
+	changedOut, err := s.git(ctx, QueryTimeout, "diff", "--name-only", oldCommit, newCommit)
 	if err != nil {
 		return Result{}, fmt.Errorf("git diff: %w", err)
 	}
@@ -78,7 +86,7 @@ func (s *Syncer) Preview(ctx context.Context) (Result, error) {
 }
 
 func (s *Syncer) Checkout(ctx context.Context, commit string) error {
-	if _, err := s.git(ctx, "checkout", commit); err != nil {
+	if _, err := s.git(ctx, CheckoutTimeout, "checkout", commit); err != nil {
 		return fmt.Errorf("git checkout %s: %w", commit, err)
 	}
 	return nil

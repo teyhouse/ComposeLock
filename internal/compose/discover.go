@@ -1,11 +1,15 @@
 package compose
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"hash"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/compose-spec/compose-go/v2/schema"
 	"go.yaml.in/yaml/v4"
@@ -37,7 +41,84 @@ var composeTopLevelKeys = map[string]bool{
 	"volumes":  true,
 }
 
+type discoverCache struct {
+	mu          sync.Mutex
+	key         string
+	fingerprint string
+	stacks      []Stack
+	err         error
+}
+
+var cache discoverCache
+
 func Discover(composeDir, baseProjectName string) ([]Stack, error) {
+	key := composeDir + "\x00" + baseProjectName
+
+	fp, fpErr := fingerprint(composeDir)
+	if fpErr == nil {
+		cache.mu.Lock()
+		hit := cache.key == key && cache.fingerprint == fp
+		stacks, err := cache.stacks, cache.err
+		cache.mu.Unlock()
+		if hit {
+			return slices.Clone(stacks), err
+		}
+	}
+
+	stacks, err := discover(composeDir, baseProjectName)
+
+	if fpErr == nil {
+		cache.mu.Lock()
+		cache.key, cache.fingerprint, cache.stacks, cache.err = key, fp, stacks, err
+		cache.mu.Unlock()
+	}
+	return slices.Clone(stacks), err
+}
+
+func fingerprint(composeDir string) (string, error) {
+	entries, err := os.ReadDir(composeDir)
+	if err != nil {
+		return "", err
+	}
+
+	h := sha256.New()
+	if err := hashComposeFiles(h, composeDir, entries); err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		if isHidden(e.Name()) || !isDir(composeDir, e) {
+			continue
+		}
+		subDir := filepath.Join(composeDir, e.Name())
+		subEntries, err := os.ReadDir(subDir)
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(h, "d\x00%s\x00", subDir)
+		if err := hashComposeFiles(h, subDir, subEntries); err != nil {
+			return "", err
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func hashComposeFiles(h hash.Hash, dir string, entries []os.DirEntry) error {
+	for _, e := range entries {
+		name := e.Name()
+		if isHidden(name) || !IsComposeFile(name) || isDir(dir, e) {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(h, "f\x00%s\x00%d\x00", name, len(data))
+		h.Write(data)
+	}
+	return nil
+}
+
+func discover(composeDir, baseProjectName string) ([]Stack, error) {
 	entries, err := os.ReadDir(composeDir)
 	if err != nil {
 		return nil, fmt.Errorf("reading compose_dir %s: %w", composeDir, err)

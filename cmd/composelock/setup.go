@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/gofrs/flock"
+
 	"github.com/teyhouse/ComposeLock/internal/compose"
 	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/execx"
@@ -81,6 +83,7 @@ func setup(f *cliFlags, writesState bool) (*config.Config, reconcile.Deps, int) 
 			fmt.Fprintln(os.Stderr, fmt.Errorf("state file unwritable: %w", err))
 			return nil, reconcile.Deps{}, 2
 		}
+		deps.Lock = flock.New(cfg.StateFile + ".lock")
 	}
 
 	return cfg, deps, 0

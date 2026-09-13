@@ -35,7 +35,7 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 			Branch:  cfg.Branch,
 			Err:     err,
 		})
-		return Result{Err: err, Notification: &embed}
+		return Result{Err: err, Notification: &embed, NotificationKey: "git-sync"}
 	}
 
 	result := Result{
@@ -86,6 +86,7 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 			Err:     result.Err,
 		})
 		result.Notification = &embed
+		result.NotificationKey = "preflight:" + gitResult.NewCommit
 		return result
 	}
 
@@ -154,6 +155,9 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	// Persisted before touching Docker so a crash here is recoverable via
 	// pending_commit on the next run.
 	now := deps.Clock.Now()
+	if st.PendingCommit != commit {
+		st.PendingAttempts = 0
+	}
 	st.PendingCommit = commit
 	st.PendingSince = now
 	st.LastAttemptCommit = commit
@@ -228,6 +232,7 @@ func failAndRevert(ctx context.Context, deps Deps, st *state.State, stacks []com
 	result.RolledBackTo = revertResult.RolledBackTo
 	result.Err = revertResult.Err
 	result.Notification = revertResult.Notification
+	result.NotificationKey = revertResult.NotificationKey
 	result.HealthWatch += revertResult.HealthWatch
 	return result
 }
@@ -247,6 +252,7 @@ func abortBeforeUp(ctx context.Context, deps Deps, result Result, title string, 
 		Err:     err,
 	})
 	result.Notification = &embed
+	result.NotificationKey = "abort:" + title + ":" + result.NewCommit
 	return result
 }
 

@@ -61,6 +61,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 
 	st.PendingCommit = ""
 	st.PendingSince = time.Time{}
+	st.PendingAttempts = 0
 	st.LastResult = state.ResultReverted
 	if err := deps.State.Save(st); err != nil {
 		return Result{Reverted: true, RolledBackTo: target, HealthWatch: watchDuration, Err: fmt.Errorf("saving state: %w", err)}
@@ -78,7 +79,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 		Duration:    time.Since(start),
 		Err:         revertErr,
 	})
-	return Result{Reverted: true, RolledBackTo: target, HealthWatch: watchDuration, Err: revertErr, Notification: &embed}
+	return Result{Reverted: true, RolledBackTo: target, HealthWatch: watchDuration, Err: revertErr, Notification: &embed, NotificationKey: "reverted:" + failedCommit}
 }
 
 func revertFailed(ctx context.Context, deps Deps, st *state.State, failedCommit, target string, stacks []compose.Stack, err error, start time.Time) Result {
@@ -104,5 +105,5 @@ func degrade(deps Deps, st *state.State, failedCommit, target string, stacks []s
 		Duration: time.Since(start),
 		Err:      err,
 	})
-	return Result{Degraded: true, RolledBackTo: target, Err: err, Notification: &embed}
+	return Result{Degraded: true, RolledBackTo: target, Err: err, Notification: &embed, NotificationKey: "degraded:" + failedCommit}
 }

@@ -218,6 +218,25 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	if c.PprofListen != "" && !isLoopback(c.PprofListen) {
 		return fmt.Errorf("config: pprof_listen must be a loopback address, got %q", c.PprofListen)
 	}
+	if c.LogFormat != "json" && c.LogFormat != "text" {
+		return fmt.Errorf("config: log_format must be \"json\" or \"text\", got %q", c.LogFormat)
+	}
+	if err := c.Webhook.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w WebhookConfig) validate() error {
+	if !strings.HasPrefix(w.Path, "/") {
+		return fmt.Errorf("config: webhook.path must start with %q, got %q", "/", w.Path)
+	}
+	if strings.ContainsAny(w.Path, " \t") {
+		return fmt.Errorf("config: webhook.path must not contain whitespace, got %q", w.Path)
+	}
+	if _, _, err := net.SplitHostPort(w.Listen); err != nil {
+		return fmt.Errorf("config: webhook.listen must be host:port, got %q", w.Listen)
+	}
 	return nil
 }
 
