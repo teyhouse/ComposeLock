@@ -87,6 +87,7 @@ type Report struct {
 	Services     []string
 	Updated      []string
 	UpdatedKnown bool
+	Restarted    []string
 	Stacks       []string
 	HealthWatch  time.Duration
 	Duration     time.Duration
@@ -127,6 +128,9 @@ func BuildEmbed(r Report) Embed {
 			updated = strings.Join(r.Updated, ", ")
 		}
 		fields = append(fields, Field{Name: "Updated", Value: updated, Inline: true})
+	}
+	if len(r.Restarted) > 0 {
+		fields = append(fields, Field{Name: "Restarted", Value: strings.Join(r.Restarted, ", "), Inline: true})
 	}
 	if len(r.Stacks) > 0 {
 		fields = append(fields, Field{Name: "Stacks", Value: strings.Join(r.Stacks, ", "), Inline: true})

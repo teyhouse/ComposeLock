@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -221,13 +222,13 @@ func TestInitRefusesToOverwrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "composelock.json")
 
-	if err := Init(path, false); err != nil {
+	if _, err := Init(path, false, Overrides{}); err != nil {
 		t.Fatalf("first Init: %v", err)
 	}
-	if err := Init(path, false); err == nil {
+	if _, err := Init(path, false, Overrides{}); err == nil {
 		t.Fatal("expected Init to refuse overwrite without --force")
 	}
-	if err := Init(path, true); err != nil {
+	if _, err := Init(path, true, Overrides{}); err != nil {
 		t.Fatalf("Init with force: %v", err)
 	}
 
@@ -246,7 +247,7 @@ func TestInitRefusesToOverwrite(t *testing.T) {
 
 func TestInitWritesPrivateFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "composelock.json")
-	if err := Init(path, false); err != nil {
+	if _, err := Init(path, false, Overrides{}); err != nil {
 		t.Fatalf("Init: %v", err)
 	}
 
@@ -325,5 +326,58 @@ func TestLoadMissingBothComposeFileAndComposeDirErrors(t *testing.T) {
 
 	if _, err := Load(path, Overrides{}, testLogger(&bytes.Buffer{})); err == nil {
 		t.Fatal("expected an error when neither compose_file nor compose_dir is set")
+	}
+}
+
+func TestLoadRejectsAFutureSchemaVersion(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), []byte(`{"schema_version": 99, "repo_path": ".", "project_name": "app", "compose_file": "./docker-compose.yml"}`))
+
+	if _, err := Load(path, Overrides{}, testLogger(&bytes.Buffer{})); err == nil {
+		t.Error("Load() = nil, want a config written by a newer build to be refused")
+	}
+}
+
+func TestLoadWarnsAboutUnknownNestedFields(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), []byte(`{"repo_path": ".", "project_name": "app", "compose_file": "./docker-compose.yml", "webhook": {"secrt": "hunter2"}}`))
+
+	var buf bytes.Buffer
+	if _, err := Load(path, Overrides{}, testLogger(&buf)); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !strings.Contains(buf.String(), "webhook.secrt") {
+		t.Errorf("logs = %q, want a warning naming webhook.secrt", buf.String())
+	}
+}
+
+func TestLoadCanonicalizesTheStateFilePath(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), []byte(`{"repo_path": ".", "project_name": "app", "compose_file": "./docker-compose.yml", "state_file": "./sub/../state.json"}`))
+
+	cfg, err := Load(path, Overrides{}, testLogger(&bytes.Buffer{}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !filepath.IsAbs(cfg.StateFile) || strings.Contains(cfg.StateFile, "..") {
+		t.Errorf("StateFile = %q, want a cleaned absolute path", cfg.StateFile)
+	}
+}
+
+func TestInitWritesTheStateFilePathItWasGiven(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "composelock.json")
+	statePath := filepath.Join(dir, "var", "state.json")
+
+	cfg, err := Init(path, false, Overrides{StateFile: &statePath})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if cfg.StateFile != statePath {
+		t.Errorf("cfg.StateFile = %q, want %q", cfg.StateFile, statePath)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), statePath) {
+		t.Errorf("scaffolded config does not point at %q:\n%s", statePath, data)
 	}
 }

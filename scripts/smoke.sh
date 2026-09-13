@@ -169,25 +169,28 @@ publish "v3: requires app.env"
 run_step 04-env-file-missing 1 sync
 expect_log 04-env-file-missing 'app.env'
 
-touch "$REPO/app.env"
-run_step 05-env-file-fixed 0 sync
-expect_log 05-env-file-fixed '"applied":true'
+run_step 05-env-file-known-bad 0 sync
+expect_log 05-env-file-known-bad 'skipping known-bad commit'
 
-run_step 06-git-sync-fails 1 --remote does-not-exist sync
-expect_log 06-git-sync-fails 'git sync failed'
+touch "$REPO/app.env"
+run_step 06-env-file-fixed 0 --force sync
+expect_log 06-env-file-fixed '"applied":true'
+
+run_step 07-git-sync-fails 1 --remote does-not-exist sync
+expect_log 07-git-sync-fails 'git sync failed'
 
 write_compose '["sh", "-c", "sleep 3; exit 1"]'
 publish "v4: web crashes, no rollback target"
-run_step 07-degraded 3 --state-file "$WORK/fresh-state.json" sync
-expect_log 07-degraded '"degraded":true'
-run_step 08-degraded-refuses 3 --state-file "$WORK/fresh-state.json" sync
-expect_log 08-degraded-refuses 'refusing to reconcile'
+run_step 08-degraded 3 --state-file "$WORK/fresh-state.json" sync
+expect_log 08-degraded '"degraded":true'
+run_step 09-degraded-refuses 3 --state-file "$WORK/fresh-state.json" sync
+expect_log 09-degraded-refuses 'refusing to reconcile'
 
 remove_stack
 write_compose '["sleep", "infinity"]'
 publish "v5: healthy baseline for crash recovery"
-run_step 09-recovery-baseline 0 --state-file "$REC_STATE" sync
-expect_log 09-recovery-baseline '"applied":true'
+run_step 10-recovery-baseline 0 --state-file "$REC_STATE" sync
+expect_log 10-recovery-baseline '"applied":true'
 GOOD_COMMIT=$(git -C "$REPO" rev-parse HEAD)
 
 cat >"$SEED/docker-compose.yml" <<'EOF'
@@ -206,34 +209,36 @@ cat >"$REC_STATE" <<EOF
 }
 EOF
 
-for attempt in 1 2 3; do
-	run_step "10-recovery-attempt-$attempt" 1 --state-file "$REC_STATE" sync
-	expect_log "10-recovery-attempt-$attempt" 'crash recovery'
-	expect_head "10-recovery-attempt-$attempt" "$GOOD_COMMIT"
-	expect_state_field "10-recovery-attempt-$attempt" "$REC_STATE" pending_attempts "$attempt"
-done
+run_step 11-recovery-blames-bad-commit 1 --state-file "$REC_STATE" sync
+expect_log 11-recovery-blames-bad-commit 'crash recovery'
+expect_head 11-recovery-blames-bad-commit "$GOOD_COMMIT"
+expect_state_field 11-recovery-blames-bad-commit "$REC_STATE" pending_attempts 1
+expect_state_field 11-recovery-blames-bad-commit "$REC_STATE" last_failed_commit "$BAD_COMMIT"
 
-run_step 11-recovery-gives-up 3 --state-file "$REC_STATE" sync
-expect_log 11-recovery-gives-up 'attempt limit reached'
-expect_log 11-recovery-gives-up '"degraded":true'
-run_step 12-recovery-stays-degraded 3 --state-file "$REC_STATE" sync
-expect_log 12-recovery-stays-degraded 'refusing to reconcile'
+run_step 12-recovery-resumes-revert 1 --state-file "$REC_STATE" sync
+expect_log 12-recovery-resumes-revert 'resuming interrupted revert'
+expect_head 12-recovery-resumes-revert "$GOOD_COMMIT"
+expect_state_field 12-recovery-resumes-revert "$REC_STATE" last_result reverted
+expect_state_field 12-recovery-resumes-revert "$REC_STATE" pending_commit ""
+
+run_step 13-recovery-settles-on-known-bad 0 --state-file "$REC_STATE" sync
+expect_log 13-recovery-settles-on-known-bad 'skipping known-bad commit'
 
 write_compose '["sleep", "2147483647"]'
 publish "v7: healthy change that keeps the health watch busy"
-"$BIN" --config "$CFG" --state-file "$LOCK_STATE" sync >"$WORK/logs/14-lock-holder.log" 2>&1 &
+"$BIN" --config "$CFG" --state-file "$LOCK_STATE" sync >"$WORK/logs/15-lock-holder.log" 2>&1 &
 HOLDER_PID=$!
 sleep 4
-run_step 13-lock-skipped 0 --state-file "$LOCK_STATE" sync
-expect_log 13-lock-skipped 'holds the state lock'
+run_step 14-lock-skipped 0 --state-file "$LOCK_STATE" sync
+expect_log 14-lock-skipped 'holds the state lock'
 HOLDER_RC=0
 wait "$HOLDER_PID" || HOLDER_RC=$?
 if [ "$HOLDER_RC" -ne 0 ]; then
-	echo "FAIL 14-lock-holder: exit $HOLDER_RC, want 0 (log: $WORK/logs/14-lock-holder.log)" >&2
-	tail -n 5 "$WORK/logs/14-lock-holder.log" >&2
+	echo "FAIL 15-lock-holder: exit $HOLDER_RC, want 0 (log: $WORK/logs/15-lock-holder.log)" >&2
+	tail -n 5 "$WORK/logs/15-lock-holder.log" >&2
 	exit 1
 fi
-echo "ok   14-lock-holder (exit $HOLDER_RC)"
+echo "ok   15-lock-holder (exit $HOLDER_RC)"
 
 if grep -h 'discord notify:' "$WORK"/logs/*.log >&2; then
 	echo "FAIL: Discord rejected or never received a notification" >&2
@@ -247,5 +252,5 @@ fi
 SUCCESS=1
 echo "smoke test passed"
 if [ -n "$WEBHOOK" ]; then
-	echo "expect 12 Discord notifications: deployed, reverted, env_file failure, deployed, git sync failed, DEGRADED, deployed, 3x crash-recovery failure, DEGRADED, deployed"
+	echo "expect 9 Discord notifications: deployed, reverted, env_file failure, deployed, git sync failed, DEGRADED, deployed, crash-recovery failure, reverted, deployed"
 fi

@@ -45,9 +45,9 @@ func newSyncer(t *testing.T, responses map[string]fakeResponse) (*Syncer, *fakeR
 
 func TestPreviewNoChange(t *testing.T) {
 	s, _ := newSyncer(t, map[string]fakeResponse{
-		"git fetch origin main":     {},
-		"git rev-parse HEAD":        {stdout: "abc123"},
-		"git rev-parse origin/main": {stdout: "abc123"},
+		"git fetch --end-of-options origin main":              {},
+		"git rev-parse --verify --end-of-options HEAD":        {stdout: "abc123"},
+		"git rev-parse --verify --end-of-options origin/main": {stdout: "abc123"},
 	})
 
 	result, err := s.Preview(t.Context())
@@ -61,10 +61,10 @@ func TestPreviewNoChange(t *testing.T) {
 
 func TestPreviewChangeDoesNotCheckout(t *testing.T) {
 	s, _ := newSyncer(t, map[string]fakeResponse{
-		"git fetch origin main":                 {},
-		"git rev-parse HEAD":                    {stdout: "old111"},
-		"git rev-parse origin/main":             {stdout: "new222"},
-		"git diff --name-only -z old111 new222": {stdout: "docker-compose.yml\x00app.env.example\x00"},
+		"git fetch --end-of-options origin main":              {},
+		"git rev-parse --verify --end-of-options HEAD":        {stdout: "aaa111"},
+		"git rev-parse --verify --end-of-options origin/main": {stdout: "bbb222"},
+		"git diff --name-only -z aaa111 bbb222":               {stdout: "docker-compose.yml\x00app.env.example\x00"},
 	})
 
 	result, err := s.Preview(t.Context())
@@ -74,8 +74,8 @@ func TestPreviewChangeDoesNotCheckout(t *testing.T) {
 	if !result.Changed {
 		t.Fatal("expected Changed = true")
 	}
-	if result.OldCommit != "old111" || result.NewCommit != "new222" {
-		t.Errorf("commits = %q -> %q, want old111 -> new222", result.OldCommit, result.NewCommit)
+	if result.OldCommit != "aaa111" || result.NewCommit != "bbb222" {
+		t.Errorf("commits = %q -> %q, want aaa111 -> bbb222", result.OldCommit, result.NewCommit)
 	}
 	wantFiles := []string{"docker-compose.yml", "app.env.example"}
 	if len(result.ChangedFiles) != len(wantFiles) {
@@ -91,7 +91,7 @@ func TestPreviewChangeDoesNotCheckout(t *testing.T) {
 func TestFetchRetriesExhausted(t *testing.T) {
 	fetchErr := errors.New("network unreachable")
 	fr := &fakeRunner{t: t, responses: map[string]fakeResponse{
-		"git fetch origin main": {err: fetchErr},
+		"git fetch --end-of-options origin main": {err: fetchErr},
 	}}
 	s := &Syncer{Runner: fr, RepoPath: "/repo", Remote: "origin", Branch: "main"}
 
@@ -104,7 +104,7 @@ func TestFetchRetriesExhausted(t *testing.T) {
 	}
 	fetchCalls := 0
 	for _, c := range fr.calls {
-		if c == "git fetch origin main" {
+		if c == "git fetch --end-of-options origin main" {
 			fetchCalls++
 		}
 	}
@@ -116,13 +116,13 @@ func TestFetchRetriesExhausted(t *testing.T) {
 func TestFetchFailsTwiceThenSucceeds(t *testing.T) {
 	attempt := 0
 	responses := map[string]fakeResponse{
-		"git rev-parse HEAD":        {stdout: "abc123"},
-		"git rev-parse origin/main": {stdout: "abc123"},
+		"git rev-parse --verify --end-of-options HEAD":        {stdout: "abc123"},
+		"git rev-parse --verify --end-of-options origin/main": {stdout: "abc123"},
 	}
 	fr := &fakeRunner{t: t, responses: responses}
 	countingRunner := runnerFunc(func(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, []byte, error) {
 		key := name + " " + strings.Join(args, " ")
-		if key == "git fetch origin main" {
+		if key == "git fetch --end-of-options origin main" {
 			attempt++
 			if attempt < 3 {
 				return nil, nil, fmt.Errorf("flaky attempt %d", attempt)
@@ -151,9 +151,9 @@ func TestFetchFailsTwiceThenSucceeds(t *testing.T) {
 
 func TestFetchZeroAttemptsStillTriesOnce(t *testing.T) {
 	s, fr := newSyncer(t, map[string]fakeResponse{
-		"git fetch origin main":     {},
-		"git rev-parse HEAD":        {stdout: "abc123"},
-		"git rev-parse origin/main": {stdout: "abc123"},
+		"git fetch --end-of-options origin main":              {},
+		"git rev-parse --verify --end-of-options HEAD":        {stdout: "abc123"},
+		"git rev-parse --verify --end-of-options origin/main": {stdout: "abc123"},
 	})
 
 	if _, err := Fetch(t.Context(), s, 0, 0, slog.New(slog.DiscardHandler)); err != nil {
@@ -182,8 +182,8 @@ func (f runnerFunc) Run(ctx context.Context, dir string, env []string, name stri
 
 func TestPreviewDoesNotFetch(t *testing.T) {
 	s, fr := newSyncer(t, map[string]fakeResponse{
-		"git rev-parse HEAD":        {stdout: "abc123"},
-		"git rev-parse origin/main": {stdout: "abc123"},
+		"git rev-parse --verify --end-of-options HEAD":        {stdout: "abc123"},
+		"git rev-parse --verify --end-of-options origin/main": {stdout: "abc123"},
 	})
 
 	if _, err := s.Preview(t.Context()); err != nil {
@@ -198,9 +198,9 @@ func TestPreviewDoesNotFetch(t *testing.T) {
 
 func TestPreviewSplitsDiffOnNUL(t *testing.T) {
 	s, _ := newSyncer(t, map[string]fakeResponse{
-		"git rev-parse HEAD":                    {stdout: "old111"},
-		"git rev-parse origin/main":             {stdout: "new222"},
-		"git diff --name-only -z old111 new222": {stdout: "deploy/a b.yaml\x00deploy/c.yaml\x00"},
+		"git rev-parse --verify --end-of-options HEAD":        {stdout: "aaa111"},
+		"git rev-parse --verify --end-of-options origin/main": {stdout: "bbb222"},
+		"git diff --name-only -z aaa111 bbb222":               {stdout: "deploy/a b.yaml\x00deploy/c.yaml\x00"},
 	})
 
 	result, err := s.Preview(t.Context())
@@ -220,7 +220,7 @@ func TestPreviewSplitsDiffOnNUL(t *testing.T) {
 
 func TestFetchDoesNotRetryPermanentErrors(t *testing.T) {
 	fr := &fakeRunner{t: t, responses: map[string]fakeResponse{
-		"git fetch origin main": {err: errors.New("exit status 128 (stderr: fatal: not a git repository)")},
+		"git fetch --end-of-options origin main": {err: errors.New("exit status 128 (stderr: fatal: not a git repository)")},
 	}}
 	s := &Syncer{Runner: fr, RepoPath: "/repo", Remote: "origin", Branch: "main"}
 
@@ -229,5 +229,51 @@ func TestFetchDoesNotRetryPermanentErrors(t *testing.T) {
 	}
 	if len(fr.calls) != 1 {
 		t.Errorf("ran %d commands, want 1: a permanent error must not be retried", len(fr.calls))
+	}
+}
+
+func TestPreviewKeepsLeadingWhitespaceInDiffPaths(t *testing.T) {
+	s, _ := newSyncer(t, map[string]fakeResponse{
+		"git rev-parse --verify --end-of-options HEAD":        {stdout: "aaa111\n"},
+		"git rev-parse --verify --end-of-options origin/main": {stdout: "bbb222\n"},
+		"git diff --name-only -z aaa111 bbb222":               {stdout: " leading.yml\x00stacks/app/compose.yml\x00"},
+	})
+
+	result, err := s.Preview(t.Context())
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	want := []string{" leading.yml", "stacks/app/compose.yml"}
+	if len(result.ChangedFiles) != len(want) {
+		t.Fatalf("ChangedFiles = %q, want %q", result.ChangedFiles, want)
+	}
+	for i := range want {
+		if result.ChangedFiles[i] != want[i] {
+			t.Errorf("ChangedFiles[%d] = %q, want %q", i, result.ChangedFiles[i], want[i])
+		}
+	}
+}
+
+func TestCheckoutRejectsNonCommitArguments(t *testing.T) {
+	for _, commit := range []string{"--upload-pack=touch /tmp/pwned", "-f", "", "ab", "main", strings.Repeat("a", 65)} {
+		s, fr := newSyncer(t, map[string]fakeResponse{})
+		if err := s.Checkout(t.Context(), commit); err == nil {
+			t.Errorf("Checkout(%q) = nil, want a rejection", commit)
+		}
+		if len(fr.calls) != 0 {
+			t.Errorf("Checkout(%q) ran %v, want no git invocation", commit, fr.calls)
+		}
+	}
+}
+
+func TestCheckoutDiscardsLocalModifications(t *testing.T) {
+	s, fr := newSyncer(t, map[string]fakeResponse{
+		"git checkout --detach --force aaa111": {},
+	})
+	if err := s.Checkout(t.Context(), "aaa111"); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if len(fr.calls) != 1 || fr.calls[0] != "git checkout --detach --force aaa111" {
+		t.Errorf("calls = %v, want a detached forced checkout", fr.calls)
 	}
 }

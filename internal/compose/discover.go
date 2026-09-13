@@ -9,6 +9,7 @@ import (
 	"hash"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -74,7 +75,10 @@ type discoverCache struct {
 
 var cache discoverCache
 
-func Discover(composeDir, baseProjectName string) ([]Stack, error) {
+func Discover(composeDir, baseProjectName string, log *slog.Logger) ([]Stack, error) {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
 	key := composeDir + "\x00" + baseProjectName
 
 	fp, fpErr := fingerprint(composeDir)
@@ -88,7 +92,7 @@ func Discover(composeDir, baseProjectName string) ([]Stack, error) {
 		}
 	}
 
-	stacks, err := discover(composeDir, baseProjectName)
+	stacks, err := discover(composeDir, baseProjectName, log)
 
 	if fpErr == nil {
 		cache.mu.Lock()
@@ -149,7 +153,7 @@ func hashComposeFiles(h hash.Hash, dir string, entries []os.DirEntry) error {
 	return nil
 }
 
-func discover(composeDir, baseProjectName string) ([]Stack, error) {
+func discover(composeDir, baseProjectName string, log *slog.Logger) ([]Stack, error) {
 	entries, err := os.ReadDir(composeDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -160,12 +164,14 @@ func discover(composeDir, baseProjectName string) ([]Stack, error) {
 
 	var stacks []Stack
 
-	rootFiles, err := composeFilesIn(composeDir, entries)
+	rootFiles, rootWorkloads, err := composeFilesIn(composeDir, entries, log)
 	if err != nil {
 		return nil, err
 	}
-	if len(rootFiles) > 0 {
+	if len(rootFiles) > 0 && rootWorkloads {
 		stacks = append(stacks, Stack{ProjectName: baseProjectName, Dir: composeDir, Files: rootFiles})
+	} else if len(rootFiles) > 0 {
+		log.Warn("skipping compose files that define no services and no include", "dir", composeDir, "files", rootFiles)
 	}
 
 	for _, e := range entries {
@@ -177,11 +183,15 @@ func discover(composeDir, baseProjectName string) ([]Stack, error) {
 		if err != nil {
 			return nil, fmt.Errorf("reading %s: %w", subDir, err)
 		}
-		files, err := composeFilesIn(subDir, subEntries)
+		files, hasWorkloads, err := composeFilesIn(subDir, subEntries, log)
 		if err != nil {
 			return nil, err
 		}
 		if len(files) == 0 {
+			continue
+		}
+		if !hasWorkloads {
+			log.Warn("skipping compose files that define no services and no include", "dir", subDir, "files", files)
 			continue
 		}
 		stacks = append(stacks, Stack{
@@ -206,23 +216,25 @@ func discover(composeDir, baseProjectName string) ([]Stack, error) {
 	return stacks, nil
 }
 
-func composeFilesIn(dir string, entries []os.DirEntry) ([]string, error) {
+func composeFilesIn(dir string, entries []os.DirEntry, log *slog.Logger) ([]string, bool, error) {
 	var files []string
+	hasWorkloads := false
 	for _, e := range entries {
 		if !isComposeCandidate(dir, e) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
-		isCompose, err := checkComposeFile(path)
+		isCompose, workloads, err := checkComposeFile(path, log)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if isCompose {
 			files = append(files, path)
+			hasWorkloads = hasWorkloads || workloads
 		}
 	}
 	sortByMergeOrder(files)
-	return files, nil
+	return files, hasWorkloads, nil
 }
 
 func sortByMergeOrder(files []string) {
@@ -246,25 +258,49 @@ func mergeRank(name string) int {
 	}
 }
 
-func checkComposeFile(path string) (bool, error) {
+func checkComposeFile(path string, log *slog.Logger) (isCompose, hasWorkloads bool, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return false, fmt.Errorf("reading %s: %w", path, err)
+		return false, false, fmt.Errorf("reading %s: %w", path, err)
 	}
 	docs, err := yamlMappings(data)
 	if err != nil {
-		return false, fmt.Errorf("parsing %s: %w", path, err)
+		return false, false, fmt.Errorf("parsing %s: %w", path, err)
 	}
-	if len(docs) == 0 || !looksLikeCompose(docs[0]) {
-		return false, nil
+	if len(docs) == 0 {
+		return false, false, nil
+	}
+	if !looksLikeCompose(docs[0]) {
+		log.Warn("skipping YAML file in compose_dir: unrecognized top-level keys",
+			"path", path, "keys", unknownTopLevelKeys(docs[0]))
+		return false, false, nil
 	}
 	if len(docs) > 1 {
-		return false, fmt.Errorf("multi-document compose file %s: only the first document would be applied", path)
+		return false, false, fmt.Errorf("multi-document compose file %s: only the first document would be applied", path)
 	}
 	if err := schema.Validate(docs[0]); err != nil {
-		return false, fmt.Errorf("invalid compose file %s: %w", path, err)
+		return false, false, fmt.Errorf("invalid compose file %s: %w", path, err)
 	}
-	return true, nil
+	return true, definesWorkloads(docs[0]), nil
+}
+
+func definesWorkloads(model map[string]any) bool {
+	if _, ok := model["services"]; ok {
+		return true
+	}
+	_, ok := model["include"]
+	return ok
+}
+
+func unknownTopLevelKeys(model map[string]any) []string {
+	var keys []string
+	for k := range model {
+		if !composeTopLevelKeys[k] && !strings.HasPrefix(k, "x-") {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	return keys
 }
 
 func yamlMappings(data []byte) ([]map[string]any, error) {
@@ -284,6 +320,9 @@ func yamlMappings(data []byte) ([]map[string]any, error) {
 		}
 		mapping, ok := doc.(map[string]any)
 		if !ok {
+			if len(docs) > 0 {
+				return nil, fmt.Errorf("document %d is a %T, not a mapping", len(docs)+1, doc)
+			}
 			return nil, nil
 		}
 		docs = append(docs, mapping)

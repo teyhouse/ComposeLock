@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type Result string
 
@@ -28,6 +28,9 @@ type State struct {
 
 	LastHealthyCommit string    `json:"last_healthy_commit"`
 	LastHealthyAt     time.Time `json:"last_healthy_at,omitzero"`
+	LastHealthyStacks []string  `json:"last_healthy_stacks,omitzero"`
+
+	LastCheckoutCommit string `json:"last_checkout_commit,omitzero"`
 
 	LastFailedCommit string    `json:"last_failed_commit"`
 	LastFailedAt     time.Time `json:"last_failed_at,omitzero"`
@@ -40,6 +43,8 @@ type State struct {
 	PendingCommit   string    `json:"pending_commit"`
 	PendingSince    time.Time `json:"pending_since,omitzero"`
 	PendingAttempts int       `json:"pending_attempts,omitzero"`
+	PendingStacks   []string  `json:"pending_stacks,omitzero"`
+	PendingRevert   bool      `json:"pending_revert,omitzero"`
 }
 
 func New() *State {
@@ -59,12 +64,10 @@ func Load(path string) (*State, error) {
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, fmt.Errorf("parsing state file %s: %w", path, err)
 	}
-	if st.SchemaVersion == 0 {
-		st.SchemaVersion = schemaVersion
-	}
 	if st.SchemaVersion > schemaVersion {
 		return nil, fmt.Errorf("state file %s has schema_version %d, this build understands %d: upgrade composelock", path, st.SchemaVersion, schemaVersion)
 	}
+	st.SchemaVersion = schemaVersion
 	return &st, nil
 }
 
@@ -123,11 +126,18 @@ func CheckWritable(path string) error {
 }
 
 func (s *State) Pending() bool {
-	return s.PendingCommit != ""
+	return s.PendingCommit != "" || s.PendingRevert
 }
 
 func (s *State) RevertInProgress() bool {
-	return s.Pending() && s.PendingCommit == s.LastFailedCommit
+	return s.PendingRevert || (s.PendingCommit != "" && s.PendingCommit == s.LastFailedCommit)
+}
+
+func (s *State) ExpectedCheckout() string {
+	if s.LastCheckoutCommit != "" {
+		return s.LastCheckoutCommit
+	}
+	return s.LastHealthyCommit
 }
 
 type Store interface {

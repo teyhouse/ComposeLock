@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -42,27 +43,32 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func (s *Syncer) git(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+func (s *Syncer) run(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	stdout, _, err := s.Runner.Run(ctx, s.RepoPath, s.env(), "git", args...)
-	return strings.TrimSpace(string(stdout)), err
+	return string(stdout), err
+}
+
+func (s *Syncer) git(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
+	out, err := s.run(ctx, timeout, args...)
+	return strings.TrimSpace(out), err
 }
 
 func (s *Syncer) fetch(ctx context.Context) error {
-	if _, err := s.git(ctx, FetchTimeout, "fetch", s.Remote, s.Branch); err != nil {
+	if _, err := s.git(ctx, FetchTimeout, "fetch", "--end-of-options", s.Remote, s.Branch); err != nil {
 		return fmt.Errorf("git fetch: %w", err)
 	}
 	return nil
 }
 
 func (s *Syncer) Preview(ctx context.Context) (Result, error) {
-	oldCommit, err := s.git(ctx, QueryTimeout, "rev-parse", "HEAD")
+	oldCommit, err := s.git(ctx, QueryTimeout, "rev-parse", "--verify", "--end-of-options", "HEAD")
 	if err != nil {
 		return Result{}, fmt.Errorf("git rev-parse HEAD: %w", err)
 	}
 
-	newCommit, err := s.git(ctx, QueryTimeout, "rev-parse", s.Remote+"/"+s.Branch)
+	newCommit, err := s.git(ctx, QueryTimeout, "rev-parse", "--verify", "--end-of-options", s.Remote+"/"+s.Branch)
 	if err != nil {
 		return Result{}, fmt.Errorf("git rev-parse %s/%s: %w", s.Remote, s.Branch, err)
 	}
@@ -70,8 +76,11 @@ func (s *Syncer) Preview(ctx context.Context) (Result, error) {
 	if oldCommit == newCommit {
 		return Result{Changed: false, OldCommit: oldCommit, NewCommit: newCommit}, nil
 	}
+	if err := errors.Join(checkCommit(oldCommit), checkCommit(newCommit)); err != nil {
+		return Result{}, fmt.Errorf("git rev-parse: %w", err)
+	}
 
-	changedOut, err := s.git(ctx, QueryTimeout, "diff", "--name-only", "-z", oldCommit, newCommit)
+	changedOut, err := s.run(ctx, QueryTimeout, "diff", "--name-only", "-z", oldCommit, newCommit)
 	if err != nil {
 		return Result{}, fmt.Errorf("git diff: %w", err)
 	}
@@ -86,10 +95,34 @@ func (s *Syncer) Preview(ctx context.Context) (Result, error) {
 }
 
 func (s *Syncer) Checkout(ctx context.Context, commit string) error {
-	if _, err := s.git(ctx, CheckoutTimeout, "checkout", commit); err != nil {
+	if err := checkCommit(commit); err != nil {
+		return fmt.Errorf("git checkout: %w", err)
+	}
+	if _, err := s.git(ctx, CheckoutTimeout, "checkout", "--detach", "--force", commit); err != nil {
 		return fmt.Errorf("git checkout %s: %w", commit, err)
 	}
 	return nil
+}
+
+func checkCommit(commit string) error {
+	if !validCommit(commit) {
+		return fmt.Errorf("%q is not a commit id (expected 4 to 64 hex characters)", commit)
+	}
+	return nil
+}
+
+func validCommit(commit string) bool {
+	if len(commit) < 4 || len(commit) > 64 {
+		return false
+	}
+	for _, r := range commit {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func splitNUL(out string) []string {

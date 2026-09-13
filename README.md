@@ -74,7 +74,7 @@ composelock sync
 composelock status
 ```
 
-`sync` is one complete reconcile and exits. To keep the stack in sync continuously, point cron at it or run `poll`, see [Keeping it running](#keeping-it-running). From cron or a systemd unit, pass absolute paths: `composelock --config /srv/composelock.json sync`.
+The first `sync` deploys the current checkout even though `HEAD` already matches the branch, so a fresh install does not need a throwaway commit to get going. `sync` is one complete reconcile and exits. To keep the stack in sync continuously, point cron at it or run `poll`, see [Keeping it running](#keeping-it-running). From cron or a systemd unit, pass absolute paths: `composelock --config /srv/composelock.json sync`.
 
 ## Commands
 
@@ -109,21 +109,27 @@ Once a run exits with code 3, every following run refuses to touch the stack unt
 
 Before anything is applied, ComposeLock snapshots the currently deployed stack. If it is not healthy, the new commit is not applied at all, because deploying on top of a broken stack makes the failure impossible to attribute. A commit that already failed its health watch once is skipped the same way, so a bad commit fails once rather than on every poll tick, until a new commit lands or you pass `--force`.
 
-The Git checkout only moves once every pre-flight check has passed, so a failed check (Docker unreachable, a missing `env_file`, an invalid Compose file) leaves the worktree untouched and is retried on the next run.
+The Git checkout only moves once the pre-flight snapshot has passed, so a gate failure (Docker unreachable, discovery failing at the current checkout) leaves the worktree untouched and is retried on the next run. Checks that can only run against the new tree, discovering its stacks, loading each project, and verifying every `env_file` exists, run right after the checkout and before Compose is touched. If one of them fails, the worktree is restored to the previous commit and the commit is recorded as known-bad, so it fails once rather than on every poll tick. Push a new commit or run `composelock sync --force` to retry it, which is what you want after fixing an `env_file` that lives on the host rather than in the repository.
+
+`git checkout` runs with `--detach --force`: the worktree is a deployment artifact, and the tracked branch is the only source of truth, so uncommitted local edits under `repo_path` are discarded rather than silently carried into the next deploy.
 
 ### The health watch
 
-After `compose up`, the stack is watched for `health_watch_seconds` (default 300), polling every `health_poll_interval_seconds` (default 5). A deploy fails if a container exits non-zero, restarts more than `health_restart_tolerance` times, reports an unhealthy Docker healthcheck for `health_unhealthy_streak` consecutive polls, or is still `starting` when the window closes.
+After `compose up`, the stack is watched for `health_watch_seconds` (default 300), polling every `health_poll_interval_seconds` (default 5). A deploy fails if a container exits non-zero, restarts more than `health_restart_tolerance` times, reports an unhealthy Docker healthcheck for `health_unhealthy_streak` consecutive polls, loses a replica, or is still `starting` when the window closes. A container that lands in `dead` or `removing` fails the watch on the poll that sees it, and one wedged in `created` or `paused` fails after `health_unhealthy_streak` polls, rather than each of them burning the whole window before the rollback starts.
 
-Containers that exit with code 0, such as one-shot migration or init jobs, count as completed rather than failed. Services removed from the Compose file are removed from the stack.
+`health_restart_tolerance` is counted per container, against that container's own restart count when the watch started, so one crash-looping replica of a service cannot hide behind a sibling that happens to have restarted more often in the past. Replica counts are held to their baseline too: a service that loses one of its two containers fails the watch even though the service itself is still present, while scaling up mid-window is not a failure.
+
+Containers that exit with code 0, such as one-shot migration or init jobs, count as completed rather than failed. Services removed from the Compose file are removed from the stack. A container that happens to be `restarting` at the final poll passes, as long as its restart count is still within tolerance, so ordinary `restart: always` churn does not roll back a healthy deploy.
 
 ### Revert and DEGRADED
 
-If the watch fails, ComposeLock checks out the last commit that was known to be healthy, re-applies it, and watches that too. A successful revert exits 1: the deploy failed, but the stack is serving again. If the revert itself fails its health watch, or there is no known-healthy commit to fall back to, the run ends DEGRADED and exits 3, and every later run refuses to act until you pass `--force`.
+If the watch fails, ComposeLock checks out the last commit that was known to be healthy, re-applies it, and watches that too. The revert loads every stack and verifies its `env_file` paths before the first `compose up`, the same way the apply path does, so a rollback that cannot succeed fails cleanly instead of leaving half the stacks at the target and half at the failed commit. A successful revert exits 1: the deploy failed, but the stack is serving again. If the revert itself fails its health watch, or there is no known-healthy commit to fall back to, the run ends DEGRADED and exits 3, and every later run refuses to act until you pass `--force`.
+
+If the revert is interrupted before its watch finishes, by a shutdown or a Docker blip, the run records the revert as still pending and the next run resumes it, rather than forgetting it happened.
 
 ### Crash recovery
 
-State (last healthy commit, last failed commit, pending commit, last result) is kept in a JSON file so a crash mid-deploy is recoverable on the next run: an interrupted deploy is re-applied and watched again, and an interrupted revert is finished. Recovery gives up after three attempts and goes DEGRADED rather than looping.
+State (last healthy commit and the stacks it deployed, last failed commit, last checkout, pending commit and the stacks it was applying, last result) is kept in a JSON file so a crash mid-deploy is recoverable on the next run: an interrupted deploy is re-applied and watched again, and an interrupted revert is finished, in both cases limited to the stacks the interrupted run was touching. Recovery gives up and goes DEGRADED rather than looping, after three attempts or once the pending commit has been unresolved for longer than three health watch windows, whichever comes first. Only a real apply or revert attempt spends one of the three: a Docker blip or an unreadable `compose_dir` returns without consuming the budget. `composelock sync --force` resets the counter, which is how a DEGRADED deployment is retried.
 
 Only one reconcile touches a deployment at a time. A second process finds the state file lock held and exits 0 without doing anything, which makes it safe to run cron and a webhook server against the same config.
 
@@ -135,7 +141,7 @@ composelock --init --config composelock.json --with-state
 
 This writes a default `composelock.json` and an empty `state.json`. Config path resolution order: the `--config` flag, then `$COMPOSELOCK_CONFIG`, then `./composelock.json`.
 
-`repo_path`, `project_name`, and one of `compose_file`/`compose_dir` are required. Everything else has a sane default:
+`repo_path`, `project_name`, and one of `compose_file`/`compose_dir` are required. `remote` and `branch` are restricted to letters, digits, `.`, `_`, `/` and `-`, and may not start with `-` or contain `..`, since both are passed straight to `git`. A config carrying a `schema_version` newer than the binary understands is refused rather than silently loaded with its new fields ignored, and unknown fields are warned about by their full dotted path, so `webhook.secrt` is reported instead of quietly leaving the webhook unauthenticated. Everything else has a sane default:
 
 | Field                          | Default              | Meaning                                        |
 |---------------------------------|-----------------------|-------------------------------------------------|
@@ -158,7 +164,7 @@ This writes a default `composelock.json` and an empty `state.json`. Config path 
 | `pprof_listen`                  | (disabled)            | Loopback address for a pprof server in `poll`/`webhook` mode, e.g. `127.0.0.1:6060` |
 | `webhook.listen`                | `127.0.0.1:8080`      | Address for `composelock webhook`               |
 | `webhook.path`                  | `/webhook`            | Path for `composelock webhook`                  |
-| `webhook.secret`                | (disabled)            | HMAC secret for the webhook; empty disables validation |
+| `webhook.secret`                | (disabled)            | HMAC secret for the webhook; empty disables validation, and is only allowed on a loopback `webhook.listen` |
 
 Every field except `webhook.secret` can be overridden on the command line, run `composelock --help` for the full flag list. Flags win over the config file and are validated the same way. Duration flags must be whole seconds (`30s`, `5m`), a sub-second value is rejected rather than truncated.
 
@@ -187,13 +193,14 @@ Merge order within a stack is the canonical base file (`compose.yaml`, `compose.
 Which files are picked up:
 
 - Only `*.yaml` and `*.yml`, and only at depth 0 or 1. Dot entries are skipped, so pointing `compose_dir` at a repository root does not turn `.github/dependabot.yml` into a stack.
-- A YAML file whose top level is not Compose Spec shaped (it has no `services:` or `include:`, and holds keys the spec does not define) is some other tool's config file sitting next to a compose file, such as a `prometheus.yml`. It is skipped, not merged, and does not fail the sync. Empty files, files whose top level is a list or a scalar, and dangling symlinks are skipped the same way.
+- A YAML file whose top level is not Compose Spec shaped (it has no `services:` or `include:`, and holds keys the spec does not define) is some other tool's config file sitting next to a compose file, such as a `prometheus.yml`. It is skipped, not merged, and does not fail the sync, with a warning naming the keys that were not recognized so a typo in a real top-level key is visible instead of silent. Empty files, files whose top level is a list or a scalar, and dangling symlinks are skipped the same way. A file that starts as a mapping and then holds a second, non-mapping document is an error rather than a skip, because dropping it would take the whole stack out of discovery.
+- A directory whose compose files define no `services:` and no `include:` between them is skipped rather than turned into a stack that can only ever report `NO CONTAINERS`. Fragment files that contribute only `networks:` or `volumes:` still merge into a stack alongside a sibling that does define services.
 - Every remaining file is schema-validated on its own, before merging, so a file that is meant to be a compose file but is broken fails loudly with its own file name in the error instead of a generic merged-load failure. Unparsable YAML fails the same way, as does a multi-document file, since Compose would silently apply only its first document.
 - Two subdirectory names that normalize to the same project name (`my db` and `my-db`) are rejected with an error, because Compose would otherwise treat both as one project and remove the other's containers.
 
 Before anything is touched, the pre-flight gate snapshots every stack that is currently deployed, not just `project_name`, so a broken sub-stack stops a new commit from being applied on top of it.
 
-Only the stack(s) whose files actually changed in a commit are applied and health-watched, the same skip logic described above for a single `compose_file`, generalized per stack. A change to any `*.yaml` or `*.yml` at depth 0 or 1 counts as a change to that directory's stack, including a file the commit deleted. A commit that changes no compose file at all still moves the checkout forward and is recorded as the new rollback target, so `HEAD` never falls permanently behind the branch. The changed stacks are health-watched concurrently, so a cycle costs about one watch window no matter how many stacks changed, and the first stack to fail stops the others rather than delaying the rollback until their windows expire.
+Only the stack(s) whose files actually changed in a commit are applied and health-watched. Any changed file under a stack's directory counts, at any depth and including dot files, because `env_file` targets, Dockerfiles, build contexts and `include:` fragments all change what the stack deploys even though none of them is a compose file. A file is attributed to the most deeply nested stack directory that contains it, so a change under `db/` never re-ups the root stack as well, and files under a subdirectory that the commit deleted belong to that removed stack rather than to its parent. A commit that touches nothing under `compose_dir` still moves the checkout forward, so `HEAD` never falls permanently behind the branch, but it does not become the rollback target: `last_healthy_commit` only ever advances to a commit that was applied and passed a health watch, and `last_checkout_commit` records where `HEAD` was left. The changed stacks are health-watched concurrently, so a cycle costs about one watch window no matter how many stacks changed, and the first stack to fail stops the others rather than delaying the rollback until their windows expire.
 
 If a stack's health watch fails, only the stack(s) touched in that cycle revert; a stack untouched this cycle is never affected by another stack's failure. The revert re-applies each stack from the rollback target's own file list, and a stack that only exists in the failing commit is torn down, so the deployment ends up as the rollback target describes it.
 
@@ -239,7 +246,7 @@ Notes for cron specifically:
 
 ### Webhook
 
-`composelock webhook` serves `webhook.path` on `webhook.listen` and reconciles on push. Set `webhook.secret` to the same value as the GitHub webhook secret so requests are authenticated with `X-Hub-Signature-256`; leaving it empty means anything that can reach the port can trigger a deploy, which is why the default listen address is loopback only. A `ping` is answered without deploying, non-push events are ignored, and a push to a branch other than `branch` is ignored. Pushes that arrive while a reconcile is running coalesce into a single follow-up run.
+`composelock webhook` serves `webhook.path` on `webhook.listen` and reconciles on push. Set `webhook.secret` to the same value as the GitHub webhook secret so requests are authenticated with `X-Hub-Signature-256`. Leaving it empty means anything that can reach the port can trigger a deploy, so it is only accepted on a loopback `webhook.listen`; a non-loopback listen address without a secret is rejected at startup. To expose the webhook publicly, either set a secret or keep the listener on loopback and front it with a reverse proxy. A `ping` is answered without deploying, non-push events are ignored, and a push to a branch other than `branch` is ignored. Pushes that arrive while a reconcile is running coalesce into a single follow-up run.
 
 ### Run as a container
 

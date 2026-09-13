@@ -29,7 +29,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 		return revertFailed(ctx, deps, st, failedCommit, target, stacks, fmt.Errorf("checking out rollback target %s: %w", target, err), start)
 	}
 
-	targetStacks, err := StacksFor(cfg)
+	targetStacks, err := stacksAllowingEmpty(deps)
 	if err != nil {
 		return revertFailed(ctx, deps, st, failedCommit, target, nil, fmt.Errorf("discovering compose stacks at rollback target: %w", err), start)
 	}
@@ -46,18 +46,21 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 		if err != nil {
 			return revertFailed(ctx, deps, st, failedCommit, target, revertStacks, fmt.Errorf("loading project %s for revert: %w", s.ProjectName, err), start)
 		}
-		if err := deps.Compose.Up(ctx, project); err != nil {
-			return revertFailed(ctx, deps, st, failedCommit, target, revertStacks, fmt.Errorf("compose up during revert of %s: %w", s.ProjectName, err), start)
+		if err := compose.CheckEnvFiles(project); err != nil {
+			return revertFailed(ctx, deps, st, failedCommit, target, revertStacks, fmt.Errorf("env_file missing for revert of %s: %w", s.ProjectName, err), start)
 		}
 		projects[i] = project
-		allServices = append(allServices, serviceNames(project)...)
+	}
+	for i, s := range revertStacks {
+		if err := deps.Compose.Up(ctx, projects[i]); err != nil {
+			return revertFailed(ctx, deps, st, failedCommit, target, revertStacks, fmt.Errorf("compose up during revert of %s: %w", s.ProjectName, err), start)
+		}
+		allServices = append(allServices, serviceNames(projects[i])...)
 	}
 
 	watchResult, _, err := watchStacks(ctx, deps, revertStacks, projects, target)
 	if err != nil {
-		// ctx cancelled: state is left as-is (pending_commit still set),
-		// so the next run picks this back up via crash recovery.
-		return Result{RolledBackTo: target, Err: fmt.Errorf("health watch during revert: %w", err)}
+		return revertInterrupted(ctx, deps, st, failedCommit, target, revertStacks, err, start)
 	}
 	watchDuration := time.Duration(cfg.HealthWatchSeconds) * time.Second
 
@@ -67,17 +70,22 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 			start)
 	}
 
-	st.PendingCommit = ""
-	st.PendingSince = time.Time{}
-	st.PendingAttempts = 0
-	st.LastAttemptAt = deps.Clock.Now()
+	next := *st
+	next.PendingCommit = ""
+	next.PendingSince = time.Time{}
+	next.PendingAttempts = 0
+	next.PendingStacks = nil
+	next.PendingRevert = false
+	next.LastCheckoutCommit = target
+	next.LastAttemptAt = deps.Clock.Now()
 	if failedCommit != preflightRecovery {
-		st.LastAttemptCommit = failedCommit
+		next.LastAttemptCommit = failedCommit
 	}
-	st.LastResult = state.ResultReverted
-	if err := deps.State.Save(st); err != nil {
+	next.LastResult = state.ResultReverted
+	if err := deps.State.Save(&next); err != nil {
 		return Result{Reverted: true, RolledBackTo: target, HealthWatch: watchDuration, Err: fmt.Errorf("saving state: %w", err)}
 	}
+	*st = next
 
 	title, key := "ComposeLock: reverted, healthy again", "reverted:"+failedCommit
 	if failedCommit == preflightRecovery {
@@ -105,6 +113,53 @@ func reportedCommit(failedCommit, target string) string {
 	return failedCommit
 }
 
+func revertInterrupted(ctx context.Context, deps Deps, st *state.State, failedCommit, target string, stacks []compose.Stack, watchErr error, start time.Time) Result {
+	err := fmt.Errorf("health watch during revert: %w", watchErr)
+	now := deps.Clock.Now()
+
+	next := *st
+	next.PendingRevert = true
+	next.PendingCommit = failedCommit
+	next.PendingStacks = stackNames(stacks)
+	if next.PendingSince.IsZero() {
+		next.PendingSince = now
+	}
+	if failedCommit != preflightRecovery {
+		next.LastFailedCommit = failedCommit
+		next.LastFailedAt = now
+		next.LastAttemptCommit = failedCommit
+	}
+	next.LastAttemptAt = now
+	next.LastResult = state.ResultFailedApply
+	if saveErr := deps.State.Save(&next); saveErr != nil {
+		deps.Log.Error("saving interrupted revert state", "err", saveErr)
+		err = fmt.Errorf("%w (saving interrupted revert state also failed: %w)", err, saveErr)
+	} else {
+		*st = next
+	}
+
+	if ctx.Err() != nil {
+		deps.Log.Warn("revert interrupted by shutdown, will resume on the next run", "target", target, "err", err)
+		return Result{RolledBackTo: target, Err: err}
+	}
+	deps.Log.Error("revert health watch failed, will resume on the next run", "target", target, "err", err)
+	embed := notify.BuildEmbed(notify.Report{
+		Outcome:  notify.OutcomeFailure,
+		Title:    "ComposeLock: revert interrupted, will resume",
+		Commit:   reportedCommit(failedCommit, target),
+		Branch:   deps.Config.Branch,
+		Stacks:   reportStacks(deps.Config, stackNames(stacks)),
+		Duration: time.Since(start),
+		Err:      err,
+	})
+	return Result{
+		RolledBackTo:    target,
+		Err:             err,
+		Notification:    &embed,
+		NotificationKey: "revert-interrupted:" + reportedCommit(failedCommit, target),
+	}
+}
+
 func revertFailed(ctx context.Context, deps Deps, st *state.State, failedCommit, target string, stacks []compose.Stack, err error, start time.Time) Result {
 	if ctx.Err() != nil {
 		deps.Log.Warn("revert interrupted", "err", err)
@@ -115,17 +170,21 @@ func revertFailed(ctx context.Context, deps Deps, st *state.State, failedCommit,
 
 func degrade(deps Deps, st *state.State, failedCommit, target string, stacks []string, err error, start time.Time) Result {
 	cfg := deps.Config
-	st.LastResult = state.ResultDegraded
-	st.LastAttemptAt = deps.Clock.Now()
+	now := deps.Clock.Now()
+	next := *st
+	next.LastResult = state.ResultDegraded
+	next.LastAttemptAt = now
 	if failedCommit != preflightRecovery {
-		st.LastFailedCommit = failedCommit
-		st.LastFailedAt = deps.Clock.Now()
-		st.LastAttemptCommit = failedCommit
+		next.LastFailedCommit = failedCommit
+		next.LastFailedAt = now
+		next.LastAttemptCommit = failedCommit
 	}
-	saveErr := deps.State.Save(st)
+	saveErr := deps.State.Save(&next)
 	if saveErr != nil {
 		deps.Log.Error("saving degraded state", "err", saveErr)
 		err = fmt.Errorf("%w (saving degraded state also failed: %w)", err, saveErr)
+	} else {
+		*st = next
 	}
 	embed := notify.BuildEmbed(notify.Report{
 		Outcome:  notify.OutcomeFailure,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"time"
 )
@@ -16,8 +17,13 @@ const (
 )
 
 const (
-	StateRunning = "running"
-	StateExited  = "exited"
+	StateRunning    = "running"
+	StateExited     = "exited"
+	StateCreated    = "created"
+	StatePaused     = "paused"
+	StateRestarting = "restarting"
+	StateDead       = "dead"
+	StateRemoving   = "removing"
 )
 
 type ContainerStatus struct {
@@ -116,8 +122,10 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 		return res, nil
 	}
 	baselineRestarts := make(map[string]int, len(baseline.Containers))
+	baselineCounts := make(map[string]int, len(baseline.Containers))
 	for _, c := range baseline.Containers {
-		baselineRestarts[c.Service] = max(baselineRestarts[c.Service], c.RestartCount)
+		baselineRestarts[c.ID] = c.RestartCount
+		baselineCounts[c.Service]++
 	}
 
 	deadline := clock.Now().Add(opts.WatchDuration)
@@ -127,8 +135,8 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 		"poll_interval", opts.PollInterval.String(),
 		"healthy_at", deadline.Format(time.RFC3339))
 	result := Result{Baseline: baseline}
-	unhealthyStreak := 0
-	var last Snapshot
+	unhealthyStreak, wedgedStreak := 0, 0
+	last := baseline
 
 	for clock.Now().Before(deadline) {
 		if !clock.Sleep(ctx, opts.PollInterval) {
@@ -146,15 +154,15 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 			res.Baseline = baseline
 			return res, nil
 		}
-		if service, ok := missingService(baselineRestarts, cur); !ok {
-			result.Reason = fmt.Sprintf("container disappeared: %s", service)
+		if reason, ok := missingReplicas(baselineCounts, cur); !ok {
+			result.Reason = fmt.Sprintf("container disappeared: %s", reason)
 			result.Failures = append(result.Failures, result.Reason)
-			log.Warn("health watch: container disappeared", "service", service)
+			log.Warn("health watch: container disappeared", "detail", reason)
 			result.Outcome = Unhealthy
 			return result, nil
 		}
 
-		anyUnhealthy, anyStarting := false, false
+		anyUnhealthy, anyStarting, anyWedged := false, false, false
 		for _, c := range cur.Containers {
 			if c.State == StateExited && !c.Completed() {
 				result.Reason = fmt.Sprintf("container exited: %s (exit code %d)", c.Service, c.ExitCode)
@@ -163,12 +171,22 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 				result.Outcome = Unhealthy
 				return result, nil
 			}
-			if c.RestartCount > baselineRestarts[c.Service]+opts.RestartTolerance {
-				result.Reason = fmt.Sprintf("restarted beyond tolerance: %s (restarts=%d, tolerance=%d)", c.Service, c.RestartCount-baselineRestarts[c.Service], opts.RestartTolerance)
+			if c.State == StateDead || c.State == StateRemoving {
+				result.Reason = fmt.Sprintf("container %s: %s", c.State, c.Service)
 				result.Failures = append(result.Failures, result.Reason)
-				log.Warn("health watch: restart tolerance exceeded", "service", c.Service, "restarts", c.RestartCount-baselineRestarts[c.Service])
+				log.Warn("health watch: container in terminal state", "service", c.Service, "state", c.State)
 				result.Outcome = Unhealthy
 				return result, nil
+			}
+			if restarts := c.RestartCount - baselineRestarts[c.ID]; restarts > opts.RestartTolerance {
+				result.Reason = fmt.Sprintf("restarted beyond tolerance: %s (restarts=%d, tolerance=%d)", c.Service, restarts, opts.RestartTolerance)
+				result.Failures = append(result.Failures, result.Reason)
+				log.Warn("health watch: restart tolerance exceeded", "service", c.Service, "restarts", restarts)
+				result.Outcome = Unhealthy
+				return result, nil
+			}
+			if c.State == StateCreated || c.State == StatePaused {
+				anyWedged = true
 			}
 			switch c.Health {
 			case HealthUnhealthy:
@@ -176,6 +194,19 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 			case HealthStarting:
 				anyStarting = true
 			}
+		}
+
+		if anyWedged {
+			wedgedStreak++
+			if wedgedStreak >= opts.UnhealthyStreakLimit {
+				result.Reason = "container never started"
+				result.Failures = append(result.Failures, result.Reason)
+				log.Warn("health watch: container stuck in a non-running state", "streak", wedgedStreak)
+				result.Outcome = Unhealthy
+				return result, nil
+			}
+		} else {
+			wedgedStreak = 0
 		}
 
 		if anyUnhealthy {
@@ -194,7 +225,7 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 
 	// A container stuck in "starting" for the whole window never triggers
 	// the loop's per-poll checks above, so it must fail here explicitly.
-	healthy, reason := Evaluate(last)
+	healthy, reason := evaluate(last, false, true)
 	if !healthy {
 		result.Outcome = Unhealthy
 		result.Reason = reason
@@ -241,30 +272,49 @@ func containerIDs(snap Snapshot) map[string][]string {
 	return byService
 }
 
-func missingService(baseline map[string]int, cur Snapshot) (string, bool) {
-	present := make(map[string]struct{}, len(cur.Containers))
+func missingReplicas(baselineCounts map[string]int, cur Snapshot) (string, bool) {
+	present := make(map[string]int, len(cur.Containers))
 	for _, c := range cur.Containers {
-		present[c.Service] = struct{}{}
+		present[c.Service]++
 	}
-	for service := range baseline {
-		if _, ok := present[service]; !ok {
-			return service, false
+	for _, service := range slices.Sorted(maps.Keys(baselineCounts)) {
+		want := baselineCounts[service]
+		if got := present[service]; got < want {
+			return fmt.Sprintf("%s (%d of %d replicas)", service, got, want), false
 		}
 	}
 	return "", true
 }
 
+func RestartedServices(before, after Snapshot) []string {
+	restarts := make(map[string]int, len(before.Containers))
+	for _, c := range before.Containers {
+		restarts[c.ID] = c.RestartCount
+	}
+	var restarted []string
+	for _, c := range after.Containers {
+		if base, ok := restarts[c.ID]; ok && c.RestartCount > base {
+			restarted = append(restarted, c.Service)
+		}
+	}
+	slices.Sort(restarted)
+	return slices.Compact(restarted)
+}
+
 func Evaluate(snap Snapshot) (healthy bool, reason string) {
-	return evaluate(snap, false)
+	return evaluate(snap, false, false)
 }
 
 func EvaluatePreflight(snap Snapshot) (healthy bool, reason string) {
-	return evaluate(snap, true)
+	return evaluate(snap, true, false)
 }
 
-func evaluate(snap Snapshot, tolerateStarting bool) (healthy bool, reason string) {
+func evaluate(snap Snapshot, tolerateStarting, tolerateRestarting bool) (healthy bool, reason string) {
 	for _, c := range snap.Containers {
 		if c.Completed() {
+			continue
+		}
+		if tolerateRestarting && c.State == StateRestarting {
 			continue
 		}
 		if c.State != StateRunning {

@@ -40,6 +40,7 @@ func logResult(log *slog.Logger, msg string, result reconcile.Result) {
 		"applied", result.Applied,
 		"reverted", result.Reverted,
 		"degraded", result.Degraded,
+		"restarted_services", result.Restarted,
 		"old_commit", result.OldCommit,
 		"new_commit", result.NewCommit,
 		"updated_services", result.Updated,
@@ -84,17 +85,15 @@ func (a *asyncNotifier) drain() {
 
 func cmdInit(f *cliFlags) int {
 	path := config.ResolvePath(f.configPath)
-	if err := config.Init(path, f.force); err != nil {
+	cfg, err := config.Init(path, f.force, f.overrides())
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
 	fmt.Println("wrote", path)
 
 	if f.withState {
-		statePath := f.stateFile
-		if statePath == "" {
-			statePath = config.Default().StateFile
-		}
+		statePath := cfg.StateFile
 		if _, err := os.Stat(statePath); err == nil && !f.force {
 			fmt.Fprintf(os.Stderr, "state file %s already exists (use --force to overwrite)\n", statePath)
 			return 2
@@ -126,7 +125,7 @@ func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps 
 	}
 	fmt.Printf("state:\n%s\n", data)
 
-	stacks, err := reconcile.StacksFor(cfg)
+	stacks, err := reconcile.StacksFor(cfg, deps.Log)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "discovering compose stacks:", err)
 		return 1
@@ -188,18 +187,19 @@ func cmdPoll(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 	notifier := &asyncNotifier{deps: deps}
 	defer notifier.drain()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	for {
 		result := reconcile.Reconcile(ctx, reconcile.Options{Trigger: "poll"}, deps)
 		logResult(deps.Log, "poll tick complete", result)
 		notifier.send(ctx, result)
 
+		timer.Reset(interval)
 		select {
 		case <-ctx.Done():
 			return 0
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }

@@ -38,7 +38,7 @@ func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ..
 	case "fetch":
 		return nil, nil, g.fetchErr
 	case "rev-parse":
-		if args[1] == "HEAD" {
+		if args[len(args)-1] == "HEAD" {
 			return []byte(g.head), nil, nil
 		}
 		return []byte(g.remote), nil, nil
@@ -47,11 +47,12 @@ func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ..
 		if files == "" {
 			files = "docker-compose.yml"
 		}
-		return []byte(strings.ReplaceAll(files, "\n", "\x00")), nil, nil
+		return []byte(strings.ReplaceAll(files, "\n", "\x00") + "\x00"), nil, nil
 	case "checkout":
-		g.head = args[1]
+		commit := args[len(args)-1]
+		g.head = commit
 		if g.onCheckout != nil {
-			g.onCheckout(args[1])
+			g.onCheckout(commit)
 		}
 		return nil, nil, nil
 	}
@@ -291,7 +292,7 @@ func testDirDeps(t *testing.T, g *fakeGit, compose ComposeService, snap health.S
 
 func TestReconcileNoChange(t *testing.T) {
 	compose := &fakeCompose{}
-	deps, _ := testDeps(t, gitNoChange("abc123"), compose, snapshots(healthySnapshot()), state.New())
+	deps, _ := testDeps(t, gitNoChange("abc123"), compose, snapshots(healthySnapshot()), withHealthy("abc123"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -303,11 +304,28 @@ func TestReconcileNoChange(t *testing.T) {
 	}
 }
 
+func TestReconcileFreshInstallAppliesWithoutANewCommit(t *testing.T) {
+	compose := &fakeCompose{}
+	deps, store := testDeps(t, gitNoChange("abc123"), compose, snapshots(healthySnapshot()), state.New())
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected the first run of an empty state to deploy, result = %+v", result)
+	}
+	if compose.upCalls != 1 {
+		t.Errorf("Up called %d times, want 1", compose.upCalls)
+	}
+	if store.State.LastHealthyCommit != "abc123" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "abc123")
+	}
+}
+
 func TestReconcileComposeFileUnchanged(t *testing.T) {
 	compose := &fakeCompose{}
 	g := gitChange("abc123", "def456")
 	g.diffFiles = "README.md"
-	deps, _ := testDeps(t, g, compose, snapshots(healthySnapshot()), state.New())
+	deps, _ := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("abc123"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -345,7 +363,7 @@ func TestReconcileComposeFileChangedAmongOthers(t *testing.T) {
 }
 
 func TestReconcileApplySucceedsPromotesState(t *testing.T) {
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
 	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), state.New())
 
@@ -360,12 +378,12 @@ func TestReconcileApplySucceedsPromotesState(t *testing.T) {
 	if compose.upCalls != 1 {
 		t.Errorf("Up called %d times, want 1", compose.upCalls)
 	}
-	if g.head != "new222" {
-		t.Errorf("HEAD = %q, want %q", g.head, "new222")
+	if g.head != "bbb222" {
+		t.Errorf("HEAD = %q, want %q", g.head, "bbb222")
 	}
 	st := store.State
-	if st.LastHealthyCommit != "new222" {
-		t.Errorf("LastHealthyCommit = %q, want %q", st.LastHealthyCommit, "new222")
+	if st.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", st.LastHealthyCommit, "bbb222")
 	}
 	if st.Pending() {
 		t.Error("expected pending_commit cleared after promotion")
@@ -376,9 +394,9 @@ func TestReconcileApplySucceedsPromotesState(t *testing.T) {
 }
 
 func TestReconcileKnownBadCommitSkipped(t *testing.T) {
-	st := withHealthy("old111")
-	st.LastFailedCommit = "new222"
-	g := gitChange("old111", "new222")
+	st := withHealthy("aaa111")
+	st.LastFailedCommit = "bbb222"
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
 	deps, _ := testDeps(t, g, compose, snapshots(healthySnapshot()), st)
 
@@ -391,16 +409,16 @@ func TestReconcileKnownBadCommitSkipped(t *testing.T) {
 	if compose.upCalls != 0 {
 		t.Errorf("Up called %d times, want 0 (known-bad commit)", compose.upCalls)
 	}
-	if g.head != "old111" {
-		t.Errorf("HEAD = %q, want %q (known-bad commit must not be checked out)", g.head, "old111")
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want %q (known-bad commit must not be checked out)", g.head, "aaa111")
 	}
 }
 
 func TestReconcileKnownBadCommitForced(t *testing.T) {
 	st := state.New()
-	st.LastFailedCommit = "new222"
+	st.LastFailedCommit = "bbb222"
 	compose := &fakeCompose{}
-	deps, store := testDeps(t, gitChange("old111", "new222"), compose, snapshots(healthySnapshot()), st)
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(healthySnapshot()), st)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli", Force: true}, deps)
 
@@ -416,11 +434,11 @@ func TestReconcileKnownBadCommitForced(t *testing.T) {
 }
 
 func TestReconcilePreflightUnhealthyRevertsWithoutApplying(t *testing.T) {
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
 	// call0: pre-flight (unhealthy) -> triggers revert.
 	// call1: revert's watch baseline+poll -> healthy.
-	deps, _ := testDeps(t, g, compose, snapshots(unhealthySnapshot(), healthySnapshot()), withHealthy("old111"))
+	deps, _ := testDeps(t, g, compose, snapshots(unhealthySnapshot(), healthySnapshot()), withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -430,33 +448,33 @@ func TestReconcilePreflightUnhealthyRevertsWithoutApplying(t *testing.T) {
 	if !result.Reverted {
 		t.Fatalf("expected Reverted = true, result = %+v", result)
 	}
-	if result.RolledBackTo != "old111" {
-		t.Errorf("RolledBackTo = %q, want %q", result.RolledBackTo, "old111")
+	if result.RolledBackTo != "aaa111" {
+		t.Errorf("RolledBackTo = %q, want %q", result.RolledBackTo, "aaa111")
 	}
-	if g.head != "old111" {
-		t.Errorf("HEAD = %q, want %q", g.head, "old111")
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want %q", g.head, "aaa111")
 	}
 }
 
 func TestReconcilePreflightSnapshotErrorRetriesNextRun(t *testing.T) {
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
 	snap := snapshots(healthySnapshot())
 	snap.err = errors.New("docker daemon unreachable")
-	deps, _ := testDeps(t, g, compose, snap, withHealthy("old111"))
+	deps, _ := testDeps(t, g, compose, snap, withHealthy("aaa111"))
 
 	first := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 	if first.Err == nil {
 		t.Fatal("expected a pre-flight error")
 	}
-	if g.head != "old111" {
-		t.Errorf("HEAD = %q after failed pre-flight, want %q", g.head, "old111")
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q after failed pre-flight, want %q", g.head, "aaa111")
 	}
 
 	snap.err = nil
 	second := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 	if !second.Applied {
-		t.Fatalf("expected new222 to be applied once Docker is reachable again, result = %+v", second)
+		t.Fatalf("expected bbb222 to be applied once Docker is reachable again, result = %+v", second)
 	}
 }
 
@@ -471,8 +489,8 @@ func TestReconcileMissingEnvFileAbortsBeforeUp(t *testing.T) {
 			},
 		},
 	}
-	g := gitChange("old111", "new222")
-	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("old111"))
+	g := gitChange("aaa111", "bbb222")
+	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -485,22 +503,30 @@ func TestReconcileMissingEnvFileAbortsBeforeUp(t *testing.T) {
 	if store.State.Pending() {
 		t.Error("expected state unchanged (no pending_commit) on env_file failure")
 	}
-	if g.head != "old111" {
-		t.Errorf("HEAD = %q, want checkout restored to %q", g.head, "old111")
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want checkout restored to %q", g.head, "aaa111")
 	}
 
 	if err := os.WriteFile(filepath.Join(dir, "app.env"), nil, 0o600); err != nil {
 		t.Fatalf("writing env file: %v", err)
 	}
-	retry := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+	skipped := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+	if !skipped.Skipped || skipped.Applied {
+		t.Fatalf("expected bbb222 to be skipped as known-bad instead of retried every tick, result = %+v", skipped)
+	}
+	if store.State.LastResult != state.ResultSkippedKnownBad {
+		t.Errorf("LastResult = %q, want %q", store.State.LastResult, state.ResultSkippedKnownBad)
+	}
+
+	retry := Reconcile(t.Context(), Options{Trigger: "cli", Force: true}, deps)
 	if !retry.Applied {
-		t.Fatalf("expected new222 to be applied after the env file was created, result = %+v", retry)
+		t.Fatalf("expected --force to apply bbb222 after the env file was created, result = %+v", retry)
 	}
 }
 
 func TestReconcileApplyFailsNoBaselineDegrades(t *testing.T) {
 	compose := &fakeCompose{upErrs: []error{errors.New("image pull failed")}}
-	deps, store := testDeps(t, gitChange("old111", "new222"), compose, snapshots(healthySnapshot()), state.New())
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(healthySnapshot()), state.New())
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -511,8 +537,8 @@ func TestReconcileApplyFailsNoBaselineDegrades(t *testing.T) {
 	if st.LastResult != state.ResultDegraded {
 		t.Errorf("LastResult = %q, want %q", st.LastResult, state.ResultDegraded)
 	}
-	if st.LastFailedCommit != "new222" {
-		t.Errorf("LastFailedCommit = %q, want %q", st.LastFailedCommit, "new222")
+	if st.LastFailedCommit != "bbb222" {
+		t.Errorf("LastFailedCommit = %q, want %q", st.LastFailedCommit, "bbb222")
 	}
 	if !st.Pending() {
 		t.Error("expected pending_commit to stay set for visibility")
@@ -520,9 +546,9 @@ func TestReconcileApplyFailsNoBaselineDegrades(t *testing.T) {
 }
 
 func TestReconcileApplyFailsRevertsImmediately(t *testing.T) {
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{upErrs: []error{errors.New("pull access denied")}}
-	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("old111"))
+	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -533,17 +559,17 @@ func TestReconcileApplyFailsRevertsImmediately(t *testing.T) {
 		t.Errorf("Up called %d times, want 2 (failed apply + revert apply)", compose.upCalls)
 	}
 	st := store.State
-	if st.LastHealthyCommit != "old111" {
-		t.Errorf("LastHealthyCommit = %q, want unchanged %q", st.LastHealthyCommit, "old111")
+	if st.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want unchanged %q", st.LastHealthyCommit, "aaa111")
 	}
-	if st.LastFailedCommit != "new222" {
-		t.Errorf("LastFailedCommit = %q, want %q", st.LastFailedCommit, "new222")
+	if st.LastFailedCommit != "bbb222" {
+		t.Errorf("LastFailedCommit = %q, want %q", st.LastFailedCommit, "bbb222")
 	}
 	if st.Pending() {
 		t.Error("expected pending_commit cleared after a successful revert")
 	}
-	if g.head != "old111" {
-		t.Errorf("HEAD = %q, want %q", g.head, "old111")
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want %q", g.head, "aaa111")
 	}
 
 	next := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
@@ -558,7 +584,7 @@ func TestReconcileUnhealthyWatchRevertsSuccessfully(t *testing.T) {
 	// call2: apply-watch poll (exited -> fails). call3: revert-watch
 	// baseline (healthy). call4: revert-watch poll (healthy -> passes).
 	snap := snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot(), healthySnapshot())
-	deps, store := testDeps(t, gitChange("old111", "new222"), compose, snap, withHealthy("old111"))
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snap, withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -566,11 +592,11 @@ func TestReconcileUnhealthyWatchRevertsSuccessfully(t *testing.T) {
 		t.Fatalf("expected Reverted = true, result = %+v", result)
 	}
 	st := store.State
-	if st.LastHealthyCommit != "old111" {
-		t.Errorf("LastHealthyCommit = %q, want unchanged %q", st.LastHealthyCommit, "old111")
+	if st.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want unchanged %q", st.LastHealthyCommit, "aaa111")
 	}
-	if st.LastFailedCommit != "new222" {
-		t.Errorf("LastFailedCommit = %q, want %q (guard should keep skipping it)", st.LastFailedCommit, "new222")
+	if st.LastFailedCommit != "bbb222" {
+		t.Errorf("LastFailedCommit = %q, want %q (guard should keep skipping it)", st.LastFailedCommit, "bbb222")
 	}
 	if st.LastResult != state.ResultReverted {
 		t.Errorf("LastResult = %q, want %q", st.LastResult, state.ResultReverted)
@@ -584,7 +610,7 @@ func TestReconcileRevertAlsoFailsDegrades(t *testing.T) {
 	compose := &fakeCompose{}
 	// pre-flight: healthy. apply watch: exited. revert watch: exited too.
 	snap := snapshots(healthySnapshot(), unhealthySnapshot(), unhealthySnapshot())
-	deps, store := testDeps(t, gitChange("old111", "new222"), compose, snap, withHealthy("old111"))
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snap, withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -610,7 +636,7 @@ func TestReconcileRevertAlsoFailsDegrades(t *testing.T) {
 }
 
 func TestReconcilePreflightDegradeIsSticky(t *testing.T) {
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
 	deps, _ := testDeps(t, g, compose, snapshots(unhealthySnapshot()), state.New())
 
@@ -626,8 +652,8 @@ func TestReconcilePreflightDegradeIsSticky(t *testing.T) {
 	if compose.upCalls != 0 {
 		t.Errorf("Up called %d times, want 0", compose.upCalls)
 	}
-	if g.head != "old111" {
-		t.Errorf("HEAD = %q, want %q", g.head, "old111")
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want %q", g.head, "aaa111")
 	}
 }
 
@@ -639,7 +665,7 @@ func TestReconcileInterruptedRevertUpDoesNotDegrade(t *testing.T) {
 		}
 	}}
 	snap := snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot())
-	deps, store := testDeps(t, gitChange("old111", "new222"), compose, snap, withHealthy("old111"))
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snap, withHealthy("aaa111"))
 
 	result := Reconcile(ctx, Options{Trigger: "poll"}, deps)
 
@@ -657,8 +683,8 @@ func TestReconcileInterruptedRevertUpDoesNotDegrade(t *testing.T) {
 	if !resumed.Reverted {
 		t.Fatalf("expected the next run to finish the revert, result = %+v", resumed)
 	}
-	if store.State.LastHealthyCommit != "old111" {
-		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "old111")
+	if store.State.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "aaa111")
 	}
 	if store.State.Pending() {
 		t.Error("expected pending_commit cleared after the resumed revert")
@@ -667,10 +693,10 @@ func TestReconcileInterruptedRevertUpDoesNotDegrade(t *testing.T) {
 
 func TestReconcileInterruptedRevertWatchResumesRevert(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
 	snap := snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot())
-	deps, store := testDeps(t, g, compose, snap, withHealthy("old111"))
+	deps, store := testDeps(t, g, compose, snap, withHealthy("aaa111"))
 	deps.Clock = &cancelingClock{cancelAt: 2, cancel: cancel}
 
 	first := Reconcile(ctx, Options{Trigger: "poll"}, deps)
@@ -687,21 +713,21 @@ func TestReconcileInterruptedRevertWatchResumesRevert(t *testing.T) {
 		t.Fatalf("expected the next run to finish the revert, result = %+v", second)
 	}
 	st := store.State
-	if st.LastHealthyCommit != "old111" {
-		t.Errorf("LastHealthyCommit = %q, want %q (known-bad commit must never be promoted)", st.LastHealthyCommit, "old111")
+	if st.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want %q (known-bad commit must never be promoted)", st.LastHealthyCommit, "aaa111")
 	}
-	if st.LastFailedCommit != "new222" {
-		t.Errorf("LastFailedCommit = %q, want %q", st.LastFailedCommit, "new222")
+	if st.LastFailedCommit != "bbb222" {
+		t.Errorf("LastFailedCommit = %q, want %q", st.LastFailedCommit, "bbb222")
 	}
-	if g.head != "old111" {
-		t.Errorf("HEAD = %q, want %q", g.head, "old111")
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want %q", g.head, "aaa111")
 	}
 }
 
 func TestReconcileCrashRecoveryReappliesPendingCommit(t *testing.T) {
-	st := withHealthy("old111")
-	st.PendingCommit = "pending333"
-	g := gitNoChange("old111")
+	st := withHealthy("aaa111")
+	st.PendingCommit = "ccc333"
+	g := gitNoChange("aaa111")
 	compose := &fakeCompose{}
 	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), st)
 
@@ -713,11 +739,11 @@ func TestReconcileCrashRecoveryReappliesPendingCommit(t *testing.T) {
 	if compose.upCalls != 1 {
 		t.Errorf("Up called %d times, want 1 (pending commit is re-applied before it is watched)", compose.upCalls)
 	}
-	if g.head != "pending333" {
-		t.Errorf("HEAD = %q, want %q", g.head, "pending333")
+	if g.head != "ccc333" {
+		t.Errorf("HEAD = %q, want %q", g.head, "ccc333")
 	}
-	if store.State.LastHealthyCommit != "pending333" {
-		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "pending333")
+	if store.State.LastHealthyCommit != "ccc333" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "ccc333")
 	}
 	if store.State.Pending() {
 		t.Error("expected pending_commit cleared")
@@ -725,11 +751,11 @@ func TestReconcileCrashRecoveryReappliesPendingCommit(t *testing.T) {
 }
 
 func TestReconcileCrashRecoveryUnhealthyRevertsImmediately(t *testing.T) {
-	st := withHealthy("old111")
-	st.PendingCommit = "pending333"
+	st := withHealthy("aaa111")
+	st.PendingCommit = "ccc333"
 	compose := &fakeCompose{}
 	// live snapshot: unhealthy -> immediate revert; revert watch: healthy.
-	deps, _ := testDeps(t, gitNoChange("pending333"), compose, snapshots(unhealthySnapshot(), healthySnapshot()), st)
+	deps, _ := testDeps(t, gitNoChange("ccc333"), compose, snapshots(unhealthySnapshot(), healthySnapshot()), st)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -742,7 +768,7 @@ func TestReconcileCrashRecoveryUnhealthyRevertsImmediately(t *testing.T) {
 }
 
 func TestReconcileDryRunNoSDKCallsNoStateWrites(t *testing.T) {
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
 	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), state.New())
 
@@ -757,8 +783,8 @@ func TestReconcileDryRunNoSDKCallsNoStateWrites(t *testing.T) {
 	if store.State.PendingCommit != "" || store.State.LastHealthyCommit != "" {
 		t.Errorf("expected no state writes on dry run, got %+v", store.State)
 	}
-	if g.head != "old111" {
-		t.Errorf("HEAD = %q, want %q on dry run", g.head, "old111")
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want %q on dry run", g.head, "aaa111")
 	}
 }
 
@@ -767,7 +793,7 @@ func TestReconcileSingleFlightSkipsConcurrentRun(t *testing.T) {
 	release := make(chan struct{})
 
 	blockingSnap := &blockingSnapshotter{healthy: healthySnapshot(), block: block, release: release}
-	deps, _ := testDeps(t, gitChange("old111", "new222"), &fakeCompose{}, blockingSnap, state.New())
+	deps, _ := testDeps(t, gitChange("aaa111", "bbb222"), &fakeCompose{}, blockingSnap, state.New())
 
 	done := make(chan Result, 1)
 	go func() {
@@ -873,7 +899,7 @@ func TestReconcileDirModeMultiStackAllHealthy(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/service-a.yaml\ndeployment/db/docker-compose.yaml"
 	compose := &fakeCompose{}
 	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), state.New(), repoPath, composeDir)
@@ -891,8 +917,8 @@ func TestReconcileDirModeMultiStackAllHealthy(t *testing.T) {
 	if want := []string{"test-stack", "test-stack-db"}; !equalStringSlices(gotStacks, want) {
 		t.Errorf("Stacks = %v, want %v", gotStacks, want)
 	}
-	if store.State.LastHealthyCommit != "new222" {
-		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "new222")
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
 	}
 }
 
@@ -902,10 +928,10 @@ func TestReconcileDirModePartialChangeOnlyAppliesChangedStack(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/db/docker-compose.yaml"
 	compose := &fakeCompose{}
-	deps, _ := testDirDeps(t, g, compose, snapshots(healthySnapshot()), state.New(), repoPath, composeDir)
+	deps, _ := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -926,7 +952,7 @@ func TestReconcileDirModeOneStackFailureRevertsOnlyThatCycle(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "c", "docker-compose.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/service-a.yaml"
 	compose := &fakeCompose{}
 
@@ -934,7 +960,7 @@ func TestReconcileDirModeOneStackFailureRevertsOnlyThatCycle(t *testing.T) {
 	perProject.set("test-stack", snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot(), healthySnapshot()))
 	perProject.set("test-stack-c", snapshots(healthySnapshot()))
 
-	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -949,8 +975,8 @@ func TestReconcileDirModeOneStackFailureRevertsOnlyThatCycle(t *testing.T) {
 	if compose.upCalls != 2 {
 		t.Errorf("Up called %d times, want 2 (failed apply + revert apply of test-stack only)", compose.upCalls)
 	}
-	if store.State.LastHealthyCommit != "old111" {
-		t.Errorf("LastHealthyCommit = %q, want unchanged %q", store.State.LastHealthyCommit, "old111")
+	if store.State.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want unchanged %q", store.State.LastHealthyCommit, "aaa111")
 	}
 }
 
@@ -960,7 +986,7 @@ func TestReconcileDirModeInvalidFileFailsLoudly(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "broken.yaml"), invalidComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/service-a.yaml"
 	compose := &fakeCompose{}
 	deps, _ := testDirDeps(t, g, compose, snapshots(healthySnapshot()), state.New(), repoPath, composeDir)
@@ -1015,13 +1041,13 @@ func TestReconcileDirModeRevertUsesRollbackTargetFileList(t *testing.T) {
 	added := filepath.Join(composeDir, "service-b.yaml")
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/service-a.yaml\ndeployment/service-b.yaml"
 	g.onCheckout = func(commit string) {
 		switch commit {
-		case "new222":
+		case "bbb222":
 			writeComposeFile(t, added, validComposeYAML)
-		case "old111":
+		case "aaa111":
 			if err := os.Remove(added); err != nil {
 				t.Error(err)
 			}
@@ -1031,7 +1057,7 @@ func TestReconcileDirModeRevertUsesRollbackTargetFileList(t *testing.T) {
 	compose := &fakeCompose{}
 	perProject := &perProjectSnapshotter{}
 	perProject.set("test-stack", snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot(), healthySnapshot()))
-	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -1059,10 +1085,10 @@ func TestReconcileDirModeDeletedComposeFileReappliesStack(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, removed, validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/service-b.yaml"
 	g.onCheckout = func(commit string) {
-		if commit == "new222" {
+		if commit == "bbb222" {
 			if err := os.Remove(removed); err != nil {
 				t.Error(err)
 			}
@@ -1070,7 +1096,7 @@ func TestReconcileDirModeDeletedComposeFileReappliesStack(t *testing.T) {
 	}
 
 	compose := &fakeCompose{}
-	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("old111"), repoPath, composeDir)
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -1080,8 +1106,8 @@ func TestReconcileDirModeDeletedComposeFileReappliesStack(t *testing.T) {
 	if len(compose.loadCalls) != 1 || len(compose.loadCalls[0].files) != 1 {
 		t.Errorf("loadCalls = %+v, want one call with only the surviving file", compose.loadCalls)
 	}
-	if store.State.LastHealthyCommit != "new222" {
-		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "new222")
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
 	}
 }
 
@@ -1091,10 +1117,10 @@ func TestReconcileDirModeRemovedStackTornDownAndCommitRecorded(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/db/docker-compose.yaml"
 	g.onCheckout = func(commit string) {
-		if commit == "new222" {
+		if commit == "bbb222" {
 			if err := os.RemoveAll(filepath.Join(composeDir, "db")); err != nil {
 				t.Error(err)
 			}
@@ -1102,7 +1128,7 @@ func TestReconcileDirModeRemovedStackTornDownAndCommitRecorded(t *testing.T) {
 	}
 
 	compose := &fakeCompose{}
-	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("old111"), repoPath, composeDir)
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -1118,8 +1144,8 @@ func TestReconcileDirModeRemovedStackTornDownAndCommitRecorded(t *testing.T) {
 	if compose.upCalls != 0 {
 		t.Errorf("Up called %d times, want 0", compose.upCalls)
 	}
-	if store.State.LastHealthyCommit != "new222" {
-		t.Errorf("LastHealthyCommit = %q, want %q (the checkout moved)", store.State.LastHealthyCommit, "new222")
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q (the checkout moved)", store.State.LastHealthyCommit, "bbb222")
 	}
 }
 
@@ -1129,15 +1155,15 @@ func TestReconcileDirModeRemovedStackSurvivesRevert(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/service-a.yaml\ndeployment/db/docker-compose.yaml"
 	g.onCheckout = func(commit string) {
 		switch commit {
-		case "new222":
+		case "bbb222":
 			if err := os.RemoveAll(filepath.Join(composeDir, "db")); err != nil {
 				t.Error(err)
 			}
-		case "old111":
+		case "aaa111":
 			writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
 		}
 	}
@@ -1146,7 +1172,7 @@ func TestReconcileDirModeRemovedStackSurvivesRevert(t *testing.T) {
 	perProject := &perProjectSnapshotter{}
 	perProject.set("test-stack", snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot(), healthySnapshot()))
 	perProject.set("test-stack-db", snapshots(healthySnapshot()))
-	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -1163,13 +1189,13 @@ func TestReconcileDirModeNewStackTornDownOnRevert(t *testing.T) {
 	composeDir := filepath.Join(repoPath, "deployment")
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/new/docker-compose.yaml"
 	g.onCheckout = func(commit string) {
 		switch commit {
-		case "new222":
+		case "bbb222":
 			writeComposeFile(t, filepath.Join(composeDir, "new", "docker-compose.yaml"), validComposeYAML)
-		case "old111":
+		case "aaa111":
 			if err := os.RemoveAll(filepath.Join(composeDir, "new")); err != nil {
 				t.Error(err)
 			}
@@ -1180,7 +1206,7 @@ func TestReconcileDirModeNewStackTornDownOnRevert(t *testing.T) {
 	perProject := &perProjectSnapshotter{}
 	perProject.set("test-stack", snapshots(healthySnapshot()))
 	perProject.set("test-stack-new", snapshots(healthySnapshot(), unhealthySnapshot()))
-	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+	deps, _ := testDirDeps(t, g, compose, perProject, withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -1198,7 +1224,7 @@ func TestReconcileDirModePreflightChecksEveryStack(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/service-a.yaml"
 	compose := &fakeCompose{}
 
@@ -1206,7 +1232,7 @@ func TestReconcileDirModePreflightChecksEveryStack(t *testing.T) {
 	perProject.set("test-stack", snapshots(healthySnapshot()))
 	perProject.set("test-stack-db", snapshots(unhealthySnapshot(), healthySnapshot()))
 
-	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -1216,8 +1242,8 @@ func TestReconcileDirModePreflightChecksEveryStack(t *testing.T) {
 	if !result.Reverted {
 		t.Errorf("expected the pre-flight gate to revert, result = %+v", result)
 	}
-	if store.State.LastHealthyCommit != "old111" {
-		t.Errorf("LastHealthyCommit = %q, want unchanged %q", store.State.LastHealthyCommit, "old111")
+	if store.State.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want unchanged %q", store.State.LastHealthyCommit, "aaa111")
 	}
 }
 
@@ -1227,10 +1253,10 @@ func TestReconcileDirModeIgnoresNonComposeYAML(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "db", "prometheus.yml"), "global:\n  scrape_interval: 15s\n")
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/db/prometheus.yml"
 	compose := &fakeCompose{}
-	deps, _ := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("old111"), repoPath, composeDir)
+	deps, _ := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -1250,9 +1276,9 @@ func TestWatchStacksReportsEveryFailingStackAndStopsEarly(t *testing.T) {
 	perProject.set("stack-a", snapshots(healthySnapshot()))
 	perProject.set("stack-b", snapshots(healthySnapshot(), unhealthySnapshot()))
 
-	deps, _ := testDirDeps(t, gitChange("old111", "new222"), &fakeCompose{}, perProject, state.New(), t.TempDir(), t.TempDir())
+	deps, _ := testDirDeps(t, gitChange("aaa111", "bbb222"), &fakeCompose{}, perProject, state.New(), t.TempDir(), t.TempDir())
 
-	result, _, err := watchStacks(t.Context(), deps, stackFixtures("stack-a", "stack-b"), nil, "new222")
+	result, _, err := watchStacks(t.Context(), deps, stackFixtures("stack-a", "stack-b"), nil, "bbb222")
 	if err != nil {
 		t.Fatalf("watchStacks: %v", err)
 	}
@@ -1270,9 +1296,9 @@ func TestWatchStacksReportsEveryFailingStackAndStopsEarly(t *testing.T) {
 }
 
 func TestWatchStacksNoStacksIsHealthy(t *testing.T) {
-	deps, _ := testDirDeps(t, gitChange("old111", "new222"), &fakeCompose{}, snapshots(healthySnapshot()), state.New(), t.TempDir(), t.TempDir())
+	deps, _ := testDirDeps(t, gitChange("aaa111", "bbb222"), &fakeCompose{}, snapshots(healthySnapshot()), state.New(), t.TempDir(), t.TempDir())
 
-	result, _, err := watchStacks(t.Context(), deps, nil, nil, "new222")
+	result, _, err := watchStacks(t.Context(), deps, nil, nil, "bbb222")
 	if err != nil {
 		t.Fatalf("watchStacks: %v", err)
 	}
@@ -1298,8 +1324,11 @@ func TestReconcileIrrelevantChangeAdvancesTheCheckout(t *testing.T) {
 	if g.head != "def456" {
 		t.Errorf("HEAD = %q, want the checkout to advance to %q so it stops re-diffing forever", g.head, "def456")
 	}
-	if store.State.LastHealthyCommit != "def456" {
-		t.Errorf("last_healthy_commit = %q, want %q", store.State.LastHealthyCommit, "def456")
+	if store.State.LastHealthyCommit != "abc123" {
+		t.Errorf("last_healthy_commit = %q, want the rollback target to stay at the commit that passed a watch (%q)", store.State.LastHealthyCommit, "abc123")
+	}
+	if store.State.LastCheckoutCommit != "def456" {
+		t.Errorf("last_checkout_commit = %q, want %q", store.State.LastCheckoutCommit, "def456")
 	}
 }
 
@@ -1355,10 +1384,10 @@ func TestReconcileFailedTeardownIsNotPromoted(t *testing.T) {
 	writeComposeFile(t, filepath.Join(composeDir, "service-a.yaml"), validComposeYAML)
 	writeComposeFile(t, filepath.Join(composeDir, "c", "docker-compose.yaml"), validComposeYAML)
 
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	g.diffFiles = "deployment/c/docker-compose.yaml"
 	g.onCheckout = func(commit string) {
-		if commit == "new222" {
+		if commit == "bbb222" {
 			if err := os.RemoveAll(filepath.Join(composeDir, "c")); err != nil {
 				t.Error(err)
 			}
@@ -1368,21 +1397,21 @@ func TestReconcileFailedTeardownIsNotPromoted(t *testing.T) {
 	compose := &fakeCompose{downErr: errors.New("docker daemon unreachable")}
 	perProject := &perProjectSnapshotter{}
 	perProject.set("test-stack", snapshots(healthySnapshot()))
-	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("old111"), repoPath, composeDir)
+	deps, store := testDirDeps(t, g, compose, perProject, withHealthy("aaa111"), repoPath, composeDir)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
 	if result.Err == nil {
 		t.Fatal("expected the failed teardown to surface as an error")
 	}
-	if store.State.LastHealthyCommit == "new222" {
+	if store.State.LastHealthyCommit == "bbb222" {
 		t.Error("a stack that failed to come down must not be promoted as a healthy deploy")
 	}
 }
 
 func TestDegradeRecordsTheFailedCommit(t *testing.T) {
 	compose := &fakeCompose{}
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot(), unhealthySnapshot()), state.New())
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
@@ -1390,8 +1419,8 @@ func TestDegradeRecordsTheFailedCommit(t *testing.T) {
 	if !result.Degraded {
 		t.Fatalf("expected DEGRADED without a rollback target, result = %+v", result)
 	}
-	if store.State.LastFailedCommit != "new222" {
-		t.Errorf("last_failed_commit = %q, want %q", store.State.LastFailedCommit, "new222")
+	if store.State.LastFailedCommit != "bbb222" {
+		t.Errorf("last_failed_commit = %q, want %q", store.State.LastFailedCommit, "bbb222")
 	}
 	if store.State.LastResult != state.ResultDegraded {
 		t.Errorf("last_result = %q, want %q", store.State.LastResult, state.ResultDegraded)
@@ -1418,7 +1447,7 @@ func TestReconcileReportsOnlyTheServicesThatWereRecreated(t *testing.T) {
 		twoServiceSnapshot("c9", "c2"),
 		twoServiceSnapshot("c9", "c2"),
 	)
-	deps, _ := testDeps(t, gitChange("old111", "new222"), compose, snap, withHealthy("old111"))
+	deps, _ := testDeps(t, gitChange("aaa111", "bbb222"), compose, snap, withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -1444,7 +1473,7 @@ func TestReconcileReportsNoUpdatedServicesWhenNothingMoved(t *testing.T) {
 		Name:     "test-stack",
 		Services: ctypes.Services{"web": ctypes.ServiceConfig{Name: "web"}},
 	}}
-	deps, _ := testDeps(t, gitChange("old111", "new222"), compose, snapshots(healthySnapshot()), withHealthy("old111"))
+	deps, _ := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 

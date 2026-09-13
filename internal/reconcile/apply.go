@@ -51,11 +51,11 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 			deps.Log.Info("nothing to do", "commit", gitResult.OldCommit)
 			return result
 		}
-		deps.Log.Warn("checkout does not match last_healthy_commit, re-applying",
-			"head", gitResult.OldCommit, "last_healthy_commit", st.LastHealthyCommit)
+		deps.Log.Warn("checkout does not match the expected commit, re-applying",
+			"head", gitResult.OldCommit, "expected", st.ExpectedCheckout(), "last_healthy_commit", st.LastHealthyCommit)
 		result.Changed = true
 		result.ChangedFiles = nil
-	} else if !relevantChange(cfg, gitResult.ChangedFiles) {
+	} else if !relevantChange(cfg, gitResult.ChangedFiles) && st.LastHealthyCommit != "" {
 		deps.Log.Info("compose file(s) unchanged, advancing checkout without applying",
 			"commit", gitResult.NewCommit, "changed_files", gitResult.ChangedFiles)
 		result.Skipped = true
@@ -128,33 +128,41 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		return revertResult
 	}
 
-	return applyAndWatch(ctx, deps, st, result, previousStacks, live.snapshots, start)
+	return applyAndWatch(ctx, deps, st, result, deployedStacks(st, previousStacks), nil, live.snapshots, start)
 }
 
 func checkoutDrifted(st *state.State, head string) bool {
-	return st.LastHealthyCommit != "" && head != "" && head != st.LastHealthyCommit
+	return head != "" && head != st.ExpectedCheckout()
 }
 
 func advanceCheckout(ctx context.Context, deps Deps, st *state.State, result Result) Result {
 	if err := deps.Git.Checkout(ctx, result.NewCommit); err != nil {
 		return abortBeforeUp(ctx, deps, st, result, "checkout failed", err)
 	}
-	if err := promoteHealthy(deps, st, result.NewCommit); err != nil {
+	if err := recordCheckout(deps, st, result.NewCommit); err != nil {
 		result.Err = err
 	}
 	return result
 }
 
-func previousStacksAt(deps Deps) ([]compose.Stack, error) {
-	stacks, err := StacksFor(deps.Config)
-	if errors.Is(err, compose.ErrNoStacks) {
-		deps.Log.Info("no compose stacks deployed at the current checkout", "err", err)
-		return nil, nil
+func recordCheckout(deps Deps, st *state.State, commit string) error {
+	next := *st
+	next.LastCheckoutCommit = commit
+	next.LastAttemptCommit = commit
+	next.LastAttemptAt = deps.Clock.Now()
+	next.LastResult = state.ResultSuccess
+	if err := deps.State.Save(&next); err != nil {
+		return fmt.Errorf("saving state: %w", err)
 	}
-	return stacks, err
+	*st = next
+	return nil
 }
 
-func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Result, previousStacks []compose.Stack, before map[string]health.Snapshot, start time.Time) Result {
+func previousStacksAt(deps Deps) ([]compose.Stack, error) {
+	return stacksAllowingEmpty(deps)
+}
+
+func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Result, previousStacks []compose.Stack, pendingStacks []string, before map[string]health.Snapshot, start time.Time) Result {
 	cfg := deps.Config
 	commit := result.NewCommit
 
@@ -162,15 +170,20 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 		return abortBeforeUp(ctx, deps, st, result, "checkout failed", err)
 	}
 
-	stacks, err := StacksFor(cfg)
+	stacks, err := stacksAllowingEmpty(deps)
 	if err != nil {
-		return abortBeforeUp(ctx, deps, st, result, "discovering compose stacks failed", err)
+		return abortBadCommit(ctx, deps, st, result, "discovering compose stacks failed", err)
 	}
 	vanished := vanishedStacks(previousStacks, stacks)
 
 	changedStacks := stacks
-	if result.ChangedFiles != nil {
-		changedStacks = filterChanged(cfg.RepoPath, stacks, result.ChangedFiles)
+	switch {
+	case st.LastHealthyCommit == "":
+		deps.Log.Info("no healthy deployment recorded yet, applying every stack", "commit", commit)
+	case result.ChangedFiles != nil:
+		changedStacks = filterChanged(cfg.RepoPath, stacks, previousStacks, result.ChangedFiles)
+	case len(pendingStacks) > 0:
+		changedStacks = restrictToNames(stacks, pendingStacks)
 	}
 	if len(changedStacks) == 0 {
 		if err := tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir"); err != nil {
@@ -179,7 +192,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 		}
 		deps.Log.Info("no compose stack changed, nothing to apply", "commit", commit)
 		result.Skipped = true
-		if err := promoteHealthy(deps, st, commit); err != nil {
+		if err := promoteHealthy(deps, st, commit, stackNames(stacks)); err != nil {
 			result.Err = err
 		}
 		return result
@@ -189,10 +202,10 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	for i, s := range changedStacks {
 		project, err := deps.Compose.LoadProject(ctx, s.Files, s.ProjectName)
 		if err != nil {
-			return abortBeforeUp(ctx, deps, st, result, "loading compose project failed", fmt.Errorf("loading project %s: %w", s.ProjectName, err))
+			return abortBadCommit(ctx, deps, st, result, "loading compose project failed", fmt.Errorf("loading project %s: %w", s.ProjectName, err))
 		}
 		if err := compose.CheckEnvFiles(project); err != nil {
-			return abortBeforeUp(ctx, deps, st, result, "env_file missing", err)
+			return abortBadCommit(ctx, deps, st, result, "env_file missing", err)
 		}
 		projects[i] = project
 	}
@@ -200,20 +213,24 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	// Persisted before touching Docker so a crash here is recoverable via
 	// pending_commit on the next run.
 	now := deps.Clock.Now()
-	if st.PendingCommit != commit {
-		st.PendingAttempts = 0
+	next := *st
+	if next.PendingCommit != commit {
+		next.PendingAttempts = 0
 	}
-	st.PendingCommit = commit
-	st.PendingSince = now
-	st.LastAttemptCommit = commit
-	st.LastAttemptAt = now
-	if st.LastFailedCommit == commit {
-		st.LastFailedCommit = ""
-		st.LastFailedAt = time.Time{}
+	next.PendingCommit = commit
+	next.PendingSince = now
+	next.PendingStacks = stackNames(changedStacks)
+	next.LastCheckoutCommit = commit
+	next.LastAttemptCommit = commit
+	next.LastAttemptAt = now
+	if next.LastFailedCommit == commit {
+		next.LastFailedCommit = ""
+		next.LastFailedAt = time.Time{}
 	}
-	if err := deps.State.Save(st); err != nil {
+	if err := deps.State.Save(&next); err != nil {
 		return abortBeforeUp(ctx, deps, st, result, "saving state failed", fmt.Errorf("saving state: %w", err))
 	}
+	*st = next
 
 	var allServices []string
 	for i, s := range changedStacks {
@@ -244,12 +261,13 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 			result.Err = err
 			return result
 		}
-		if err := promoteHealthy(deps, st, commit); err != nil {
+		if err := promoteHealthy(deps, st, commit, stackNames(stacks)); err != nil {
 			result.Err = err
 			return result
 		}
-		updated, updatedKnown := updatedServices(cfg, before, baselines, changedStacks)
+		updated, restarted, updatedKnown := updatedServices(cfg, before, baselines, changedStacks)
 		result.Updated = updated
+		result.Restarted = restarted
 		embed := notify.BuildEmbed(notify.Report{
 			Outcome:      notify.OutcomeSuccess,
 			Title:        "ComposeLock: deployed successfully",
@@ -258,6 +276,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 			Services:     result.Services,
 			Updated:      updated,
 			UpdatedKnown: updatedKnown,
+			Restarted:    restarted,
 			Stacks:       reportStacks(cfg, result.Stacks),
 			HealthWatch:  result.HealthWatch,
 			Duration:     time.Since(start),
@@ -287,6 +306,12 @@ func failAndRevert(ctx context.Context, deps Deps, st *state.State, stacks []com
 	result.NotificationKey = revertResult.NotificationKey
 	result.HealthWatch += revertResult.HealthWatch
 	return result
+}
+
+func abortBadCommit(ctx context.Context, deps Deps, st *state.State, result Result, title string, err error) Result {
+	st.LastFailedCommit = result.NewCommit
+	st.LastFailedAt = deps.Clock.Now()
+	return abortBeforeUp(ctx, deps, st, result, title, err)
 }
 
 func abortBeforeUp(ctx context.Context, deps Deps, st *state.State, result Result, title string, err error) Result {
@@ -349,22 +374,19 @@ func stackFilesChanged(repoPath string, files []string, changedFiles []string) b
 func composeDirRelevant(repoPath, composeDir string, changedFiles []string) bool {
 	dir := resolveUnderRepo(repoPath, composeDir)
 	for _, f := range changedFiles {
-		if relevantComposeDirEntry(dir, resolveUnderRepo(repoPath, f)) {
+		if pathUnder(dir, resolveUnderRepo(repoPath, f)) {
 			return true
 		}
 	}
 	return false
 }
 
-func relevantComposeDirEntry(dir, abs string) bool {
+func pathUnder(dir, abs string) bool {
 	rel, err := filepath.Rel(dir, abs)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if err != nil || rel == "." || rel == ".." {
 		return false
 	}
-	if compose.IsHiddenPath(rel) || !compose.IsComposeFile(filepath.Base(rel)) {
-		return false
-	}
-	return strings.Count(rel, string(filepath.Separator)) <= 1
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func resolveUnderRepo(repoPath, p string) string {

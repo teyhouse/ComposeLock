@@ -10,11 +10,11 @@ func TestDiscoverCacheReturnsEqualResultOnRepeatedCalls(t *testing.T) {
 	writeFile(t, filepath.Join(dir, "docker-compose.yml"), "services:\n  web:\n    image: nginx\n")
 	writeFile(t, filepath.Join(dir, "api", "compose.yaml"), "services:\n  api:\n    image: nginx\n")
 
-	first, err := Discover(dir, "stack")
+	first, err := Discover(dir, "stack", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	second, err := Discover(dir, "stack")
+	second, err := Discover(dir, "stack", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -34,13 +34,13 @@ func TestDiscoverCacheInvalidatesOnContentChange(t *testing.T) {
 	path := filepath.Join(dir, "docker-compose.yml")
 	writeFile(t, path, "services:\n  web:\n    image: nginx\n")
 
-	if _, err := Discover(dir, "stack"); err != nil {
+	if _, err := Discover(dir, "stack", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	writeFile(t, filepath.Join(dir, "api", "compose.yaml"), "services:\n  api:\n    image: nginx\n")
 
-	stacks, err := Discover(dir, "stack")
+	stacks, err := Discover(dir, "stack", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestDiscoverCacheInvalidatesOnContentChange(t *testing.T) {
 	}
 
 	writeFile(t, path, "services:\n  web:\n    image: nginx:alpine\n")
-	if _, err := Discover(dir, "stack"); err != nil {
+	if _, err := Discover(dir, "stack", nil); err != nil {
 		t.Fatalf("unexpected error after a content change: %v", err)
 	}
 }
@@ -58,11 +58,11 @@ func TestDiscoverCacheInvalidatesOnProjectNameChange(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "docker-compose.yml"), "services:\n  web:\n    image: nginx\n")
 
-	a, err := Discover(dir, "alpha")
+	a, err := Discover(dir, "alpha", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	b, err := Discover(dir, "beta")
+	b, err := Discover(dir, "beta", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -75,13 +75,13 @@ func TestDiscoverResultIsNotAliasedAcrossCalls(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "docker-compose.yml"), "services:\n  web:\n    image: nginx\n")
 
-	first, err := Discover(dir, "stack")
+	first, err := Discover(dir, "stack", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	first[0].ProjectName = "mutated"
 
-	second, err := Discover(dir, "stack")
+	second, err := Discover(dir, "stack", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

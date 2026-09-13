@@ -93,3 +93,33 @@ func TestValidateRejectsComposeDirPointingAtAFile(t *testing.T) {
 		t.Fatal("expected an error when compose_dir is a file")
 	}
 }
+
+func TestValidateRejectsOptionLikeRemoteAndBranch(t *testing.T) {
+	for _, tc := range []struct{ name, remote, branch string }{
+		{"remote flag", "--upload-pack=/bin/sh", "main"},
+		{"branch flag", "origin", "--upload-pack=/bin/sh"},
+		{"branch traversal", "origin", "../../etc"},
+		{"branch space", "origin", "main branch"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.Remote, cfg.Branch = tc.remote, tc.branch
+			if err := cfg.Validate(slog.New(slog.DiscardHandler)); err == nil {
+				t.Errorf("Validate() = nil, want a rejection for remote %q branch %q", tc.remote, tc.branch)
+			}
+		})
+	}
+}
+
+func TestValidateRequiresAWebhookSecretOffLoopback(t *testing.T) {
+	cfg := Default()
+	cfg.Webhook.Listen = "0.0.0.0:8080"
+	if err := cfg.Validate(slog.New(slog.DiscardHandler)); err == nil {
+		t.Error("Validate() = nil, want an unauthenticated public webhook to be refused")
+	}
+
+	cfg.Webhook.Secret = "hunter2"
+	if err := cfg.Validate(slog.New(slog.DiscardHandler)); err != nil {
+		t.Errorf("Validate() = %v, want a secret-protected public webhook to be accepted", err)
+	}
+}

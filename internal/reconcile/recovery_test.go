@@ -8,10 +8,11 @@ import (
 )
 
 func TestReconcileCrashRecoveryGivesUpAfterAttemptLimit(t *testing.T) {
-	st := withHealthy("old111")
-	st.PendingCommit = "pending333"
-	compose := &fakeCompose{loadErr: errors.New("compose file is broken")}
-	deps, store := testDeps(t, gitNoChange("old111"), compose, snapshots(healthySnapshot()), st)
+	st := withHealthy("aaa111")
+	st.PendingCommit = "ccc333"
+	st.LastFailedCommit = "ccc333"
+	snap := &fakeSnapshotter{err: errors.New("docker daemon unreachable")}
+	deps, store := testDeps(t, gitNoChange("aaa111"), &fakeCompose{}, snap, st)
 
 	for attempt := 1; attempt <= maxRecoveryAttempts; attempt++ {
 		result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
@@ -38,10 +39,10 @@ func TestReconcileCrashRecoveryGivesUpAfterAttemptLimit(t *testing.T) {
 }
 
 func TestReconcileCrashRecoveryResetsAttemptsOnSuccess(t *testing.T) {
-	st := withHealthy("old111")
-	st.PendingCommit = "pending333"
+	st := withHealthy("aaa111")
+	st.PendingCommit = "ccc333"
 	st.PendingAttempts = 2
-	deps, store := testDeps(t, gitNoChange("old111"), &fakeCompose{}, snapshots(healthySnapshot()), st)
+	deps, store := testDeps(t, gitNoChange("aaa111"), &fakeCompose{}, snapshots(healthySnapshot()), st)
 
 	if result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps); result.Err != nil {
 		t.Fatalf("unexpected error: %v", result.Err)
@@ -52,24 +53,24 @@ func TestReconcileCrashRecoveryResetsAttemptsOnSuccess(t *testing.T) {
 }
 
 func TestReconcileCrashRecoveryForceResetsAttempts(t *testing.T) {
-	st := withHealthy("old111")
-	st.PendingCommit = "pending333"
+	st := withHealthy("aaa111")
+	st.PendingCommit = "ccc333"
 	st.PendingAttempts = maxRecoveryAttempts
-	deps, store := testDeps(t, gitNoChange("old111"), &fakeCompose{}, snapshots(healthySnapshot()), st)
+	deps, store := testDeps(t, gitNoChange("aaa111"), &fakeCompose{}, snapshots(healthySnapshot()), st)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli", Force: true}, deps)
 	if result.Degraded {
 		t.Fatalf("--force should retry past the attempt limit, got %+v", result)
 	}
-	if store.State.LastHealthyCommit != "pending333" {
-		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "pending333")
+	if store.State.LastHealthyCommit != "ccc333" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "ccc333")
 	}
 }
 
 func TestReconcileFreshApplyResetsAttempts(t *testing.T) {
-	st := withHealthy("old111")
+	st := withHealthy("aaa111")
 	st.PendingAttempts = 2
-	deps, store := testDeps(t, gitChange("old111", "new222"), &fakeCompose{}, snapshots(healthySnapshot()), st)
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), &fakeCompose{}, snapshots(healthySnapshot()), st)
 
 	if result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps); result.Err != nil {
 		t.Fatalf("unexpected error: %v", result.Err)

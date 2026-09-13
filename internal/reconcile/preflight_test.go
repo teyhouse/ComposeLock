@@ -14,9 +14,9 @@ func startingSnapshot() health.Snapshot {
 }
 
 func TestReconcilePreflightToleratesStartingContainers(t *testing.T) {
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
-	deps, store := testDeps(t, g, compose, snapshots(startingSnapshot(), healthySnapshot()), withHealthy("old111"))
+	deps, store := testDeps(t, g, compose, snapshots(startingSnapshot(), healthySnapshot()), withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -26,23 +26,23 @@ func TestReconcilePreflightToleratesStartingContainers(t *testing.T) {
 	if !result.Applied {
 		t.Fatalf("expected the new commit to be applied, result = %+v", result)
 	}
-	if g.head != "new222" {
-		t.Errorf("HEAD = %q, want %q", g.head, "new222")
+	if g.head != "bbb222" {
+		t.Errorf("HEAD = %q, want %q", g.head, "bbb222")
 	}
-	if store.State.LastHealthyCommit != "new222" {
-		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "new222")
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
 	}
 }
 
 func TestHealthWatchStillFailsOnStuckStartingContainer(t *testing.T) {
-	g := gitChange("old111", "new222")
+	g := gitChange("aaa111", "bbb222")
 	compose := &fakeCompose{}
 	deps, _ := testDeps(t, g, compose, snapshots(
 		healthySnapshot(),
 		healthySnapshot(),
 		startingSnapshot(),
 		healthySnapshot(),
-	), withHealthy("old111"))
+	), withHealthy("aaa111"))
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
 
@@ -73,7 +73,7 @@ func (l *fakeLock) Unlock() error {
 
 func TestReconcileSkipsWhenAnotherProcessHoldsTheLock(t *testing.T) {
 	compose := &fakeCompose{}
-	deps, _ := testDeps(t, gitChange("old111", "new222"), compose, snapshots(healthySnapshot()), withHealthy("old111"))
+	deps, _ := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
 	lock := &fakeLock{held: false}
 	deps.Lock = lock
 
@@ -91,7 +91,7 @@ func TestReconcileSkipsWhenAnotherProcessHoldsTheLock(t *testing.T) {
 }
 
 func TestReconcileReleasesTheLockAfterRunning(t *testing.T) {
-	deps, _ := testDeps(t, gitChange("old111", "new222"), &fakeCompose{}, snapshots(healthySnapshot()), withHealthy("old111"))
+	deps, _ := testDeps(t, gitChange("aaa111", "bbb222"), &fakeCompose{}, snapshots(healthySnapshot()), withHealthy("aaa111"))
 	lock := &fakeLock{held: true}
 	deps.Lock = lock
 
@@ -104,7 +104,7 @@ func TestReconcileReleasesTheLockAfterRunning(t *testing.T) {
 }
 
 func TestReconcileReportsLockError(t *testing.T) {
-	deps, _ := testDeps(t, gitChange("old111", "new222"), &fakeCompose{}, snapshots(healthySnapshot()), withHealthy("old111"))
+	deps, _ := testDeps(t, gitChange("aaa111", "bbb222"), &fakeCompose{}, snapshots(healthySnapshot()), withHealthy("aaa111"))
 	deps.Lock = &fakeLock{err: errors.New("permission denied")}
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)

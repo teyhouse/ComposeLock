@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +43,7 @@ type Result struct {
 	RolledBackTo string
 	Services     []string
 	Updated      []string
+	Restarted    []string
 	Stacks       []string
 	ChangedFiles []string
 	HealthWatch  time.Duration
@@ -168,11 +169,56 @@ func serviceNames(project *types.Project) []string {
 	return slices.Sorted(maps.Keys(project.Services))
 }
 
-func StacksFor(cfg *config.Config) ([]compose.Stack, error) {
+func StacksFor(cfg *config.Config, log *slog.Logger) ([]compose.Stack, error) {
 	if cfg.ComposeDir != "" {
-		return compose.Discover(resolveUnderRepo(cfg.RepoPath, cfg.ComposeDir), cfg.ProjectName)
+		return compose.Discover(resolveUnderRepo(cfg.RepoPath, cfg.ComposeDir), cfg.ProjectName, log)
 	}
 	return []compose.Stack{{ProjectName: cfg.ProjectName, Files: []string{cfg.ComposeFile}}}, nil
+}
+
+func stacksAllowingEmpty(deps Deps) ([]compose.Stack, error) {
+	stacks, err := StacksFor(deps.Config, deps.Log)
+	if errors.Is(err, compose.ErrNoStacks) {
+		deps.Log.Info("no compose stacks at this checkout", "err", err)
+		return nil, nil
+	}
+	return stacks, err
+}
+
+func deployedStacks(st *state.State, discovered []compose.Stack) []compose.Stack {
+	if len(st.LastHealthyStacks) == 0 {
+		return discovered
+	}
+	seen := make(map[string]struct{}, len(discovered)+len(st.LastHealthyStacks))
+	out := slices.Clone(discovered)
+	for _, s := range discovered {
+		seen[s.ProjectName] = struct{}{}
+	}
+	for _, name := range st.LastHealthyStacks {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, compose.Stack{ProjectName: name})
+	}
+	return out
+}
+
+func restrictToNames(stacks []compose.Stack, names []string) []compose.Stack {
+	if len(names) == 0 {
+		return stacks
+	}
+	wanted := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		wanted[n] = struct{}{}
+	}
+	var out []compose.Stack
+	for _, s := range stacks {
+		if _, ok := wanted[s.ProjectName]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func stackNames(stacks []compose.Stack) []string {
@@ -190,8 +236,8 @@ func reportStacks(cfg *config.Config, names []string) []string {
 	return names
 }
 
-func filterChanged(repoPath string, stacks []compose.Stack, changedFiles []string) []compose.Stack {
-	changedDirs := changedComposeDirs(repoPath, changedFiles)
+func filterChanged(repoPath string, stacks, previous []compose.Stack, changedFiles []string) []compose.Stack {
+	touched := touchedStackDirs(repoPath, append(slices.Clone(stacks), previous...), changedFiles)
 	var changed []compose.Stack
 	for _, s := range stacks {
 		if s.Dir == "" {
@@ -200,22 +246,37 @@ func filterChanged(repoPath string, stacks []compose.Stack, changedFiles []strin
 			}
 			continue
 		}
-		if _, ok := changedDirs[resolveUnderRepo(repoPath, s.Dir)]; ok {
+		if _, ok := touched[resolveUnderRepo(repoPath, s.Dir)]; ok {
 			changed = append(changed, s)
 		}
 	}
 	return changed
 }
 
-func changedComposeDirs(repoPath string, changedFiles []string) map[string]struct{} {
-	dirs := make(map[string]struct{}, len(changedFiles))
-	for _, f := range changedFiles {
-		if compose.IsHiddenPath(f) || !compose.IsComposeFile(filepath.Base(f)) {
-			continue
+func touchedStackDirs(repoPath string, stacks []compose.Stack, changedFiles []string) map[string]struct{} {
+	dirs := make([]string, 0, len(stacks))
+	for _, s := range stacks {
+		if s.Dir != "" {
+			dir := resolveUnderRepo(repoPath, s.Dir)
+			if !slices.Contains(dirs, dir) {
+				dirs = append(dirs, dir)
+			}
 		}
-		dirs[filepath.Dir(resolveUnderRepo(repoPath, f))] = struct{}{}
 	}
-	return dirs
+	touched := make(map[string]struct{}, len(dirs))
+	for _, f := range changedFiles {
+		abs := resolveUnderRepo(repoPath, f)
+		best := ""
+		for _, dir := range dirs {
+			if pathUnder(dir, abs) && len(dir) > len(best) {
+				best = dir
+			}
+		}
+		if best != "" {
+			touched[best] = struct{}{}
+		}
+	}
+	return touched
 }
 
 func intersectByProjectName(a, b []compose.Stack) []compose.Stack {
@@ -250,18 +311,38 @@ func tearDownStacks(ctx context.Context, deps Deps, stacks []compose.Stack, reas
 	if len(stacks) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), teardownTimeout)
-	defer cancel()
+	base := context.WithoutCancel(ctx)
 
 	var errs []error
+	var removed, remaining []string
 	for _, s := range stacks {
 		deps.Log.Info("tearing down compose stack", "project", s.ProjectName, "reason", reason)
-		if err := deps.Compose.Down(ctx, s.ProjectName); err != nil {
+		if err := downStack(base, deps, s.ProjectName); err != nil {
 			deps.Log.Error("tearing down compose stack failed", "project", s.ProjectName, "err", err)
 			errs = append(errs, fmt.Errorf("tearing down %s: %w", s.ProjectName, err))
+			remaining = append(remaining, s.ProjectName)
+			continue
 		}
+		removed = append(removed, s.ProjectName)
 	}
+	if len(errs) == 0 {
+		return nil
+	}
+	errs = append(errs, fmt.Errorf("torn down: %s; still running: %s", listOrNone(removed), listOrNone(remaining)))
 	return errors.Join(errs...)
+}
+
+func downStack(ctx context.Context, deps Deps, projectName string) error {
+	ctx, cancel := context.WithTimeout(ctx, teardownTimeout)
+	defer cancel()
+	return deps.Compose.Down(ctx, projectName)
+}
+
+func listOrNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
 }
 
 type liveState struct {
@@ -290,46 +371,57 @@ func evaluateLive(ctx context.Context, deps Deps, stacks []compose.Stack) (liveS
 	return live, nil
 }
 
-func updatedServices(cfg *config.Config, before, after map[string]health.Snapshot, stacks []compose.Stack) ([]string, bool) {
+func updatedServices(cfg *config.Config, before, after map[string]health.Snapshot, stacks []compose.Stack) (updated, restarted []string, known bool) {
 	if cfg.HealthWatchSeconds <= 0 {
-		return nil, false
+		return nil, nil, false
 	}
-	var updated []string
 	for _, s := range stacks {
 		post, ok := after[s.ProjectName]
 		if !ok {
-			return nil, false
+			return nil, nil, false
 		}
 		updated = append(updated, health.ChangedServices(before[s.ProjectName], post)...)
+		restarted = append(restarted, health.RestartedServices(before[s.ProjectName], post)...)
 	}
 	slices.Sort(updated)
-	return slices.Compact(updated), true
+	slices.Sort(restarted)
+	return slices.Compact(updated), slices.Compact(restarted), true
 }
 
 func recordOutcome(deps Deps, st *state.State, result state.Result, commit string) {
-	st.LastResult = result
-	st.LastAttemptAt = deps.Clock.Now()
+	next := *st
+	next.LastResult = result
+	next.LastAttemptAt = deps.Clock.Now()
 	if commit != "" {
-		st.LastAttemptCommit = commit
+		next.LastAttemptCommit = commit
 	}
-	if err := deps.State.Save(st); err != nil {
+	if err := deps.State.Save(&next); err != nil {
 		deps.Log.Error("saving state", "err", err, "last_result", string(result))
+		return
 	}
+	*st = next
 }
 
-func promoteHealthy(deps Deps, st *state.State, commit string) error {
-	st.LastHealthyCommit = commit
-	st.LastHealthyAt = deps.Clock.Now()
-	st.PendingCommit = ""
-	st.PendingSince = time.Time{}
-	st.PendingAttempts = 0
-	st.LastFailedCommit = ""
-	st.LastFailedAt = time.Time{}
-	st.LastAttemptCommit = commit
-	st.LastAttemptAt = deps.Clock.Now()
-	st.LastResult = state.ResultSuccess
-	if err := deps.State.Save(st); err != nil {
+func promoteHealthy(deps Deps, st *state.State, commit string, stacks []string) error {
+	now := deps.Clock.Now()
+	next := *st
+	next.LastHealthyCommit = commit
+	next.LastHealthyAt = now
+	next.LastHealthyStacks = slices.Clone(stacks)
+	next.LastCheckoutCommit = commit
+	next.PendingCommit = ""
+	next.PendingSince = time.Time{}
+	next.PendingAttempts = 0
+	next.PendingStacks = nil
+	next.PendingRevert = false
+	next.LastFailedCommit = ""
+	next.LastFailedAt = time.Time{}
+	next.LastAttemptCommit = commit
+	next.LastAttemptAt = now
+	next.LastResult = state.ResultSuccess
+	if err := deps.State.Save(&next); err != nil {
 		return fmt.Errorf("saving state: %w", err)
 	}
+	*st = next
 	return nil
 }

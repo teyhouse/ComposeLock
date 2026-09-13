@@ -125,7 +125,7 @@ func Load(path string, overrides Overrides, logger *slog.Logger) (*Config, error
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parsing config file %s: %w", path, err)
 	}
-	warnUnknownFields(raw, logger)
+	warnUnknownFields(raw, reflect.TypeFor[Config](), "", logger)
 
 	cfg := loadDefaults()
 	if err := json.Unmarshal(data, cfg); err != nil {
@@ -134,10 +134,14 @@ func Load(path string, overrides Overrides, logger *slog.Logger) (*Config, error
 	if cfg.SchemaVersion == 0 {
 		cfg.SchemaVersion = schemaVersion
 	}
+	if cfg.SchemaVersion > schemaVersion {
+		return nil, fmt.Errorf("config file %s has schema_version %d, this build understands %d: upgrade composelock", path, cfg.SchemaVersion, schemaVersion)
+	}
 
 	if err := cfg.Apply(overrides); err != nil {
 		return nil, err
 	}
+	cfg.StateFile = canonicalPath(cfg.StateFile)
 
 	composeFileExplicit := rawFieldString(raw, "compose_file") != "" || overrides.ComposeFile != nil
 	if cfg.ComposeDir != "" && composeFileExplicit {
@@ -150,13 +154,36 @@ func Load(path string, overrides Overrides, logger *slog.Logger) (*Config, error
 	return cfg, nil
 }
 
-func warnUnknownFields(raw map[string]json.RawMessage, logger *slog.Logger) {
-	known := knownTopLevelFields()
-	for key := range raw {
-		if !known[key] {
-			logger.Warn("unknown config field", "field", key)
+func warnUnknownFields(raw map[string]json.RawMessage, t reflect.Type, prefix string, logger *slog.Logger) {
+	known := knownFields(t)
+	for key, value := range raw {
+		field, ok := known[key]
+		if !ok {
+			logger.Warn("unknown config field", "field", prefix+key)
+			continue
 		}
+		if field.Kind() != reflect.Struct {
+			continue
+		}
+		var nested map[string]json.RawMessage
+		if err := json.Unmarshal(value, &nested); err != nil {
+			continue
+		}
+		warnUnknownFields(nested, field, prefix+key+".", logger)
 	}
+}
+
+func canonicalPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	dir, base := filepath.Split(abs)
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(dir))
+	if err != nil {
+		return abs
+	}
+	return filepath.Join(resolved, base)
 }
 
 func (c *Config) validateRequired() error {
@@ -179,6 +206,12 @@ func (c *Config) validateRequired() error {
 	}
 	if c.ProjectName != loader.NormalizeProjectName(c.ProjectName) {
 		return fmt.Errorf("config: project_name %q must consist only of lowercase letters, digits, hyphens and underscores, and start with a letter or digit", c.ProjectName)
+	}
+	if !validGitRef(c.Remote) {
+		return fmt.Errorf("config: remote %q must consist only of letters, digits, %q and must not start with %q or contain %q", c.Remote, "._/-", "-", "..")
+	}
+	if !validGitRef(c.Branch) {
+		return fmt.Errorf("config: branch %q must consist only of letters, digits, %q and must not start with %q or contain %q", c.Branch, "._/-", "-", "..")
 	}
 	return c.validateComposePath()
 }
@@ -220,14 +253,13 @@ func rawFieldString(raw map[string]json.RawMessage, field string) string {
 	return s
 }
 
-func knownTopLevelFields() map[string]bool {
-	fields := make(map[string]bool)
-	t := reflect.TypeFor[Config]()
+func knownFields(t reflect.Type) map[string]reflect.Type {
+	fields := make(map[string]reflect.Type, t.NumField())
 	for i := range t.NumField() {
 		tag := t.Field(i).Tag.Get("json")
 		name, _, _ := strings.Cut(tag, ",")
 		if name != "" {
-			fields[name] = true
+			fields[name] = t.Field(i).Type
 		}
 	}
 	return fields
@@ -289,7 +321,25 @@ func (w WebhookConfig) validate() error {
 	if _, _, err := net.SplitHostPort(w.Listen); err != nil {
 		return fmt.Errorf("config: webhook.listen must be host:port, got %q", w.Listen)
 	}
+	if w.Secret == "" && !isLoopback(w.Listen) {
+		return fmt.Errorf("config: webhook.secret is required when webhook.listen %q is not a loopback address: every request to webhook.path would trigger a deploy", w.Listen)
+	}
 	return nil
+}
+
+func validGitRef(s string) bool {
+	if s == "" || strings.HasPrefix(s, "-") || strings.Contains(s, "..") {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '_', r == '/', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func isLoopback(hostport string) bool {
@@ -304,23 +354,28 @@ func isLoopback(hostport string) bool {
 	return err == nil && addr.IsLoopback()
 }
 
-func Init(path string, force bool) error {
+func Init(path string, force bool, overrides Overrides) (*Config, error) {
 	if !force {
 		if _, err := os.Stat(path); err == nil {
-			return fmt.Errorf("config file %s already exists (use --force to overwrite)", path)
+			return nil, fmt.Errorf("config file %s already exists (use --force to overwrite)", path)
 		} else if !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("checking config file %s: %w", path, err)
+			return nil, fmt.Errorf("checking config file %s: %w", path, err)
 		}
 	}
 
-	data, err := json.MarshalIndent(Default(), "", "  ")
+	cfg := Default()
+	if err := cfg.Apply(overrides); err != nil {
+		return nil, err
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshaling default config: %w", err)
+		return nil, fmt.Errorf("marshaling default config: %w", err)
 	}
 	data = append(data, '\n')
 
 	if err := os.WriteFile(path, data, 0o600); err != nil {
-		return fmt.Errorf("writing config file %s: %w", path, err)
+		return nil, fmt.Errorf("writing config file %s: %w", path, err)
 	}
-	return nil
+	return cfg, nil
 }

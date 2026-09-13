@@ -4,9 +4,30 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
+
+type stalledClock struct {
+	now     time.Time
+	step    time.Duration
+	stalled bool
+}
+
+func (c *stalledClock) Now() time.Time {
+	if !c.stalled {
+		c.stalled = true
+		return c.now
+	}
+	c.now = c.now.Add(c.step)
+	return c.now
+}
+
+func (c *stalledClock) Sleep(_ context.Context, d time.Duration) bool {
+	c.now = c.now.Add(d)
+	return true
+}
 
 // fakeSnapshotter returns snapshots[i] on the i-th call, clamped to the
 // last entry once exhausted.
@@ -318,5 +339,147 @@ func TestWatchDisabledSkipsTheBaselineSnapshot(t *testing.T) {
 	}
 	if snap.call != 0 {
 		t.Errorf("took %d snapshots, want 0 when the watch is disabled", snap.call)
+	}
+}
+
+func TestWatchRestartBaselineIsPerContainerNotPerService(t *testing.T) {
+	lagging := ContainerStatus{ID: "c1", Service: "web", State: StateRunning, RestartCount: 0}
+	settled := ContainerStatus{ID: "c2", Service: "web", State: StateRunning, RestartCount: 5}
+	crashing := ContainerStatus{ID: "c1", Service: "web", State: StateRunning, RestartCount: 3}
+
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{lagging, settled}},
+		{Containers: []ContainerStatus{crashing, settled}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Errorf("Outcome = %v, want unhealthy: a replica that restarted 3 times must not hide behind a sibling's higher count", res.Outcome)
+	}
+}
+
+func TestWatchLosingOneReplicaFails(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web"), running("c2", "web")}},
+		{Containers: []ContainerStatus{running("c1", "web")}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want unhealthy when a replica disappears", res.Outcome)
+	}
+	if !strings.Contains(res.Reason, "1 of 2 replicas") {
+		t.Errorf("Reason = %q, want the replica counts", res.Reason)
+	}
+}
+
+func TestWatchScalingUpMidWindowStaysHealthy(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
+		{Containers: []ContainerStatus{running("c1", "web"), running("c2", "web")}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Healthy {
+		t.Errorf("Outcome = %v (%s), want healthy: extra replicas are not a failure", res.Outcome, res.Reason)
+	}
+}
+
+func TestWatchDeadContainerFailsOnTheFirstPoll(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateDead}}},
+	}}
+	clock := &fakeClock{}
+
+	res, err := Watch(t.Context(), snap, clock, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want unhealthy", res.Outcome)
+	}
+	if snap.call != 2 {
+		t.Errorf("snapshot calls = %d, want the watch to stop after the first bad poll instead of burning the window", snap.call)
+	}
+}
+
+func TestWatchContainerStuckInCreatedFailsAtTheStreakLimit(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateCreated}}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Fatalf("Outcome = %v, want unhealthy", res.Outcome)
+	}
+	if snap.call != 1+baseOpts().UnhealthyStreakLimit {
+		t.Errorf("snapshot calls = %d, want the wedge to fail after %d polls", snap.call, baseOpts().UnhealthyStreakLimit)
+	}
+}
+
+func TestWatchZeroIterationsEvaluatesTheBaseline(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateExited, ExitCode: 1}}},
+	}}
+	opts := baseOpts()
+	opts.WatchDuration = time.Nanosecond
+	opts.PollInterval = time.Second
+
+	res, err := Watch(t.Context(), snap, &stalledClock{step: time.Second}, opts, testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Errorf("Outcome = %v, want unhealthy: a window with no polls must judge the baseline, not an empty snapshot", res.Outcome)
+	}
+	if snap.call != 1 {
+		t.Errorf("snapshot calls = %d, want only the baseline", snap.call)
+	}
+}
+
+func TestWatchRestartingAtTheFinalPollWithinToleranceStaysHealthy(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRunning, RestartCount: 0}}},
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRestarting, RestartCount: 1}}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Healthy {
+		t.Errorf("Outcome = %v (%s), want healthy: a restart within tolerance is not a failed deploy", res.Outcome, res.Reason)
+	}
+}
+
+func TestRestartedServicesNamesInPlaceRestarts(t *testing.T) {
+	before := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: "web", RestartCount: 2},
+		{ID: "c2", Service: "db", RestartCount: 0},
+	}}
+	after := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: "web", RestartCount: 3},
+		{ID: "c2", Service: "db", RestartCount: 0},
+	}}
+
+	if got := RestartedServices(before, after); len(got) != 1 || got[0] != "web" {
+		t.Errorf("RestartedServices = %v, want [web]", got)
+	}
+	if got := ChangedServices(before, after); len(got) != 0 {
+		t.Errorf("ChangedServices = %v, want empty: the container kept its id", got)
 	}
 }

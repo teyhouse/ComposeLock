@@ -151,3 +151,24 @@ func TestCheckWritable(t *testing.T) {
 		t.Error("expected an error for a read-only state directory")
 	}
 }
+
+func TestLoadUpgradesAnOlderSchemaVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"schema_version": 1, "last_healthy_commit": "aaa111"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if st.SchemaVersion != schemaVersion {
+		t.Errorf("SchemaVersion = %d, want %d", st.SchemaVersion, schemaVersion)
+	}
+	if st.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want %q", st.LastHealthyCommit, "aaa111")
+	}
+	if st.ExpectedCheckout() != "aaa111" {
+		t.Errorf("ExpectedCheckout() = %q, want it to fall back to last_healthy_commit", st.ExpectedCheckout())
+	}
+}
