@@ -61,10 +61,10 @@ func TestPreviewNoChange(t *testing.T) {
 
 func TestPreviewChangeDoesNotCheckout(t *testing.T) {
 	s, _ := newSyncer(t, map[string]fakeResponse{
-		"git fetch origin main":              {},
-		"git rev-parse HEAD":                 {stdout: "old111"},
-		"git rev-parse origin/main":          {stdout: "new222"},
-		"git diff --name-only old111 new222": {stdout: "docker-compose.yml\napp.env.example"},
+		"git fetch origin main":                 {},
+		"git rev-parse HEAD":                    {stdout: "old111"},
+		"git rev-parse origin/main":             {stdout: "new222"},
+		"git diff --name-only -z old111 new222": {stdout: "docker-compose.yml\x00app.env.example\x00"},
 	})
 
 	result, err := s.Preview(t.Context())
@@ -178,4 +178,56 @@ type runnerFunc func(ctx context.Context, dir string, env []string, name string,
 
 func (f runnerFunc) Run(ctx context.Context, dir string, env []string, name string, args ...string) ([]byte, []byte, error) {
 	return f(ctx, dir, env, name, args...)
+}
+
+func TestPreviewDoesNotFetch(t *testing.T) {
+	s, fr := newSyncer(t, map[string]fakeResponse{
+		"git rev-parse HEAD":        {stdout: "abc123"},
+		"git rev-parse origin/main": {stdout: "abc123"},
+	})
+
+	if _, err := s.Preview(t.Context()); err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	for _, c := range fr.calls {
+		if strings.HasPrefix(c, "git fetch") {
+			t.Errorf("Preview ran %q, want the fetch to stay in Fetch so only it is retried", c)
+		}
+	}
+}
+
+func TestPreviewSplitsDiffOnNUL(t *testing.T) {
+	s, _ := newSyncer(t, map[string]fakeResponse{
+		"git rev-parse HEAD":                    {stdout: "old111"},
+		"git rev-parse origin/main":             {stdout: "new222"},
+		"git diff --name-only -z old111 new222": {stdout: "deploy/a b.yaml\x00deploy/c.yaml\x00"},
+	})
+
+	result, err := s.Preview(t.Context())
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	want := []string{"deploy/a b.yaml", "deploy/c.yaml"}
+	if len(result.ChangedFiles) != len(want) {
+		t.Fatalf("ChangedFiles = %q, want %q", result.ChangedFiles, want)
+	}
+	for i, f := range want {
+		if result.ChangedFiles[i] != f {
+			t.Errorf("ChangedFiles[%d] = %q, want %q", i, result.ChangedFiles[i], f)
+		}
+	}
+}
+
+func TestFetchDoesNotRetryPermanentErrors(t *testing.T) {
+	fr := &fakeRunner{t: t, responses: map[string]fakeResponse{
+		"git fetch origin main": {err: errors.New("exit status 128 (stderr: fatal: not a git repository)")},
+	}}
+	s := &Syncer{Runner: fr, RepoPath: "/repo", Remote: "origin", Branch: "main"}
+
+	if _, err := Fetch(t.Context(), s, 3, time.Minute, slog.New(slog.DiscardHandler)); err == nil {
+		t.Fatal("expected an error")
+	}
+	if len(fr.calls) != 1 {
+		t.Errorf("ran %d commands, want 1: a permanent error must not be retried", len(fr.calls))
+	}
 }

@@ -49,11 +49,14 @@ func (s *Syncer) git(ctx context.Context, timeout time.Duration, args ...string)
 	return strings.TrimSpace(string(stdout)), err
 }
 
-func (s *Syncer) Preview(ctx context.Context) (Result, error) {
+func (s *Syncer) fetch(ctx context.Context) error {
 	if _, err := s.git(ctx, FetchTimeout, "fetch", s.Remote, s.Branch); err != nil {
-		return Result{}, fmt.Errorf("git fetch: %w", err)
+		return fmt.Errorf("git fetch: %w", err)
 	}
+	return nil
+}
 
+func (s *Syncer) Preview(ctx context.Context) (Result, error) {
 	oldCommit, err := s.git(ctx, QueryTimeout, "rev-parse", "HEAD")
 	if err != nil {
 		return Result{}, fmt.Errorf("git rev-parse HEAD: %w", err)
@@ -68,14 +71,11 @@ func (s *Syncer) Preview(ctx context.Context) (Result, error) {
 		return Result{Changed: false, OldCommit: oldCommit, NewCommit: newCommit}, nil
 	}
 
-	changedOut, err := s.git(ctx, QueryTimeout, "diff", "--name-only", oldCommit, newCommit)
+	changedOut, err := s.git(ctx, QueryTimeout, "diff", "--name-only", "-z", oldCommit, newCommit)
 	if err != nil {
 		return Result{}, fmt.Errorf("git diff: %w", err)
 	}
-	var changedFiles []string
-	if changedOut != "" {
-		changedFiles = strings.Split(changedOut, "\n")
-	}
+	changedFiles := splitNUL(changedOut)
 
 	return Result{
 		Changed:      true,
@@ -92,27 +92,62 @@ func (s *Syncer) Checkout(ctx context.Context, commit string) error {
 	return nil
 }
 
-func Fetch(ctx context.Context, s *Syncer, attempts int, delay time.Duration, log *slog.Logger) (Result, error) {
-	return retry(ctx, attempts, delay, log, s.Preview)
+func splitNUL(out string) []string {
+	var files []string
+	for _, f := range strings.Split(out, "\x00") {
+		if f != "" {
+			files = append(files, f)
+		}
+	}
+	return files
 }
 
-func retry(ctx context.Context, attempts int, delay time.Duration, log *slog.Logger, fn func(context.Context) (Result, error)) (Result, error) {
+func Fetch(ctx context.Context, s *Syncer, attempts int, delay time.Duration, log *slog.Logger) (Result, error) {
+	if err := retry(ctx, attempts, delay, log, s.fetch); err != nil {
+		return Result{}, err
+	}
+	return s.Preview(ctx)
+}
+
+func retry(ctx context.Context, attempts int, delay time.Duration, log *slog.Logger, fn func(context.Context) error) error {
 	attempts = max(attempts, 1)
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		result, err := fn(ctx)
+		err := fn(ctx)
 		if err == nil {
-			return result, nil
+			return nil
 		}
 		lastErr = err
 		log.Warn("git sync attempt failed", "attempt", attempt, "err", err)
+		if permanent(err) {
+			log.Warn("git sync: error will not be fixed by retrying, giving up", "err", err)
+			break
+		}
 		if attempt < attempts {
 			if !sleepCtx(ctx, delay) {
-				return Result{}, ctx.Err()
+				return ctx.Err()
 			}
 		}
 	}
-	return Result{}, fmt.Errorf("git sync failed after %d attempts: %w", attempts, lastErr)
+	return fmt.Errorf("git sync failed: %w", lastErr)
+}
+
+var permanentFetchErrors = []string{
+	"not a git repository",
+	"does not appear to be a git repository",
+	"couldn't find remote ref",
+	"repository not found",
+	"invalid refspec",
+}
+
+func permanent(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, s := range permanentFetchErrors {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
