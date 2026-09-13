@@ -78,8 +78,9 @@ type Deps struct {
 }
 
 const (
-	SkipInFlight = "reconcile already running in this process"
-	SkipLocked   = "another composelock process holds the state lock"
+	SkipInFlight           = "reconcile already running in this process"
+	SkipLocked             = "another composelock process holds the state lock"
+	SkipPreflightUnhealthy = "pre-flight gate would block this commit: the live stack is unhealthy"
 )
 
 var processSingleFlight sync.Mutex
@@ -241,9 +242,7 @@ func filterChanged(repoPath string, stacks, previous []compose.Stack, changedFil
 	var changed []compose.Stack
 	for _, s := range stacks {
 		if s.Dir == "" {
-			if stackFilesChanged(repoPath, s.Files, changedFiles) {
-				changed = append(changed, s)
-			}
+			changed = append(changed, s)
 			continue
 		}
 		if _, ok := touched[resolveUnderRepo(repoPath, s.Dir)]; ok {
@@ -414,8 +413,8 @@ func promoteHealthy(deps Deps, st *state.State, commit string, stacks []string) 
 	next.PendingAttempts = 0
 	next.PendingStacks = nil
 	next.PendingRevert = false
-	next.LastFailedCommit = ""
-	next.LastFailedAt = time.Time{}
+	next.PreflightBlocks = 0
+	next.ForgetAllFailed()
 	next.LastAttemptCommit = commit
 	next.LastAttemptAt = now
 	next.LastResult = state.ResultSuccess

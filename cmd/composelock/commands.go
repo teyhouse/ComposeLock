@@ -113,6 +113,23 @@ func cmdInit(f *cliFlags) int {
 func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps reconcile.Deps) int {
 	fmt.Println("config:", configPath)
 
+	if deps.Lock != nil {
+		held, err := deps.Lock.TryLock()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "acquiring state lock:", err)
+			return 2
+		}
+		if held {
+			defer func() {
+				if err := deps.Lock.Unlock(); err != nil {
+					deps.Log.Error("releasing state lock", "err", err)
+				}
+			}()
+		} else {
+			fmt.Println("note: a reconcile is in progress, state and containers may not agree")
+		}
+	}
+
 	st, err := deps.State.Load()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "reading state:", err)

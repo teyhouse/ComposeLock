@@ -125,8 +125,7 @@ func revertInterrupted(ctx context.Context, deps Deps, st *state.State, failedCo
 		next.PendingSince = now
 	}
 	if failedCommit != preflightRecovery {
-		next.LastFailedCommit = failedCommit
-		next.LastFailedAt = now
+		next.MarkFailed(failedCommit, now)
 		next.LastAttemptCommit = failedCommit
 	}
 	next.LastAttemptAt = now
@@ -175,8 +174,7 @@ func degrade(deps Deps, st *state.State, failedCommit, target string, stacks []s
 	next.LastResult = state.ResultDegraded
 	next.LastAttemptAt = now
 	if failedCommit != preflightRecovery {
-		next.LastFailedCommit = failedCommit
-		next.LastFailedAt = now
+		next.MarkFailed(failedCommit, now)
 		next.LastAttemptCommit = failedCommit
 	}
 	saveErr := deps.State.Save(&next)

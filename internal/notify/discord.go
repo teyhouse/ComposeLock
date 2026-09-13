@@ -235,12 +235,12 @@ func (n *Notifier) SendThrottled(ctx context.Context, key string, embed Embed) {
 	}
 	if key == "" {
 		n.reset()
-	} else if !n.allow(key) {
+	} else if !n.claim(key) {
 		n.log.Info("discord notify: suppressing repeated notification", "key", key, "repeat_interval", RepeatInterval.String())
 		return
 	}
-	if n.send(ctx, embed) && key != "" {
-		n.markSent(key)
+	if !n.send(ctx, embed) && key != "" {
+		n.release(key)
 	}
 }
 
@@ -250,7 +250,7 @@ func (n *Notifier) reset() {
 	clear(n.sent)
 }
 
-func (n *Notifier) allow(key string) bool {
+func (n *Notifier) claim(key string) bool {
 	now := time.Now()
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -259,14 +259,17 @@ func (n *Notifier) allow(key string) bool {
 			delete(n.sent, k)
 		}
 	}
-	_, blocked := n.sent[key]
-	return !blocked
+	if _, blocked := n.sent[key]; blocked {
+		return false
+	}
+	n.sent[key] = now
+	return true
 }
 
-func (n *Notifier) markSent(key string) {
+func (n *Notifier) release(key string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.sent[key] = time.Now()
+	delete(n.sent, key)
 }
 
 func (n *Notifier) Send(ctx context.Context, embed Embed) {

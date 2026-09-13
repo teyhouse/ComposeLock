@@ -2,8 +2,10 @@ package state
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -170,5 +172,69 @@ func TestLoadUpgradesAnOlderSchemaVersion(t *testing.T) {
 	}
 	if st.ExpectedCheckout() != "aaa111" {
 		t.Errorf("ExpectedCheckout() = %q, want it to fall back to last_healthy_commit", st.ExpectedCheckout())
+	}
+}
+
+func TestFailedCommitSetRemembersMoreThanTheLastOne(t *testing.T) {
+	st := New()
+	now := time.Now()
+
+	st.MarkFailed("aaa111", now)
+	st.MarkFailed("bbb222", now)
+
+	if !st.IsKnownBad("aaa111") || !st.IsKnownBad("bbb222") {
+		t.Errorf("both commits should be known bad, state = %+v", st)
+	}
+	if st.LastFailedCommit != "bbb222" {
+		t.Errorf("LastFailedCommit = %q, want the most recent failure", st.LastFailedCommit)
+	}
+	if st.IsKnownBad("ccc333") || st.IsKnownBad("") {
+		t.Error("unrelated and empty commits must not be known bad")
+	}
+
+	st.ForgetFailed("aaa111")
+	if st.IsKnownBad("aaa111") {
+		t.Error("aaa111 should be forgotten")
+	}
+	if !st.IsKnownBad("bbb222") {
+		t.Error("forgetting one commit must not forget the others")
+	}
+
+	st.ForgetAllFailed()
+	if st.IsKnownBad("bbb222") || len(st.FailedCommits) != 0 || st.LastFailedCommit != "" {
+		t.Errorf("ForgetAllFailed left %+v", st)
+	}
+}
+
+func TestFailedCommitSetIsBoundedAndDeduplicated(t *testing.T) {
+	st := New()
+	now := time.Now()
+
+	for i := range maxFailedCommits + 5 {
+		st.MarkFailed(fmt.Sprintf("%06x", i), now)
+	}
+	if len(st.FailedCommits) != maxFailedCommits {
+		t.Errorf("FailedCommits holds %d entries, want the set bounded at %d", len(st.FailedCommits), maxFailedCommits)
+	}
+	if st.IsKnownBad("000000") {
+		t.Error("the oldest failure should have been evicted")
+	}
+
+	st.MarkFailed("abcdef", now)
+	st.MarkFailed("abcdef", now)
+	if got := slices.Compact(slices.Clone(st.FailedCommits)); len(got) != len(st.FailedCommits) {
+		t.Errorf("FailedCommits = %q, want no duplicates", st.FailedCommits)
+	}
+}
+
+func TestMarkFailedDoesNotAliasTheCallersSlice(t *testing.T) {
+	st := New()
+	st.MarkFailed("aaa111", time.Now())
+
+	next := *st
+	next.MarkFailed("bbb222", time.Now())
+
+	if len(st.FailedCommits) != 1 || st.FailedCommits[0] != "aaa111" {
+		t.Errorf("original state was mutated through a copy: %q", st.FailedCommits)
 	}
 }

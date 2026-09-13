@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 )
 
 const schemaVersion = 2
+
+const maxFailedCommits = 16
 
 type Result string
 
@@ -34,6 +37,9 @@ type State struct {
 
 	LastFailedCommit string    `json:"last_failed_commit"`
 	LastFailedAt     time.Time `json:"last_failed_at,omitzero"`
+	FailedCommits    []string  `json:"failed_commits,omitzero"`
+
+	PreflightBlocks int `json:"preflight_blocks,omitzero"`
 
 	LastResult Result `json:"last_result"`
 
@@ -131,6 +137,47 @@ func (s *State) Pending() bool {
 
 func (s *State) RevertInProgress() bool {
 	return s.PendingRevert || (s.PendingCommit != "" && s.PendingCommit == s.LastFailedCommit)
+}
+
+func (s *State) IsKnownBad(commit string) bool {
+	if commit == "" {
+		return false
+	}
+	return commit == s.LastFailedCommit || slices.Contains(s.FailedCommits, commit)
+}
+
+func (s *State) MarkFailed(commit string, at time.Time) {
+	s.LastFailedCommit = commit
+	s.LastFailedAt = at
+	if commit == "" {
+		return
+	}
+	kept := slices.DeleteFunc(slices.Clone(s.FailedCommits), func(c string) bool { return c == commit })
+	kept = append(kept, commit)
+	if len(kept) > maxFailedCommits {
+		kept = kept[len(kept)-maxFailedCommits:]
+	}
+	s.FailedCommits = kept
+}
+
+func (s *State) ForgetFailed(commit string) {
+	if s.LastFailedCommit == commit {
+		s.LastFailedCommit = ""
+		s.LastFailedAt = time.Time{}
+	}
+	if !slices.Contains(s.FailedCommits, commit) {
+		return
+	}
+	s.FailedCommits = slices.DeleteFunc(slices.Clone(s.FailedCommits), func(c string) bool { return c == commit })
+	if len(s.FailedCommits) == 0 {
+		s.FailedCommits = nil
+	}
+}
+
+func (s *State) ForgetAllFailed() {
+	s.LastFailedCommit = ""
+	s.LastFailedAt = time.Time{}
+	s.FailedCommits = nil
 }
 
 func (s *State) ExpectedCheckout() string {

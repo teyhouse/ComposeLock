@@ -431,8 +431,30 @@ func TestWatchContainerStuckInCreatedFailsAtTheStreakLimit(t *testing.T) {
 	}
 }
 
-func TestWatchZeroIterationsEvaluatesTheBaseline(t *testing.T) {
+func TestWatchAlwaysPollsOnceEvenIfTheWindowAlreadyElapsed(t *testing.T) {
 	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRunning, Health: HealthStarting}}},
+		{Containers: []ContainerStatus{healthy("c1", "web")}},
+	}}
+	opts := baseOpts()
+	opts.WatchDuration = time.Nanosecond
+	opts.PollInterval = time.Second
+
+	res, err := Watch(t.Context(), snap, &stalledClock{step: time.Second}, opts, testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Healthy {
+		t.Errorf("Outcome = %v (%s), want healthy: judging the post-Up baseline, where a container is still starting, is a false failure", res.Outcome, res.Reason)
+	}
+	if snap.call != 2 {
+		t.Errorf("snapshot calls = %d, want the baseline plus one real poll", snap.call)
+	}
+}
+
+func TestWatchStillFailsOnTheOnlyPollOfAnElapsedWindow(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
 		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateExited, ExitCode: 1}}},
 	}}
 	opts := baseOpts()
@@ -444,10 +466,7 @@ func TestWatchZeroIterationsEvaluatesTheBaseline(t *testing.T) {
 		t.Fatalf("Watch: %v", err)
 	}
 	if res.Outcome != Unhealthy {
-		t.Errorf("Outcome = %v, want unhealthy: a window with no polls must judge the baseline, not an empty snapshot", res.Outcome)
-	}
-	if snap.call != 1 {
-		t.Errorf("snapshot calls = %d, want only the baseline", snap.call)
+		t.Errorf("Outcome = %v, want unhealthy", res.Outcome)
 	}
 }
 

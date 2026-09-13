@@ -90,7 +90,9 @@ The first `sync` deploys the current checkout even though `HEAD` already matches
 
 Bare `composelock` with no command is equivalent to `sync`. `--version` is also accepted as a flag and does the same as the `version` command. Flags may be written before or after the command, so `composelock init --force` and `composelock --force init` are equivalent. `poll` and `webhook` reject `--dry-run` and `--force`: they always reconcile for real.
 
-`check` writes nothing to the state file and never touches Compose, but it does run `git fetch`, which updates `refs/remotes/<remote>/<branch>` in the repository. It takes the state lock in shared mode so it cannot read a half-moved `HEAD` while a `sync` is checking out.
+`check` writes nothing to the state file and never touches Compose, but it does run `git fetch`, which updates `refs/remotes/<remote>/<branch>` in the repository. It exits 1 when the pre-flight gate would block the commit, so a green `check` in CI means "would deploy", not merely "parsed".
+
+`check` and `status` take the state lock in shared mode so neither can read a half-moved `HEAD` while a `sync` is checking out. `status` prints a note and reports anyway if a reconcile is holding the lock, rather than failing.
 
 ### Exit codes
 
@@ -105,9 +107,17 @@ Once a run exits with code 3, every following run refuses to touch the stack unt
 
 ## How it works
 
+### What counts as a change
+
+A commit only triggers a deploy when it touches something the deployment actually depends on. In `compose_file` mode that is the compose file itself plus the inputs resolved from the loaded project: every `env_file` target, the implicit `.env` next to the compose file, each service's build context and Dockerfile, and any `config`/`secret` sourced from a file. A change to a tracked `.env` or a Dockerfile therefore redeploys, while a docs-only commit does not. If the project cannot be loaded to work this out, the commit is treated as relevant and applied, so the failure surfaces loudly instead of being skipped. In `compose_dir` mode the rule is broader and cheaper, see [Multiple compose files](#multiple-compose-files-compose_dir).
+
+A commit that changes nothing relevant still moves the checkout forward, so `HEAD` never falls permanently behind the branch, but it is recorded in `last_checkout_commit` rather than `last_healthy_commit`: the rollback target is only ever a commit that was applied and passed a health watch.
+
 ### The pre-flight gate
 
-Before anything is applied, ComposeLock snapshots the currently deployed stack. If it is not healthy, the new commit is not applied at all, because deploying on top of a broken stack makes the failure impossible to attribute. A commit that already failed its health watch once is skipped the same way, so a bad commit fails once rather than on every poll tick, until a new commit lands or you pass `--force`.
+Before anything is applied, ComposeLock snapshots the currently deployed stack. If it is not healthy, the new commit is not applied at all, because deploying on top of a broken stack makes the failure impossible to attribute. Instead the last healthy commit is re-applied and watched, and if the gate blocks three runs in a row the deployment goes DEGRADED rather than repeating a full watch window every tick forever.
+
+A commit that already failed is skipped the same way, so a bad commit fails once rather than on every poll tick, until a new commit lands or you pass `--force`. The last several failed commits are remembered, not just the most recent one, so two bad commits in a row do not take turns being retried.
 
 The Git checkout only moves once the pre-flight snapshot has passed, so a gate failure (Docker unreachable, discovery failing at the current checkout) leaves the worktree untouched and is retried on the next run. Checks that can only run against the new tree, discovering its stacks, loading each project, and verifying every `env_file` exists, run right after the checkout and before Compose is touched. If one of them fails, the worktree is restored to the previous commit and the commit is recorded as known-bad, so it fails once rather than on every poll tick. Push a new commit or run `composelock sync --force` to retry it, which is what you want after fixing an `env_file` that lives on the host rather than in the repository.
 
@@ -115,7 +125,7 @@ The Git checkout only moves once the pre-flight snapshot has passed, so a gate f
 
 ### The health watch
 
-After `compose up`, the stack is watched for `health_watch_seconds` (default 300), polling every `health_poll_interval_seconds` (default 5). A deploy fails if a container exits non-zero, restarts more than `health_restart_tolerance` times, reports an unhealthy Docker healthcheck for `health_unhealthy_streak` consecutive polls, loses a replica, or is still `starting` when the window closes. A container that lands in `dead` or `removing` fails the watch on the poll that sees it, and one wedged in `created` or `paused` fails after `health_unhealthy_streak` polls, rather than each of them burning the whole window before the rollback starts.
+After `compose up`, the stack is watched for `health_watch_seconds` (default 300), polling every `health_poll_interval_seconds` (default 5). At least one poll always happens after the baseline, so the verdict is never the snapshot taken the instant `Up` returned, where a container legitimately still reads as `starting`. `health_poll_interval_seconds` may not exceed `health_watch_seconds`. A deploy fails if a container exits non-zero, restarts more than `health_restart_tolerance` times, reports an unhealthy Docker healthcheck for `health_unhealthy_streak` consecutive polls, loses a replica, or is still `starting` when the window closes. A container that lands in `dead` or `removing` fails the watch on the poll that sees it, and one wedged in `created` or `paused` fails after `health_unhealthy_streak` polls, rather than each of them burning the whole window before the rollback starts.
 
 `health_restart_tolerance` is counted per container, against that container's own restart count when the watch started, so one crash-looping replica of a service cannot hide behind a sibling that happens to have restarted more often in the past. Replica counts are held to their baseline too: a service that loses one of its two containers fails the watch even though the service itself is still present, while scaling up mid-window is not a failure.
 
@@ -200,7 +210,7 @@ Which files are picked up:
 
 Before anything is touched, the pre-flight gate snapshots every stack that is currently deployed, not just `project_name`, so a broken sub-stack stops a new commit from being applied on top of it.
 
-Only the stack(s) whose files actually changed in a commit are applied and health-watched. Any changed file under a stack's directory counts, at any depth and including dot files, because `env_file` targets, Dockerfiles, build contexts and `include:` fragments all change what the stack deploys even though none of them is a compose file. A file is attributed to the most deeply nested stack directory that contains it, so a change under `db/` never re-ups the root stack as well, and files under a subdirectory that the commit deleted belong to that removed stack rather than to its parent. A commit that touches nothing under `compose_dir` still moves the checkout forward, so `HEAD` never falls permanently behind the branch, but it does not become the rollback target: `last_healthy_commit` only ever advances to a commit that was applied and passed a health watch, and `last_checkout_commit` records where `HEAD` was left. The changed stacks are health-watched concurrently, so a cycle costs about one watch window no matter how many stacks changed, and the first stack to fail stops the others rather than delaying the rollback until their windows expire.
+In `compose_dir` mode, only the stack(s) whose files actually changed in a commit are applied and health-watched. Any changed file under a stack's directory counts, at any depth and including dot files, because `env_file` targets, Dockerfiles, build contexts and `include:` fragments all change what the stack deploys even though none of them is a compose file. A file is attributed to the most deeply nested stack directory that contains it, so a change under `db/` never re-ups the root stack as well, and files under a subdirectory that the commit deleted belong to that removed stack rather than to its parent. A commit that touches nothing under `compose_dir` still moves the checkout forward, so `HEAD` never falls permanently behind the branch, but it does not become the rollback target: `last_healthy_commit` only ever advances to a commit that was applied and passed a health watch, and `last_checkout_commit` records where `HEAD` was left. The changed stacks are health-watched concurrently, so a cycle costs about one watch window no matter how many stacks changed, and the first stack to fail stops the others rather than delaying the rollback until their windows expire.
 
 If a stack's health watch fails, only the stack(s) touched in that cycle revert; a stack untouched this cycle is never affected by another stack's failure. The revert re-applies each stack from the rollback target's own file list, and a stack that only exists in the failing commit is torn down, so the deployment ends up as the rollback target describes it.
 

@@ -340,3 +340,217 @@ func TestReconcileFreshInstallAppliesEvenWhenTheCommitLooksIrrelevant(t *testing
 		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
 	}
 }
+
+type toggleSnapshotter struct {
+	mu        sync.Mutex
+	unhealthy bool
+}
+
+func (s *toggleSnapshotter) set(unhealthy bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unhealthy = unhealthy
+}
+
+func (s *toggleSnapshotter) Snapshot(context.Context, string) (health.Snapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.unhealthy {
+		return unhealthySnapshot(), nil
+	}
+	return healthySnapshot(), nil
+}
+
+func singleFileProject(dir string) *ctypes.Project {
+	return &ctypes.Project{
+		Name:         "test-stack",
+		WorkingDir:   dir,
+		ComposeFiles: []string{filepath.Join(dir, "docker-compose.yml")},
+		Services: ctypes.Services{
+			"web": ctypes.ServiceConfig{
+				Name:     "web",
+				EnvFiles: []ctypes.EnvFile{{Path: "app.env", Required: true}},
+				Build:    &ctypes.BuildConfig{Context: "app", Dockerfile: "Dockerfile"},
+			},
+		},
+	}
+}
+
+func singleFileDeps(t *testing.T, g *fakeGit, compose *fakeCompose, snap health.Snapshotter, st *state.State, dir string) (Deps, *state.MemStore) {
+	t.Helper()
+	deps, store := testDeps(t, g, compose, snap, st)
+	deps.Config.RepoPath = dir
+	deps.Config.ComposeFile = filepath.Join(dir, "docker-compose.yml")
+	deps.Git.RepoPath = dir
+	return deps, store
+}
+
+func TestReconcileSingleFileEnvFileChangeIsApplied(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "app.env"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	compose := &fakeCompose{project: singleFileProject(dir)}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "app.env"
+	deps, store := singleFileDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected an env_file change to be applied in single-file mode, result = %+v", result)
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}
+
+func TestReconcileSingleFileBuildContextChangeIsApplied(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "app.env"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	compose := &fakeCompose{project: singleFileProject(dir)}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "app/src/main.go"
+	deps, _ := singleFileDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
+
+	if result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps); !result.Applied {
+		t.Fatalf("expected a build context change to be applied, result = %+v", result)
+	}
+}
+
+func TestReconcileSingleFileUnrelatedChangeStillSkips(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "app.env"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	compose := &fakeCompose{project: singleFileProject(dir)}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "docs/README.md"
+	deps, store := singleFileDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Skipped || compose.upCalls != 0 {
+		t.Fatalf("expected a docs-only commit to skip, result = %+v, upCalls = %d", result, compose.upCalls)
+	}
+	if store.State.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want the rollback target unchanged", store.State.LastHealthyCommit)
+	}
+	if store.State.LastCheckoutCommit != "bbb222" {
+		t.Errorf("LastCheckoutCommit = %q, want %q", store.State.LastCheckoutCommit, "bbb222")
+	}
+}
+
+func TestReconcilePreflightBlockEscalatesToDegraded(t *testing.T) {
+	snap := &toggleSnapshotter{unhealthy: true}
+	g := gitChange("aaa111", "bbb222")
+	g.onCheckout = func(commit string) {
+		if commit == "aaa111" {
+			snap.set(false)
+		}
+	}
+	compose := &fakeCompose{}
+	deps, store := testDeps(t, g, compose, snap, withHealthy("aaa111"))
+
+	for block := 1; block <= maxPreflightBlocks; block++ {
+		snap.set(true)
+		result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+		if result.Degraded {
+			t.Fatalf("block %d: went DEGRADED before the limit was reached", block)
+		}
+		if !result.Reverted {
+			t.Fatalf("block %d: expected the pre-flight revert to run, result = %+v", block, result)
+		}
+		if store.State.PreflightBlocks != block {
+			t.Fatalf("block %d: PreflightBlocks = %d, want %d", block, store.State.PreflightBlocks, block)
+		}
+	}
+
+	snap.set(true)
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Degraded {
+		t.Fatalf("expected DEGRADED after %d blocked runs, result = %+v", maxPreflightBlocks, result)
+	}
+	if store.State.LastResult != state.ResultDegraded {
+		t.Errorf("LastResult = %q, want %q", store.State.LastResult, state.ResultDegraded)
+	}
+}
+
+func TestReconcilePreflightBlockCounterResetsOnASuccessfulDeploy(t *testing.T) {
+	snap := &toggleSnapshotter{unhealthy: true}
+	g := gitChange("aaa111", "bbb222")
+	g.onCheckout = func(commit string) {
+		if commit == "aaa111" {
+			snap.set(false)
+		}
+	}
+	deps, store := testDeps(t, g, &fakeCompose{}, snap, withHealthy("aaa111"))
+
+	if result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); !result.Reverted {
+		t.Fatalf("expected a pre-flight revert, result = %+v", result)
+	}
+	if store.State.PreflightBlocks != 1 {
+		t.Fatalf("PreflightBlocks = %d, want 1", store.State.PreflightBlocks)
+	}
+
+	if result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); !result.Applied {
+		t.Fatalf("expected the healthy retry to deploy, result = %+v", result)
+	}
+	if store.State.PreflightBlocks != 0 {
+		t.Errorf("PreflightBlocks = %d, want 0 after a successful deploy", store.State.PreflightBlocks)
+	}
+}
+
+func TestReconcileRemembersMoreThanOneBadCommit(t *testing.T) {
+	compose := &fakeCompose{loadErr: errors.New("yaml: mapping values are not allowed")}
+	g := gitChange("aaa111", "bbb222")
+	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
+
+	if first := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); first.Err == nil {
+		t.Fatal("expected bbb222 to fail")
+	}
+
+	g.remote = "ddd444"
+	if second := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); second.Err == nil {
+		t.Fatal("expected ddd444 to fail")
+	}
+	if store.State.LastFailedCommit != "ddd444" {
+		t.Fatalf("LastFailedCommit = %q, want %q", store.State.LastFailedCommit, "ddd444")
+	}
+
+	g.remote = "bbb222"
+	third := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !third.Skipped {
+		t.Errorf("expected bbb222 to still be known-bad after ddd444 failed, result = %+v", third)
+	}
+	if store.State.LastResult != state.ResultSkippedKnownBad {
+		t.Errorf("LastResult = %q, want %q", store.State.LastResult, state.ResultSkippedKnownBad)
+	}
+	if len(compose.loadCalls) != 2 {
+		t.Errorf("LoadProject called %d times, want 2: the third run must not re-apply a known-bad commit", len(compose.loadCalls))
+	}
+}
+
+func TestReconcileDryRunReportsAPreflightBlock(t *testing.T) {
+	compose := &fakeCompose{}
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(unhealthySnapshot()), withHealthy("aaa111"))
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli", DryRun: true}, deps)
+
+	if result.Err == nil {
+		t.Fatal("expected check to report that the pre-flight gate would block the commit")
+	}
+	if result.SkipReason != SkipPreflightUnhealthy {
+		t.Errorf("SkipReason = %q, want %q", result.SkipReason, SkipPreflightUnhealthy)
+	}
+	if compose.upCalls != 0 || len(compose.downCalls) != 0 {
+		t.Errorf("a dry run must not touch Compose, upCalls = %d, downCalls = %v", compose.upCalls, compose.downCalls)
+	}
+	if store.State.PreflightBlocks != 0 || store.State.LastResult == state.ResultDegraded {
+		t.Errorf("a dry run must not write state, got %+v", store.State)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -216,5 +217,29 @@ func TestSendDrainsResponseBody(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "request failed") {
 		t.Errorf("unexpected request failure: %s", buf.String())
+	}
+}
+
+func TestSendThrottledPostsOnceUnderConcurrentTriggers(t *testing.T) {
+	var posts atomic.Int64
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	n := New(srv.URL, slog.New(slog.DiscardHandler))
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() { n.SendThrottled(t.Context(), "git-sync", Embed{Title: "a"}) })
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := posts.Load(); got != 1 {
+		t.Errorf("posted %d times, want 1: concurrent triggers with the same key must not both pass the throttle", got)
 	}
 }

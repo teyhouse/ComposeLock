@@ -290,6 +290,9 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	if c.HealthUnhealthyStreak < 1 {
 		return fmt.Errorf("config: health_unhealthy_streak must be >= 1")
 	}
+	if c.HealthWatchSeconds > 0 && c.HealthPollIntervalSeconds > c.HealthWatchSeconds {
+		return fmt.Errorf("config: health_poll_interval_seconds (%d) must not exceed health_watch_seconds (%d), or the watch would judge a single poll", c.HealthPollIntervalSeconds, c.HealthWatchSeconds)
+	}
 	if c.PollIntervalSeconds < 0 {
 		return fmt.Errorf("config: poll_interval_seconds must be >= 0")
 	}

@@ -11,7 +11,6 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 
 	"github.com/teyhouse/ComposeLock/internal/compose"
-	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/git"
 	"github.com/teyhouse/ComposeLock/internal/health"
 	"github.com/teyhouse/ComposeLock/internal/notify"
@@ -19,6 +18,8 @@ import (
 )
 
 const restoreCheckoutTimeout = 30 * time.Second
+
+const maxPreflightBlocks = 3
 
 func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, start time.Time) Result {
 	cfg := deps.Config
@@ -55,7 +56,7 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 			"head", gitResult.OldCommit, "expected", st.ExpectedCheckout(), "last_healthy_commit", st.LastHealthyCommit)
 		result.Changed = true
 		result.ChangedFiles = nil
-	} else if !relevantChange(cfg, gitResult.ChangedFiles) && st.LastHealthyCommit != "" {
+	} else if st.LastHealthyCommit != "" && !relevantChange(ctx, deps, gitResult.ChangedFiles) {
 		deps.Log.Info("compose file(s) unchanged, advancing checkout without applying",
 			"commit", gitResult.NewCommit, "changed_files", gitResult.ChangedFiles)
 		result.Skipped = true
@@ -66,7 +67,7 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 	// never moves origin/<branch>, so without this guard the next
 	// Reconcile would see local != remote again and re-apply the same bad
 	// commit forever.
-	if gitResult.NewCommit == st.LastFailedCommit && !opts.Force {
+	if st.IsKnownBad(gitResult.NewCommit) && !opts.Force {
 		deps.Log.Info("skipping known-bad commit", "commit", gitResult.NewCommit)
 		recordOutcome(deps, st, state.ResultSkippedKnownBad, gitResult.NewCommit)
 		result.Skipped = true
@@ -115,20 +116,52 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 
 	if opts.DryRun {
 		deps.Log.Info("dry run: would apply", "old_commit", gitResult.OldCommit, "new_commit", gitResult.NewCommit, "live_healthy", live.healthy, "gate_reason", live.reason)
+		if !live.healthy {
+			result.Skipped = true
+			result.SkipReason = SkipPreflightUnhealthy
+			result.Err = fmt.Errorf("pre-flight gate would block this commit: %s", live.reason)
+		}
 		return result
 	}
 
 	if !live.healthy {
-		deps.Log.Warn("pre-flight gate: live stack unhealthy, not applying", "reason", live.reason)
-		revertResult := doRevert(ctx, deps, st, previousStacks, preflightRecovery, "pre-flight: live stack unhealthy: "+live.reason, start)
-		revertResult.Changed = result.Changed
-		revertResult.OldCommit = result.OldCommit
-		revertResult.NewCommit = result.NewCommit
-		revertResult.ChangedFiles = result.ChangedFiles
-		return revertResult
+		return preflightBlocked(ctx, opts, deps, st, result, previousStacks, live.reason, start)
 	}
 
 	return applyAndWatch(ctx, deps, st, result, deployedStacks(st, previousStacks), nil, live.snapshots, start)
+}
+
+func preflightBlocked(ctx context.Context, opts Options, deps Deps, st *state.State, result Result, previousStacks []compose.Stack, reason string, start time.Time) Result {
+	deps.Log.Warn("pre-flight gate: live stack unhealthy, not applying", "reason", reason)
+	if opts.Force {
+		st.PreflightBlocks = 0
+	}
+	if st.PreflightBlocks >= maxPreflightBlocks {
+		deps.Log.Error("pre-flight gate: blocked repeatedly, DEGRADED", "reason", reason, "blocks", st.PreflightBlocks)
+		degraded := degrade(deps, st, preflightRecovery, st.LastHealthyCommit, stackNames(previousStacks),
+			fmt.Errorf("pre-flight gate blocked %d consecutive runs (%s): manual intervention required", st.PreflightBlocks, reason),
+			start)
+		degraded.Changed = result.Changed
+		degraded.OldCommit = result.OldCommit
+		degraded.NewCommit = result.NewCommit
+		degraded.ChangedFiles = result.ChangedFiles
+		return degraded
+	}
+
+	next := *st
+	next.PreflightBlocks++
+	if err := deps.State.Save(&next); err != nil {
+		deps.Log.Error("saving pre-flight block counter", "err", err)
+	} else {
+		*st = next
+	}
+
+	revertResult := doRevert(ctx, deps, st, previousStacks, preflightRecovery, "pre-flight: live stack unhealthy: "+reason, start)
+	revertResult.Changed = result.Changed
+	revertResult.OldCommit = result.OldCommit
+	revertResult.NewCommit = result.NewCommit
+	revertResult.ChangedFiles = result.ChangedFiles
+	return revertResult
 }
 
 func checkoutDrifted(st *state.State, head string) bool {
@@ -223,10 +256,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	next.LastCheckoutCommit = commit
 	next.LastAttemptCommit = commit
 	next.LastAttemptAt = now
-	if next.LastFailedCommit == commit {
-		next.LastFailedCommit = ""
-		next.LastFailedAt = time.Time{}
-	}
+	next.ForgetFailed(commit)
 	if err := deps.State.Save(&next); err != nil {
 		return abortBeforeUp(ctx, deps, st, result, "saving state failed", fmt.Errorf("saving state: %w", err))
 	}
@@ -290,8 +320,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 }
 
 func failAndRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.Stack, result Result, reason string, start time.Time) Result {
-	st.LastFailedCommit = result.NewCommit
-	st.LastFailedAt = deps.Clock.Now()
+	st.MarkFailed(result.NewCommit, deps.Clock.Now())
 	st.LastResult = state.ResultFailedApply
 	if err := deps.State.Save(st); err != nil {
 		deps.Log.Error("saving state before revert", "err", err)
@@ -309,8 +338,7 @@ func failAndRevert(ctx context.Context, deps Deps, st *state.State, stacks []com
 }
 
 func abortBadCommit(ctx context.Context, deps Deps, st *state.State, result Result, title string, err error) Result {
-	st.LastFailedCommit = result.NewCommit
-	st.LastFailedAt = deps.Clock.Now()
+	st.MarkFailed(result.NewCommit, deps.Clock.Now())
 	return abortBeforeUp(ctx, deps, st, result, title, err)
 }
 
@@ -347,11 +375,39 @@ func restoreCheckout(ctx context.Context, deps Deps, commit string) error {
 	return nil
 }
 
-func relevantChange(cfg *config.Config, changedFiles []string) bool {
+func relevantChange(ctx context.Context, deps Deps, changedFiles []string) bool {
+	cfg := deps.Config
 	if cfg.ComposeDir != "" {
 		return composeDirRelevant(cfg.RepoPath, cfg.ComposeDir, changedFiles)
 	}
-	return composeFileChanged(cfg.RepoPath, cfg.ComposeFile, changedFiles)
+	return composeFileRelevant(ctx, deps, changedFiles)
+}
+
+func composeFileRelevant(ctx context.Context, deps Deps, changedFiles []string) bool {
+	cfg := deps.Config
+	if composeFileChanged(cfg.RepoPath, cfg.ComposeFile, changedFiles) {
+		return true
+	}
+	project, err := deps.Compose.LoadProject(ctx, []string{cfg.ComposeFile}, cfg.ProjectName)
+	if err != nil {
+		deps.Log.Warn("loading the compose project to weigh a change failed, treating the commit as relevant", "err", err)
+		return true
+	}
+	inputs := compose.ProjectPaths(project)
+	deps.Log.Debug("weighing changed files against the project's inputs", "inputs", inputs)
+	return dependencyChanged(cfg.RepoPath, inputs, changedFiles)
+}
+
+func dependencyChanged(repoPath string, inputs []string, changedFiles []string) bool {
+	for _, f := range changedFiles {
+		abs := resolveUnderRepo(repoPath, f)
+		for _, in := range inputs {
+			if abs == in || pathUnder(in, abs) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func composeFileChanged(repoPath, composeFile string, changedFiles []string) bool {

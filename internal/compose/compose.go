@@ -139,3 +139,50 @@ func CheckEnvFiles(project *types.Project) error {
 	}
 	return nil
 }
+
+func ProjectPaths(project *types.Project) []string {
+	var paths []string
+	add := func(p string) {
+		if p == "" || isRemoteRef(p) {
+			return
+		}
+		if !filepath.IsAbs(p) {
+			if project.WorkingDir == "" {
+				return
+			}
+			p = filepath.Join(project.WorkingDir, p)
+		}
+		paths = append(paths, filepath.Clean(p))
+	}
+
+	for _, f := range project.ComposeFiles {
+		add(f)
+	}
+	add(".env")
+	for _, name := range slices.Sorted(maps.Keys(project.Services)) {
+		svc := project.Services[name]
+		for _, ef := range svc.EnvFiles {
+			add(ef.Path)
+		}
+		if svc.Build != nil {
+			add(svc.Build.Context)
+			add(svc.Build.Dockerfile)
+			for _, ctx := range svc.Build.AdditionalContexts {
+				add(ctx)
+			}
+		}
+	}
+	for _, c := range project.Configs {
+		add(c.File)
+	}
+	for _, sec := range project.Secrets {
+		add(sec.File)
+	}
+
+	slices.Sort(paths)
+	return slices.Compact(paths)
+}
+
+func isRemoteRef(p string) bool {
+	return strings.Contains(p, "://") || strings.HasPrefix(p, "git@")
+}

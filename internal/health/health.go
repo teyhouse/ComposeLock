@@ -138,7 +138,7 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 	unhealthyStreak, wedgedStreak := 0, 0
 	last := baseline
 
-	for clock.Now().Before(deadline) {
+	for first := true; first || clock.Now().Before(deadline); first = false {
 		if !clock.Sleep(ctx, opts.PollInterval) {
 			return Result{}, ctx.Err()
 		}

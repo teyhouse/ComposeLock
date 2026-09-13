@@ -123,3 +123,23 @@ func TestValidateRequiresAWebhookSecretOffLoopback(t *testing.T) {
 		t.Errorf("Validate() = %v, want a secret-protected public webhook to be accepted", err)
 	}
 }
+
+func TestValidateRejectsAPollIntervalLongerThanTheWatchWindow(t *testing.T) {
+	cfg := Default()
+	cfg.HealthWatchSeconds = 30
+	cfg.HealthPollIntervalSeconds = 60
+	if err := cfg.Validate(slog.New(slog.DiscardHandler)); err == nil {
+		t.Error("Validate() = nil, want a poll interval longer than the watch window to be refused")
+	}
+
+	cfg.HealthPollIntervalSeconds = 30
+	if err := cfg.Validate(slog.New(slog.DiscardHandler)); err != nil {
+		t.Errorf("Validate() = %v, want a poll interval equal to the watch window to be accepted", err)
+	}
+
+	cfg.HealthWatchSeconds = 0
+	cfg.HealthPollIntervalSeconds = 60
+	if err := cfg.Validate(slog.New(slog.DiscardHandler)); err != nil {
+		t.Errorf("Validate() = %v, want the check skipped when the watch is disabled", err)
+	}
+}
