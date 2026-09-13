@@ -67,6 +67,7 @@ func setup(f *cliFlags, writesState bool) (*config.Config, reconcile.Deps, int) 
 	}
 
 	log := newLogger(cfg.LogFormat, os.Stdout)
+	log.Info("composelock starting", "version", version, "commit", commit, "built", date)
 
 	deps, err := buildDeps(cfg, log)
 	if err != nil {
