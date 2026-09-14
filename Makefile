@@ -15,7 +15,9 @@ GOARCH ?= $(shell go env GOARCH)
 
 IMAGE ?= composelock
 
-.PHONY: build run test smoke smoke-compose-dir lint vuln fmt tidy clean install image
+FUZZTIME ?= 60s
+
+.PHONY: build run test fuzz smoke smoke-compose-dir lint vuln fmt tidy clean install image
 
 build:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
@@ -25,6 +27,10 @@ run: build
 
 test:
 	go test -race -shuffle=on ./...
+
+fuzz:
+	go test -run '^$$' -fuzz FuzzRedactCredentialURL -fuzztime $(FUZZTIME) ./internal/execx
+	go test -run '^$$' -fuzz FuzzRedactInvariants -fuzztime $(FUZZTIME) ./internal/execx
 
 smoke:
 	./scripts/smoke.sh

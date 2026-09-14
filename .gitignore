@@ -41,6 +41,7 @@ plan.md
 
 # Review notes (local only)
 bug.md
+fuzz.md
 
 # Personal registry push script (local only)
 /scripts/push.sh
