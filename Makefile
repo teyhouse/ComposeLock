@@ -16,8 +16,9 @@ GOARCH ?= $(shell go env GOARCH)
 IMAGE ?= composelock
 
 FUZZTIME ?= 60s
+SOAKRUNS ?= 50000
 
-.PHONY: build run test fuzz smoke smoke-compose-dir lint vuln fmt tidy clean install image
+.PHONY: build run test soak fuzz smoke smoke-compose-dir lint vuln fmt tidy clean install image
 
 build:
 	CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) $(PKG)
@@ -27,6 +28,9 @@ run: build
 
 test:
 	go test -race -shuffle=on ./...
+
+soak:
+	COMPOSELOCK_PROPERTY_RUNS=$(SOAKRUNS) COMPOSELOCK_PROPERTY_SEED=$$RANDOM go test -count=1 -run Invariants ./internal/reconcile
 
 fuzz:
 	go test -run '^$$' -fuzz FuzzRedactCredentialURL -fuzztime $(FUZZTIME) ./internal/execx
