@@ -275,12 +275,15 @@ func checkComposeFile(path string, log *slog.Logger) (isCompose, hasWorkloads bo
 	return true, definesWorkloads(docs[0]), nil
 }
 
+// definesWorkloads requires the key to actually hold something: a bare
+// "services:" or an empty "include: []" declares no workload, and turning it
+// into a stack only produces one that can never report anything but NO CONTAINERS.
 func definesWorkloads(model map[string]any) bool {
-	if _, ok := model["services"]; ok {
+	if services, ok := model["services"].(map[string]any); ok && len(services) > 0 {
 		return true
 	}
-	_, ok := model["include"]
-	return ok
+	include, ok := model["include"].([]any)
+	return ok && len(include) > 0
 }
 
 func unknownTopLevelKeys(model map[string]any) []string {

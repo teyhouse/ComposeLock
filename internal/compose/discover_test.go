@@ -463,3 +463,23 @@ func TestDiscoverSkipsAFragmentOnlySubdirButKeepsTheRest(t *testing.T) {
 		t.Errorf("stacks = %v, want only [myproject]", got)
 	}
 }
+
+func TestDiscoverSkipsFilesThatDeclareNoWorkloads(t *testing.T) {
+	// "services:" with a null value is a malformed file and fails validation
+	// loudly instead, which is a different contract.
+	for _, body := range []string{"services: {}\n", "include: []\n", "services: {}\ninclude: []\n"} {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		stacks, err := Discover(dir, "proj", nil)
+
+		if !errors.Is(err, ErrNoStacks) {
+			t.Errorf("body %q: err = %v, want ErrNoStacks: a stack with no workloads can only ever report NO CONTAINERS", body, err)
+		}
+		if len(stacks) != 0 {
+			t.Errorf("body %q: stacks = %d, want 0", body, len(stacks))
+		}
+	}
+}

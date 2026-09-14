@@ -22,43 +22,75 @@ func ProjectInputs(project *types.Project) (inputs []string, complete bool) {
 	for _, f := range project.ComposeFiles {
 		w.visit(f, project.WorkingDir, project.WorkingDir, 0)
 	}
-	inputs = append(w.paths, declaredPaths(project)...)
+	declared, declaredComplete := declaredPaths(project)
+	inputs = append(w.paths, declared...)
 	slices.Sort(inputs)
-	return slices.Compact(inputs), w.complete
+	return slices.Compact(inputs), w.complete && declaredComplete
 }
 
-func declaredPaths(project *types.Project) []string {
-	var paths []string
-	add := func(p string) {
-		if abs, ok := resolveInput(project.WorkingDir, p); ok {
-			paths = append(paths, abs)
+func declaredPaths(project *types.Project) (paths []string, complete bool) {
+	complete = true
+	dir := project.WorkingDir
+
+	// An empty value declares nothing, and a remote reference can never be a path
+	// in this repository. Anything else that will not resolve, such as a path
+	// built from a variable, is an input we cannot see, so the set is incomplete.
+	add := func(base, p string) {
+		if p == "" || isRemoteRef(p) {
+			return
 		}
+		abs, ok := resolveInput(base, p)
+		if !ok {
+			complete = false
+			return
+		}
+		paths = append(paths, abs)
+	}
+	// The implicit .env is inferred rather than declared, so a project with no
+	// working directory to resolve it against is not treated as a gap.
+	if abs, ok := resolveInput(dir, ".env"); ok {
+		paths = append(paths, abs)
 	}
 
-	add(".env")
 	for _, name := range slices.Sorted(maps.Keys(project.Services)) {
 		svc := project.Services[name]
 		for _, ef := range svc.EnvFiles {
-			add(ef.Path)
+			add(dir, ef.Path)
 		}
 		if svc.Extends != nil {
-			add(svc.Extends.File)
+			add(dir, svc.Extends.File)
 		}
 		if svc.Build != nil {
-			add(svc.Build.Context)
-			add(svc.Build.Dockerfile)
-			for _, ctx := range svc.Build.AdditionalContexts {
-				add(ctx)
+			add(dir, svc.Build.Context)
+			// dockerfile is relative to the build context, not to the project. A
+			// remote context holds its dockerfile remotely, so it is not a gap.
+			if !isRemoteRef(svc.Build.Context) {
+				if ctx, ok := buildContextDir(dir, svc.Build.Context); ok {
+					add(ctx, svc.Build.Dockerfile)
+				} else if svc.Build.Dockerfile != "" {
+					complete = false
+				}
+			}
+			for _, extra := range svc.Build.AdditionalContexts {
+				add(dir, extra)
 			}
 		}
 	}
 	for _, c := range project.Configs {
-		add(c.File)
+		add(dir, c.File)
 	}
 	for _, sec := range project.Secrets {
-		add(sec.File)
+		add(dir, sec.File)
 	}
-	return paths
+	return paths, complete
+}
+
+// buildContextDir reports the directory a service's dockerfile resolves against.
+func buildContextDir(workingDir, context string) (string, bool) {
+	if context == "" {
+		return workingDir, workingDir != ""
+	}
+	return resolveInput(workingDir, context)
 }
 
 type inputWalker struct {

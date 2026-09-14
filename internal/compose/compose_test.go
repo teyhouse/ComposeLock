@@ -101,7 +101,9 @@ func TestProjectInputsCollectsEveryRuntimeInput(t *testing.T) {
 			"web": types.ServiceConfig{
 				Name:     "web",
 				EnvFiles: []types.EnvFile{{Path: "web.env"}, {Path: "/etc/secrets/shared.env"}},
-				Build:    &types.BuildConfig{Context: "src", Dockerfile: "src/Dockerfile"},
+				// dockerfile is relative to the build context, which is what the
+				// loader leaves in this field after resolving context itself.
+				Build: &types.BuildConfig{Context: "src", Dockerfile: "Dockerfile"},
 			},
 			"remote": types.ServiceConfig{
 				Name:  "remote",
