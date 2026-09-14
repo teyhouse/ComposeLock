@@ -30,11 +30,12 @@ test:
 	go test -race -shuffle=on ./...
 
 soak:
-	COMPOSELOCK_PROPERTY_RUNS=$(SOAKRUNS) COMPOSELOCK_PROPERTY_SEED=$$RANDOM go test -count=1 -run 'Invariants|Properties' ./internal/reconcile ./internal/health
+	COMPOSELOCK_PROPERTY_RUNS=$(SOAKRUNS) COMPOSELOCK_PROPERTY_SEED=$$RANDOM go test -count=1 -run 'Invariants|Properties' ./internal/reconcile ./internal/health ./internal/compose
 
 fuzz:
 	go test -run '^$$' -fuzz FuzzRedactCredentialURL -fuzztime $(FUZZTIME) ./internal/execx
 	go test -run '^$$' -fuzz FuzzRedactInvariants -fuzztime $(FUZZTIME) ./internal/execx
+	go test -run '^$$' -fuzz FuzzProjectInputs -fuzztime $(FUZZTIME) ./internal/compose
 
 smoke:
 	./scripts/smoke.sh

@@ -52,10 +52,6 @@ func (r refKind) String() string {
 	return [...]string{"present", "missing", "interpolated", "remote", "malformed"}[r]
 }
 
-// resolvable reports whether the walker can turn this reference into a path it
-// is able to read. Only these may leave the input set complete.
-func (r refKind) resolvable() bool { return r == refPresent || r == refRemote }
-
 type tree struct {
 	dir      string
 	project  *types.Project
@@ -244,9 +240,12 @@ func FuzzProjectInputs(f *testing.F) {
 	f.Add("include: not-a-list\n")
 	f.Add("")
 
+	// One directory reused for every input: a fresh t.TempDir() per execution
+	// creates tens of thousands of directories and stalls the fuzzer outright.
+	dir := f.TempDir()
+	root := filepath.Join(dir, "docker-compose.yml")
+
 	f.Fuzz(func(t *testing.T, body string) {
-		dir := t.TempDir()
-		root := filepath.Join(dir, "docker-compose.yml")
 		if err := os.WriteFile(root, []byte(body), 0o600); err != nil {
 			t.Skip()
 		}
