@@ -176,7 +176,7 @@ func StacksFor(cfg *config.Config, log *slog.Logger) ([]compose.Stack, error) {
 	if cfg.ComposeDir != "" {
 		return compose.Discover(resolveUnderRepo(cfg.RepoPath, cfg.ComposeDir), cfg.ProjectName, log)
 	}
-	return []compose.Stack{{ProjectName: cfg.ProjectName, Files: []string{cfg.ComposeFile}}}, nil
+	return []compose.Stack{{ProjectName: cfg.ProjectName, Files: []string{resolveUnderRepo(cfg.RepoPath, cfg.ComposeFile)}}}, nil
 }
 
 func stacksAllowingEmpty(deps Deps) ([]compose.Stack, error) {

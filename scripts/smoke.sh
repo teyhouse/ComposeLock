@@ -24,6 +24,8 @@ CFG="$WORK/composelock.json"
 SEED="$WORK/seed"
 REPO="$WORK/repo"
 REC_STATE="$WORK/recovery-state.json"
+REL_CFG="$WORK/composelock-relative.json"
+REL_STATE="$WORK/relative-state.json"
 LOCK_STATE="$WORK/lock-state.json"
 SUCCESS=0
 
@@ -68,16 +70,17 @@ EOF
 }
 
 write_config() {
+	local out=${1:-$CFG} compose_file=${2:-$REPO/docker-compose.yml} state=${3:-$WORK/state.json}
 	(
 		umask 077
-		cat >"$CFG" <<EOF
+		cat >"$out" <<EOF
 {
   "repo_path": "$REPO",
   "remote": "origin",
   "branch": "main",
-  "compose_file": "$REPO/docker-compose.yml",
+  "compose_file": "$compose_file",
   "project_name": "$PROJECT",
-  "state_file": "$WORK/state.json",
+  "state_file": "$state",
   "retry_attempts": 1,
   "retry_delay_seconds": 1,
   "health_watch_seconds": 10,
@@ -91,11 +94,11 @@ EOF
 	)
 }
 
-run_step() {
-	local name=$1 want=$2
-	shift 2
+run_step_from() {
+	local dir=$1 cfg=$2 name=$3 want=$4
+	shift 4
 	local log="$WORK/logs/$name.log" got=0
-	"$BIN" --config "$CFG" "$@" >"$log" 2>&1 || got=$?
+	(cd "$dir" && "$BIN" --config "$cfg" "$@") >"$log" 2>&1 || got=$?
 	if [ "$got" -ne "$want" ]; then
 		echo "FAIL $name: exit $got, want $want (log: $log)" >&2
 		tail -n 5 "$log" >&2
@@ -103,6 +106,12 @@ run_step() {
 	fi
 	echo "ok   $name (exit $got)"
 	sleep 2
+}
+
+run_step() {
+	local name=$1 want=$2
+	shift 2
+	run_step_from "$PWD" "$CFG" "$name" "$want" "$@"
 }
 
 expect_log() {
@@ -155,6 +164,10 @@ write_compose '["sleep", "infinity"]'
 publish "v1: healthy stack"
 run_step 01-deploy 0 sync
 expect_log 01-deploy '"applied":true'
+
+write_config "$REL_CFG" "docker-compose.yml" "$REL_STATE"
+run_step_from "$WORK" "$REL_CFG" 01b-relative-compose-file 0 sync
+expect_log 01b-relative-compose-file '"applied":true'
 
 write_compose '["sh", "-c", "sleep 3; exit 1"]'
 publish "v2: web crashes"
@@ -252,5 +265,5 @@ fi
 SUCCESS=1
 echo "smoke test passed"
 if [ -n "$WEBHOOK" ]; then
-	echo "expect 9 Discord notifications: deployed, reverted, env_file failure, deployed, git sync failed, DEGRADED, deployed, crash-recovery failure, reverted, deployed"
+	echo "expect 11 Discord notifications: deployed, deployed, reverted, env_file failure, deployed, git sync failed, DEGRADED, deployed, crash-recovery failure, reverted, deployed"
 fi

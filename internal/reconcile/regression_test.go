@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,6 +16,7 @@ import (
 
 	ctypes "github.com/compose-spec/compose-go/v2/types"
 
+	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/health"
 	"github.com/teyhouse/ComposeLock/internal/state"
 )
@@ -756,5 +758,74 @@ func TestPreflightDegradedNotificationKeyNamesTheTarget(t *testing.T) {
 	}
 	if !strings.Contains(result.NotificationKey, "aaa111") {
 		t.Errorf("NotificationKey = %q, want the rollback target in the key", result.NotificationKey)
+	}
+}
+
+func TestReconcileResolvesARelativeComposeFileAgainstRepoPath(t *testing.T) {
+	compose := &fakeCompose{}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "docker-compose.yml"
+	deps, _ := testDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"))
+	deps.Config.RepoPath = "/repo"
+	deps.Config.ComposeFile = "docker-compose.yml"
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected the commit to be applied, result = %+v", result)
+	}
+	if len(compose.loadCalls) == 0 {
+		t.Fatal("no project was loaded")
+	}
+	want := filepath.Join("/repo", "docker-compose.yml")
+	for _, call := range compose.loadCalls {
+		if len(call.files) != 1 || call.files[0] != want {
+			t.Errorf("loaded %v, want %q: a relative compose_file must resolve against repo_path, not the process working directory", call.files, want)
+		}
+	}
+}
+
+func TestStacksForResolvesARelativeComposeFileAgainstRepoPath(t *testing.T) {
+	cfg := &config.Config{RepoPath: "/repo", ComposeFile: "docker-compose.yml", ProjectName: "test-stack"}
+
+	stacks, err := StacksFor(cfg, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("StacksFor: %v", err)
+	}
+	want := filepath.Join("/repo", "docker-compose.yml")
+	if len(stacks) != 1 || len(stacks[0].Files) != 1 || stacks[0].Files[0] != want {
+		t.Errorf("StacksFor() = %+v, want the single stack to carry %q", stacks, want)
+	}
+}
+
+func TestRecoveryBudgetMeasuresFromWhenTheCommitWentPending(t *testing.T) {
+	origin := time.Date(2026, 9, 14, 9, 0, 0, 0, time.UTC)
+	st := withHealthy("aaa111")
+	st.PendingCommit = "bbb222"
+	st.PendingStacks = []string{"test-stack"}
+	st.PendingAttempts = 1
+	st.PendingSince = origin
+
+	compose := &fakeCompose{upErrs: []error{
+		fmt.Errorf("compose up: %w", syscall.ECONNREFUSED),
+		fmt.Errorf("compose up: %w", syscall.ECONNREFUSED),
+	}}
+	deps, store := testDeps(t, gitNoChange("bbb222"), compose, snapshots(healthySnapshot()), st)
+	clock := deps.Clock.(*fakeClock)
+	budget, _ := recoveryExpired(deps, store.State)
+
+	clock.now = origin.Add(budget / 2)
+	Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !store.State.PendingSince.Equal(origin) {
+		t.Fatalf("PendingSince = %s, want it to stay at %s: a retry of the same commit must not restart the recovery budget",
+			store.State.PendingSince, origin)
+	}
+
+	clock.now = origin.Add(budget + time.Minute)
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Degraded {
+		t.Fatalf("expected DEGRADED once the commit had been pending for longer than %s, result = %+v", budget, result)
 	}
 }

@@ -240,9 +240,11 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	next := *st
 	if next.PendingCommit != commit {
 		next.PendingAttempts = 0
+		next.PendingSince = now
+	} else if next.PendingSince.IsZero() {
+		next.PendingSince = now
 	}
 	next.PendingCommit = commit
-	next.PendingSince = now
 	next.PendingStacks = stackNames(changedStacks)
 	next.LastCheckoutCommit = commit
 	next.LastAttemptCommit = commit
@@ -403,7 +405,7 @@ func composeFileRelevant(ctx context.Context, deps Deps, changedFiles []string) 
 	if composeFileChanged(cfg.RepoPath, cfg.ComposeFile, changedFiles) {
 		return true
 	}
-	project, err := deps.Compose.LoadProject(ctx, []string{cfg.ComposeFile}, cfg.ProjectName)
+	project, err := deps.Compose.LoadProject(ctx, []string{resolveUnderRepo(cfg.RepoPath, cfg.ComposeFile)}, cfg.ProjectName)
 	if err != nil {
 		deps.Log.Warn("loading the compose project to weigh a change failed, treating the commit as relevant", "err", err)
 		return true

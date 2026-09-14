@@ -109,6 +109,8 @@ Once a run exits with code 3, every following run refuses to touch the stack unt
 
 ### What counts as a change
 
+A relative `compose_file` is resolved against `repo_path`, the same way a relative `compose_dir` is, so it means the same file regardless of which directory ComposeLock is started from.
+
 A commit only triggers a deploy when it touches something the deployment actually depends on. In `compose_file` mode that is the compose file itself plus every input reachable from it: `include:` fragments and their own nested includes, `extends.file` targets, each `env_file`, the implicit `.env` beside the compose file and beside each included project, every service build context and Dockerfile, and any `config`/`secret` sourced from a file. A change to a tracked `.env`, a Dockerfile or an included fragment therefore redeploys, while a docs-only commit does not.
 
 Two cases fall back to applying rather than skipping, on the principle that a wrong skip is silent and a wrong apply is not: the project failing to load at all, and an input set that cannot be enumerated statically, such as an `include:` path built from a variable (`${STACK_DIR}/compose.yaml`) or a fragment that cannot be read. Remote `include:` references (`https://`, `git@`, `oci://`) are ignored, since they can never be a path in this repository. In `compose_dir` mode the rule is broader and cheaper, see [Multiple compose files](#multiple-compose-files-compose_dir).
