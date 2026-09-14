@@ -137,7 +137,8 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 		"poll_interval", opts.PollInterval.String(),
 		"healthy_at", deadline.Format(time.RFC3339))
 	result := Result{Baseline: baseline}
-	unhealthyStreak, wedgedStreak := 0, 0
+	unhealthyStreaks := make(map[string]int, len(baseline.Containers))
+	wedgedStreaks := make(map[string]int, len(baseline.Containers))
 	last := baseline
 
 	for first := true; first || clock.Now().Before(deadline); first = false {
@@ -164,7 +165,6 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 			return result, nil
 		}
 
-		anyUnhealthy, anyStarting, anyWedged := false, false, false
 		for _, c := range cur.Containers {
 			if c.State == StateExited && !c.Completed() {
 				result.Reason = fmt.Sprintf("container exited: %s (exit code %d)", c.Service, c.ExitCode)
@@ -180,51 +180,46 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 				result.Outcome = Unhealthy
 				return result, nil
 			}
-			if restarts := c.RestartCount - baselineRestarts[c.ID]; restarts > opts.RestartTolerance {
+			if restarts := restartDelta(baselineRestarts, c); restarts > opts.RestartTolerance {
 				result.Reason = fmt.Sprintf("restarted beyond tolerance: %s (restarts=%d, tolerance=%d)", c.Service, restarts, opts.RestartTolerance)
 				result.Failures = append(result.Failures, result.Reason)
 				log.Warn("health watch: restart tolerance exceeded", "service", c.Service, "restarts", restarts)
 				result.Outcome = Unhealthy
 				return result, nil
 			}
-			if c.Completed() || c.State == StateRestarting {
+			if c.Completed() {
 				continue
 			}
-			if c.State == StateCreated || c.State == StatePaused {
-				anyWedged = true
+			if c.State != StateRunning {
+				wedgedStreaks[c.ID]++
+				if wedgedStreaks[c.ID] >= opts.UnhealthyStreakLimit {
+					result.Reason = "container never started"
+					result.Failures = append(result.Failures, result.Reason)
+					log.Warn("health watch: container stuck in a non-running state",
+						"service", c.Service, "state", c.State, "streak", wedgedStreaks[c.ID])
+					result.Outcome = Unhealthy
+					return result, nil
+				}
+				continue
 			}
-			switch c.Health {
-			case HealthUnhealthy:
-				anyUnhealthy = true
-			case HealthStarting:
-				anyStarting = true
-			}
-		}
+			delete(wedgedStreaks, c.ID)
 
-		if anyWedged {
-			wedgedStreak++
-			if wedgedStreak >= opts.UnhealthyStreakLimit {
-				result.Reason = "container never started"
-				result.Failures = append(result.Failures, result.Reason)
-				log.Warn("health watch: container stuck in a non-running state", "streak", wedgedStreak)
-				result.Outcome = Unhealthy
-				return result, nil
+			if c.Health == "" || c.Health == HealthNone || c.Health == HealthHealthy {
+				delete(unhealthyStreaks, c.ID)
+				continue
 			}
-		} else {
-			wedgedStreak = 0
-		}
-
-		if anyUnhealthy {
-			unhealthyStreak++
-			if unhealthyStreak >= opts.UnhealthyStreakLimit {
+			if c.Health == HealthStarting {
+				continue
+			}
+			unhealthyStreaks[c.ID]++
+			if unhealthyStreaks[c.ID] >= opts.UnhealthyStreakLimit {
 				result.Reason = "healthcheck unhealthy"
 				result.Failures = append(result.Failures, result.Reason)
-				log.Warn("health watch: unhealthy streak limit reached", "streak", unhealthyStreak)
+				log.Warn("health watch: unhealthy streak limit reached",
+					"service", c.Service, "health", c.Health, "streak", unhealthyStreaks[c.ID])
 				result.Outcome = Unhealthy
 				return result, nil
 			}
-		} else if !anyStarting {
-			unhealthyStreak = 0
 		}
 	}
 
@@ -239,6 +234,14 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 
 	result.Outcome = Healthy
 	return result, nil
+}
+
+func restartDelta(baselineRestarts map[string]int, c ContainerStatus) int {
+	base, known := baselineRestarts[c.ID]
+	if !known {
+		return c.RestartCount
+	}
+	return c.RestartCount - base
 }
 
 func checkPopulated(snap Snapshot, opts Options) (Result, bool) {
@@ -311,7 +314,7 @@ func RestartedServices(before, after Snapshot) []string {
 	}
 	var restarted []string
 	for _, c := range after.Containers {
-		if base, ok := restarts[c.ID]; ok && c.RestartCount > base {
+		if restartDelta(restarts, c) > 0 {
 			restarted = append(restarted, c.Service)
 		}
 	}

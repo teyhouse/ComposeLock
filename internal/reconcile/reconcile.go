@@ -139,8 +139,8 @@ func reconcileLocked(ctx context.Context, opts Options, deps Deps, start time.Ti
 	}
 
 	if st.LastResult == state.ResultDegraded && !opts.Force {
-		deps.Log.Warn("refusing to reconcile: system is DEGRADED, use --force", "pending_commit", st.PendingCommit)
-		return Result{Degraded: true, NewCommit: st.PendingCommit, Err: errDegraded}
+		deps.Log.Warn("refusing to reconcile: system is DEGRADED, use --force", "commit", st.LastAttemptCommit)
+		return Result{Degraded: true, NewCommit: st.LastAttemptCommit, Err: errDegraded}
 	}
 
 	if st.Pending() {

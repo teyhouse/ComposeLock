@@ -552,8 +552,11 @@ func TestReconcileApplyFailsNoBaselineDegrades(t *testing.T) {
 	if st.LastFailedCommit != "bbb222" {
 		t.Errorf("LastFailedCommit = %q, want %q", st.LastFailedCommit, "bbb222")
 	}
-	if !st.Pending() {
-		t.Error("expected pending_commit to stay set for visibility")
+	if st.Pending() {
+		t.Error("expected the pending block cleared: a DEGRADED run must not route the next --force into crash recovery")
+	}
+	if st.LastAttemptCommit != "bbb222" {
+		t.Errorf("LastAttemptCommit = %q, want %q to keep the stuck commit visible", st.LastAttemptCommit, "bbb222")
 	}
 }
 
@@ -632,8 +635,11 @@ func TestReconcileRevertAlsoFailsDegrades(t *testing.T) {
 	if store.State.LastResult != state.ResultDegraded {
 		t.Errorf("LastResult = %q, want %q", store.State.LastResult, state.ResultDegraded)
 	}
-	if !store.State.Pending() {
-		t.Error("expected pending_commit to stay set for visibility")
+	if store.State.Pending() {
+		t.Error("expected the pending block cleared: a DEGRADED run must not route the next --force into crash recovery")
+	}
+	if store.State.LastAttemptCommit != "bbb222" {
+		t.Errorf("LastAttemptCommit = %q, want %q to keep the stuck commit visible", store.State.LastAttemptCommit, "bbb222")
 	}
 
 	// Subsequent run without --force must refuse to touch anything further.
@@ -739,7 +745,7 @@ func TestReconcileInterruptedRevertWatchResumesRevert(t *testing.T) {
 func TestReconcileCrashRecoveryReappliesPendingCommit(t *testing.T) {
 	st := withHealthy("aaa111")
 	st.PendingCommit = "ccc333"
-	g := gitNoChange("aaa111")
+	g := gitNoChange("ccc333")
 	compose := &fakeCompose{}
 	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), st)
 

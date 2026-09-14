@@ -42,7 +42,7 @@ func TestReconcileCrashRecoveryResetsAttemptsOnSuccess(t *testing.T) {
 	st := withHealthy("aaa111")
 	st.PendingCommit = "ccc333"
 	st.PendingAttempts = 2
-	deps, store := testDeps(t, gitNoChange("aaa111"), &fakeCompose{}, snapshots(healthySnapshot()), st)
+	deps, store := testDeps(t, gitNoChange("ccc333"), &fakeCompose{}, snapshots(healthySnapshot()), st)
 
 	if result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps); result.Err != nil {
 		t.Fatalf("unexpected error: %v", result.Err)
@@ -56,7 +56,7 @@ func TestReconcileCrashRecoveryForceResetsAttempts(t *testing.T) {
 	st := withHealthy("aaa111")
 	st.PendingCommit = "ccc333"
 	st.PendingAttempts = maxRecoveryAttempts
-	deps, store := testDeps(t, gitNoChange("aaa111"), &fakeCompose{}, snapshots(healthySnapshot()), st)
+	deps, store := testDeps(t, gitNoChange("ccc333"), &fakeCompose{}, snapshots(healthySnapshot()), st)
 
 	result := Reconcile(t.Context(), Options{Trigger: "cli", Force: true}, deps)
 	if result.Degraded {

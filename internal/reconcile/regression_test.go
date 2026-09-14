@@ -943,8 +943,19 @@ func TestReconcileNeverPromotesACommitItCouldNotWeigh(t *testing.T) {
 		t.Errorf("LastHealthyCommit = %q, want %q: a commit whose stacks could not be weighed was never applied, so it must not become the rollback target",
 			store.State.LastHealthyCommit, "aaa111")
 	}
-	if store.State.LastCheckoutCommit != "bbb222" {
-		t.Errorf("LastCheckoutCommit = %q, want the checkout to still move to %q", store.State.LastCheckoutCommit, "bbb222")
+	if store.State.LastCheckoutCommit == "bbb222" {
+		t.Errorf("LastCheckoutCommit = %q: recording a checkout the run never applied strands the stack, because the next run sees no drift and skips it",
+			store.State.LastCheckoutCommit)
+	}
+
+	compose.loadErr = nil
+	second := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !second.Applied {
+		t.Fatalf("expected the next run to retry the stack once it could be weighed, result = %+v", second)
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q once the retry applied it", store.State.LastHealthyCommit, "bbb222")
 	}
 }
 
@@ -986,5 +997,148 @@ func TestCancelledRevertRecordsTheStacksItWasReverting(t *testing.T) {
 	if !equalStringSlices(store.State.PendingStacks, []string{"test-stack-a"}) {
 		t.Fatalf("PendingStacks = %v, want [test-stack-a]: an empty list means every stack to restrictToNames, which would re-up stacks this cycle never touched",
 			store.State.PendingStacks)
+	}
+}
+
+func TestCrashRecoveryAppliesAFixCommitThatSupersedesThePendingCommit(t *testing.T) {
+	st := withHealthy("aaa111")
+	st.PendingCommit = "bbb222"
+	st.PendingAttempts = maxRecoveryAttempts
+	g := gitChange("bbb222", "ddd444")
+	deps, store := testDeps(t, g, &fakeCompose{}, snapshots(healthySnapshot()), st)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if result.Degraded {
+		t.Fatalf("a fix commit on the branch must pre-empt the attempt-limit degrade, result = %+v", result)
+	}
+	if g.head != "ddd444" {
+		t.Errorf("HEAD = %q, want the fix commit %q applied", g.head, "ddd444")
+	}
+	if store.State.LastHealthyCommit != "ddd444" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "ddd444")
+	}
+}
+
+func TestCrashRecoveryKeepsThePendingCommitWhenTheFetchFails(t *testing.T) {
+	st := withHealthy("aaa111")
+	st.PendingCommit = "bbb222"
+	g := gitChange("bbb222", "ddd444")
+	g.fetchErr = errors.New("network unreachable")
+	deps, store := testDeps(t, g, &fakeCompose{}, snapshots(healthySnapshot()), st)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if result.Err != nil {
+		t.Fatalf("an unreachable remote must not block crash recovery: %v", result.Err)
+	}
+	if g.head != "bbb222" {
+		t.Errorf("HEAD = %q, want the pending commit %q re-applied", g.head, "bbb222")
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}
+
+func TestDegradedForceRunPicksUpANewCommitInsteadOfReplayingThePendingOne(t *testing.T) {
+	compose := &fakeCompose{upErrs: []error{errors.New("image pull failed")}}
+	g := gitChange("aaa111", "bbb222")
+	deps, store := testDeps(t, g, compose, snapshots(healthySnapshot()), state.New())
+
+	first := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+	if !first.Degraded {
+		t.Fatalf("expected the failed apply with no rollback target to degrade, result = %+v", first)
+	}
+	if store.State.Pending() {
+		t.Fatalf("a DEGRADED run must clear the pending block, state = %+v", store.State)
+	}
+
+	g.remote = "ccc333"
+	compose.upErrs = nil
+	second := Reconcile(t.Context(), Options{Trigger: "cli", Force: true}, deps)
+
+	if second.Err != nil {
+		t.Fatalf("unexpected error on the forced retry: %v", second.Err)
+	}
+	if g.head != "ccc333" {
+		t.Errorf("HEAD = %q, want --force to fetch and apply the fix commit %q", g.head, "ccc333")
+	}
+	if store.State.LastHealthyCommit != "ccc333" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "ccc333")
+	}
+}
+
+func TestKnownBadCommitIsSkippedEvenWhenItsChangesLookIrrelevant(t *testing.T) {
+	st := withHealthy("aaa111")
+	st.MarkFailed("bbb222", time.Time{})
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "README.md"
+	deps, store := testDeps(t, g, &fakeCompose{}, snapshots(healthySnapshot()), st)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Skipped {
+		t.Fatalf("expected the known-bad commit to be skipped, result = %+v", result)
+	}
+	if store.State.LastResult != state.ResultSkippedKnownBad {
+		t.Errorf("LastResult = %q, want %q: an irrelevant-looking known-bad commit must still be recorded as skipped",
+			store.State.LastResult, state.ResultSkippedKnownBad)
+	}
+	if g.head != "aaa111" {
+		t.Errorf("HEAD = %q, want the checkout left at %q", g.head, "aaa111")
+	}
+	if store.State.LastCheckoutCommit == "bbb222" {
+		t.Errorf("LastCheckoutCommit = %q, want the known-bad commit never recorded as checked out", store.State.LastCheckoutCommit)
+	}
+}
+
+func TestPreflightBlockCounterResetsWhenTheGatePasses(t *testing.T) {
+	st := withHealthy("aaa111")
+	st.PreflightBlocks = maxPreflightBlocks - 1
+	compose := &fakeCompose{upErrs: []error{errors.New("image pull failed")}}
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(healthySnapshot(), healthySnapshot()), st)
+
+	result := Reconcile(t.Context(), Options{Trigger: "cli"}, deps)
+
+	if !result.Reverted {
+		t.Fatalf("expected the failed apply to revert, result = %+v", result)
+	}
+	if store.State.PreflightBlocks != 0 {
+		t.Errorf("PreflightBlocks = %d, want 0: the gate passed this run, so the consecutive-block streak is broken",
+			store.State.PreflightBlocks)
+	}
+}
+
+func TestWatchInfrastructureFailureIsRecordedAndNotified(t *testing.T) {
+	snap := &erroringSnapshotter{snaps: []health.Snapshot{healthySnapshot()}, after: 1}
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), &fakeCompose{}, snap, withHealthy("aaa111"))
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if result.Err == nil {
+		t.Fatal("expected the failed health watch to surface an error")
+	}
+	if result.Notification == nil {
+		t.Error("a health watch that could not run must notify, like the other infrastructure failures do")
+	}
+	if store.State.LastResult != state.ResultFailedApply {
+		t.Errorf("LastResult = %q, want %q recorded for the incomplete apply", store.State.LastResult, state.ResultFailedApply)
+	}
+	if !store.State.Pending() {
+		t.Error("the applied but unverified commit must stay pending so the next run resumes it")
+	}
+}
+
+func TestForcedRetryKeepsTheKnownBadMarkerUntilItSucceeds(t *testing.T) {
+	st := withHealthy("aaa111")
+	st.MarkFailed("bbb222", time.Time{})
+	ctx, cancel := context.WithCancel(t.Context())
+	compose := &fakeCompose{onUp: func(int) { cancel() }}
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snapshots(healthySnapshot()), st)
+
+	Reconcile(ctx, Options{Trigger: "cli", Force: true}, deps)
+
+	if !store.State.IsKnownBad("bbb222") {
+		t.Errorf("a forced retry interrupted before the commit was proved healthy must keep the known-bad marker, state = %+v", store.State)
 	}
 }

@@ -73,13 +73,27 @@ func (s *Service) LoadProject(ctx context.Context, composeFiles []string, projec
 func (s *Service) Up(ctx context.Context, project *types.Project) error {
 	ctx, cancel := s.withTimeout(ctx, s.upTimeout)
 	defer cancel()
+	forceBuild(project)
 	if err := s.compose.Up(ctx, project, api.UpOptions{
-		Create: api.CreateOptions{RemoveOrphans: true},
-		Start:  api.StartOptions{Project: project},
+		Create: api.CreateOptions{
+			RemoveOrphans: true,
+			Build:         &api.BuildOptions{Deps: true},
+		},
+		Start: api.StartOptions{Project: project},
 	}); err != nil {
 		return fmt.Errorf("compose up: %w", err)
 	}
 	return nil
+}
+
+func forceBuild(project *types.Project) {
+	for name, svc := range project.Services {
+		if svc.Build == nil {
+			continue
+		}
+		svc.PullPolicy = types.PullPolicyBuild
+		project.Services[name] = svc
+	}
 }
 
 func (s *Service) Down(ctx context.Context, projectName string) error {

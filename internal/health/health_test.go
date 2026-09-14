@@ -475,8 +475,10 @@ func TestWatchRestartingAtTheFinalPollWithinToleranceStaysHealthy(t *testing.T) 
 		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRunning, RestartCount: 0}}},
 		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRestarting, RestartCount: 1}}},
 	}}
+	opts := baseOpts()
+	opts.WatchDuration = 10 * time.Second
 
-	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	res, err := Watch(t.Context(), snap, &fakeClock{}, opts, testLog())
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
@@ -559,8 +561,10 @@ func TestWatchIgnoresAStaleUnhealthyProbeOnARestartingContainer(t *testing.T) {
 		{Containers: []ContainerStatus{running("c1", "web")}},
 		{Containers: []ContainerStatus{restarting}},
 	}}
+	opts := baseOpts()
+	opts.WatchDuration = 10 * time.Second
 
-	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	res, err := Watch(t.Context(), snap, &fakeClock{}, opts, testLog())
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
@@ -584,5 +588,107 @@ func TestWatchStillFailsARestartingContainerBeyondTolerance(t *testing.T) {
 	}
 	if res.Outcome != Unhealthy {
 		t.Errorf("Outcome = %v, want unhealthy: excessive restart churn must still fail the watch", res.Outcome)
+	}
+}
+
+func TestWatchContainerRestartingForTheWholeWindowFails(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRestarting, RestartCount: 1}}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Errorf("Outcome = %v (%s), want unhealthy: a container that never leaves restarting is wedged, even while its restart count stays within tolerance", res.Outcome, res.Reason)
+	}
+}
+
+func TestWatchStaggeredUnhealthyServicesDoNotTripTheStreak(t *testing.T) {
+	a, b := "web", "db"
+	oddPoll := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: a, State: StateRunning, Health: HealthUnhealthy},
+		{ID: "c2", Service: b, State: StateRunning, Health: HealthHealthy},
+	}}
+	evenPoll := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: a, State: StateRunning, Health: HealthHealthy},
+		{ID: "c2", Service: b, State: StateRunning, Health: HealthUnhealthy},
+	}}
+	settled := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: a, State: StateRunning, Health: HealthHealthy},
+		{ID: "c2", Service: b, State: StateRunning, Health: HealthHealthy},
+	}}
+	snap := &fakeSnapshotter{snapshots: []Snapshot{settled, oddPoll, evenPoll, oddPoll, evenPoll, settled}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Healthy {
+		t.Errorf("Outcome = %v (%s), want healthy: neither service was unhealthy for a streak of its own, so the streaks must be counted per container", res.Outcome, res.Reason)
+	}
+}
+
+func TestWatchOneServiceUnhealthyForAStreakFailsWhileOthersAreHealthy(t *testing.T) {
+	poll := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: "web", State: StateRunning, Health: HealthUnhealthy},
+		{ID: "c2", Service: "db", State: StateRunning, Health: HealthHealthy},
+	}}
+	snap := &fakeSnapshotter{snapshots: []Snapshot{poll}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Errorf("Outcome = %v (%s), want unhealthy: one container unhealthy for the whole streak still fails the watch", res.Outcome, res.Reason)
+	}
+}
+
+func TestWatchUnknownHealthValueFailsClosed(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRunning, Health: "degraded"}}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Errorf("Outcome = %v (%s), want unhealthy: a health value the watch does not recognise must fail closed, as the final verdict already does", res.Outcome, res.Reason)
+	}
+}
+
+func TestWatchUnknownContainerStateFailsClosed(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: "", Health: HealthHealthy}}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Errorf("Outcome = %v (%s), want unhealthy: a container that is not running must count as wedged, whatever its state reads as", res.Outcome, res.Reason)
+	}
+}
+
+func TestRestartedServicesNamesARecreatedContainerThatRestarted(t *testing.T) {
+	before := Snapshot{Containers: []ContainerStatus{{ID: "c1", Service: "web", RestartCount: 2}}}
+	after := Snapshot{Containers: []ContainerStatus{{ID: "c9", Service: "web", RestartCount: 3}}}
+
+	if got := RestartedServices(before, after); len(got) != 1 || got[0] != "web" {
+		t.Errorf("RestartedServices = %v, want [web]: a replacement container that has restarted since it was created did restart", got)
+	}
+}
+
+func TestRestartedServicesIgnoresAFreshContainerThatNeverRestarted(t *testing.T) {
+	before := Snapshot{Containers: []ContainerStatus{{ID: "c1", Service: "web", RestartCount: 4}}}
+	after := Snapshot{Containers: []ContainerStatus{{ID: "c9", Service: "web", RestartCount: 0}}}
+
+	if got := RestartedServices(before, after); len(got) != 0 {
+		t.Errorf("RestartedServices = %v, want empty: a replacement that has not restarted is an update, not a restart", got)
 	}
 }

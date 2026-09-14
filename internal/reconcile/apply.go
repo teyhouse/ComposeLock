@@ -47,20 +47,9 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		NewCommit:    gitResult.NewCommit,
 		ChangedFiles: gitResult.ChangedFiles,
 	}
-	if !gitResult.Changed {
-		if !checkoutDrifted(st, gitResult.OldCommit) {
-			deps.Log.Info("nothing to do", "commit", gitResult.OldCommit)
-			return result
-		}
-		deps.Log.Warn("checkout does not match the expected commit, re-applying",
-			"head", gitResult.OldCommit, "expected", st.ExpectedCheckout(), "last_healthy_commit", st.LastHealthyCommit)
-		result.Changed = true
-		result.ChangedFiles = nil
-	} else if st.LastHealthyCommit != "" && !relevantChange(ctx, deps, gitResult.ChangedFiles) {
-		deps.Log.Info("compose file(s) unchanged, advancing checkout without applying",
-			"commit", gitResult.NewCommit, "changed_files", gitResult.ChangedFiles)
-		result.Skipped = true
-		return advanceCheckout(ctx, deps, st, result)
+	if !gitResult.Changed && !checkoutDrifted(st, gitResult.OldCommit) {
+		deps.Log.Info("nothing to do", "commit", gitResult.OldCommit)
+		return result
 	}
 
 	// A revert moves the local checkout back to last_healthy_commit but
@@ -72,6 +61,18 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		recordOutcome(deps, st, state.ResultSkippedKnownBad, gitResult.NewCommit)
 		result.Skipped = true
 		return result
+	}
+
+	if !gitResult.Changed {
+		deps.Log.Warn("checkout does not match the expected commit, re-applying",
+			"head", gitResult.OldCommit, "expected", st.ExpectedCheckout(), "last_healthy_commit", st.LastHealthyCommit)
+		result.Changed = true
+		result.ChangedFiles = nil
+	} else if st.LastHealthyCommit != "" && !relevantChange(ctx, deps, gitResult.ChangedFiles) {
+		deps.Log.Info("compose file(s) unchanged, advancing checkout without applying",
+			"commit", gitResult.NewCommit, "changed_files", gitResult.ChangedFiles)
+		result.Skipped = true
+		return advanceCheckout(ctx, deps, st, result)
 	}
 
 	previousStacks, err := previousStacksAt(deps)
@@ -118,8 +119,22 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 	if !live.healthy {
 		return preflightBlocked(ctx, opts, deps, st, result, previousStacks, live.reason, start)
 	}
+	clearPreflightBlocks(deps, st)
 
 	return applyAndWatch(ctx, deps, st, result, deployedStacks(st, previousStacks), nil, live.snapshots, start)
+}
+
+func clearPreflightBlocks(deps Deps, st *state.State) {
+	if st.PreflightBlocks == 0 {
+		return
+	}
+	next := *st
+	next.PreflightBlocks = 0
+	if err := deps.State.Save(&next); err != nil {
+		deps.Log.Error("clearing the pre-flight block counter", "err", err)
+		return
+	}
+	*st = next
 }
 
 func preflightBlocked(ctx context.Context, opts Options, deps Deps, st *state.State, result Result, previousStacks []compose.Stack, reason string, start time.Time) Result {
@@ -212,15 +227,11 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	}
 	if len(changedStacks) == 0 {
 		if err := tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir"); err != nil {
-			result.Err = err
-			return result
+			return applyIncomplete(ctx, deps, st, result, "tearing down removed stacks failed", "teardown", err)
 		}
 		result.Skipped = true
 		if undetermined {
-			deps.Log.Warn("a stack could not be weighed against this commit, advancing the checkout without promoting it", "commit", commit)
-			if err := recordCheckout(deps, st, commit); err != nil {
-				result.Err = err
-			}
+			deps.Log.Warn("a stack could not be weighed against this commit, leaving the checkout unrecorded so the next run retries it", "commit", commit)
 			return result
 		}
 		deps.Log.Info("no compose stack changed, nothing to apply", "commit", commit)
@@ -257,7 +268,6 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	next.LastCheckoutCommit = commit
 	next.LastAttemptCommit = commit
 	next.LastAttemptAt = now
-	next.ForgetFailed(commit)
 	if err := deps.State.Save(&next); err != nil {
 		return abortBeforeUp(ctx, deps, st, result, "saving state failed", fmt.Errorf("saving state: %w", err))
 	}
@@ -285,15 +295,13 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 
 	watchResult, baselines, err := watchStacks(ctx, deps, changedStacks, projects, commit)
 	if err != nil {
-		result.Err = fmt.Errorf("health watch: %w", err)
-		return result
+		return applyIncomplete(ctx, deps, st, result, "health watch did not complete", "watch", fmt.Errorf("health watch: %w", err))
 	}
 	result.HealthWatch = time.Duration(cfg.HealthWatchSeconds) * time.Second
 
 	if watchResult.Outcome == health.Healthy {
 		if err := tearDownStacks(ctx, deps, vanished, "stack removed from compose_dir"); err != nil {
-			result.Err = err
-			return result
+			return applyIncomplete(ctx, deps, st, result, "tearing down removed stacks failed", "teardown", err)
 		}
 		if err := promoteHealthy(deps, st, commit, stackNames(stacks)); err != nil {
 			result.Err = err
@@ -348,6 +356,25 @@ func abortApply(ctx context.Context, deps Deps, st *state.State, result Result, 
 	}
 	st.MarkFailed(result.NewCommit, deps.Clock.Now())
 	return abortBeforeUp(ctx, deps, st, result, title, err)
+}
+
+func applyIncomplete(ctx context.Context, deps Deps, st *state.State, result Result, title, key string, err error) Result {
+	result.Err = err
+	deps.Log.Error(title, "commit", result.NewCommit, "err", err)
+	if ctx.Err() != nil {
+		return result
+	}
+	recordOutcome(deps, st, state.ResultFailedApply, result.NewCommit)
+	embed := notify.BuildEmbed(notify.Report{
+		Outcome: notify.OutcomeFailure,
+		Title:   "ComposeLock: " + title,
+		Commit:  result.NewCommit,
+		Branch:  deps.Config.Branch,
+		Err:     err,
+	})
+	result.Notification = &embed
+	result.NotificationKey = key + ":" + result.NewCommit
+	return result
 }
 
 func applyInterrupted(deps Deps, st *state.State, result Result, projectName string, err error) Result {

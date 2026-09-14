@@ -28,6 +28,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 	if err := deps.Git.Checkout(ctx, target); err != nil {
 		return revertFailed(ctx, deps, st, failedCommit, target, stacks, fmt.Errorf("checking out rollback target %s: %w", target, err), start)
 	}
+	st.LastCheckoutCommit = target
 
 	targetStacks, err := stacksAllowingEmpty(deps)
 	if err != nil {
@@ -180,6 +181,11 @@ func degrade(deps Deps, st *state.State, failedCommit, target string, stacks []s
 	next := *st
 	next.LastResult = state.ResultDegraded
 	next.LastAttemptAt = now
+	next.PendingCommit = ""
+	next.PendingSince = time.Time{}
+	next.PendingAttempts = 0
+	next.PendingStacks = nil
+	next.PendingRevert = false
 	if failedCommit != preflightRecovery {
 		next.MarkFailed(failedCommit, now)
 		next.LastAttemptCommit = failedCommit

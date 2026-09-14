@@ -135,3 +135,22 @@ func TestProjectInputsSkipsRelativePathsWithoutAWorkingDir(t *testing.T) {
 		t.Errorf("ProjectInputs = %q, want empty when the project has no working directory", got)
 	}
 }
+
+func TestForceBuildTargetsOnlyBuildableServices(t *testing.T) {
+	project := &types.Project{
+		Services: types.Services{
+			"web": types.ServiceConfig{Name: "web", Build: &types.BuildConfig{Context: "."}},
+			"db":  types.ServiceConfig{Name: "db", Image: "postgres:16"},
+		},
+	}
+
+	forceBuild(project)
+
+	if got := project.Services["web"].PullPolicy; got != types.PullPolicyBuild {
+		t.Errorf("web PullPolicy = %q, want %q: a build: service must be rebuilt even when a previous image of the same tag is still local",
+			got, types.PullPolicyBuild)
+	}
+	if got := project.Services["db"].PullPolicy; got != "" {
+		t.Errorf("db PullPolicy = %q, want it untouched: an image-only service has nothing to build", got)
+	}
+}
