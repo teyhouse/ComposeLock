@@ -71,19 +71,26 @@ func (s *Service) LoadProject(ctx context.Context, composeFiles []string, projec
 }
 
 func (s *Service) Up(ctx context.Context, project *types.Project) error {
-	ctx, cancel := s.withTimeout(ctx, s.upTimeout)
+	upCtx, cancel := s.withTimeout(ctx, s.upTimeout)
 	defer cancel()
 	forceBuild(project)
-	if err := s.compose.Up(ctx, project, api.UpOptions{
+	if err := s.compose.Up(upCtx, project, api.UpOptions{
 		Create: api.CreateOptions{
 			RemoveOrphans: true,
 			Build:         &api.BuildOptions{Deps: true},
 		},
 		Start: api.StartOptions{Project: project},
 	}); err != nil {
-		return fmt.Errorf("compose up: %w", err)
+		return fmt.Errorf("compose up: %w", ownDeadline(ctx, upCtx, err, s.upTimeout))
 	}
 	return nil
+}
+
+func ownDeadline(caller, inner context.Context, err error, budget time.Duration) error {
+	if caller.Err() != nil || !errors.Is(inner.Err(), context.DeadlineExceeded) {
+		return err
+	}
+	return fmt.Errorf("timed out after %s: %v", budget, err)
 }
 
 func forceBuild(project *types.Project) {

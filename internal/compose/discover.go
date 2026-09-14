@@ -85,9 +85,9 @@ func Discover(composeDir, baseProjectName string, log *slog.Logger) ([]Stack, er
 
 	stacks, err := discover(composeDir, baseProjectName, log)
 
-	if fpErr == nil {
+	if fpErr == nil && err == nil {
 		cache.mu.Lock()
-		cache.key, cache.fingerprint, cache.stacks, cache.err = key, fp, stacks, err
+		cache.key, cache.fingerprint, cache.stacks, cache.err = key, fp, stacks, nil
 		cache.mu.Unlock()
 	}
 	return cloneStacks(stacks), err

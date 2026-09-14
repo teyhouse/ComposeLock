@@ -1,11 +1,14 @@
 package compose
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
 )
@@ -154,5 +157,71 @@ func TestForceBuildTargetsOnlyBuildableServices(t *testing.T) {
 	}
 	if got := project.Services["db"].PullPolicy; got != "" {
 		t.Errorf("db PullPolicy = %q, want it untouched: an image-only service has nothing to build", got)
+	}
+}
+
+func TestOwnDeadlineIsNotAnInfrastructureError(t *testing.T) {
+	caller := context.Background()
+	inner, cancel := context.WithDeadline(caller, time.Now().Add(-time.Second))
+	defer cancel()
+
+	err := ownDeadline(caller, inner, context.DeadlineExceeded, 30*time.Minute)
+
+	if IsInfraError(err) {
+		t.Errorf("our own docker_up_timeout_seconds expiring must not read as the environment failing, or the apply is left pending and the half-converged stack is never reverted")
+	}
+	if !strings.Contains(err.Error(), "30m0s") {
+		t.Errorf("err = %v, want it to name the budget that ran out", err)
+	}
+}
+
+func TestOwnDeadlineKeepsCallerCancellation(t *testing.T) {
+	caller, cancelCaller := context.WithCancel(context.Background())
+	cancelCaller()
+	inner, cancel := context.WithCancel(caller)
+	defer cancel()
+
+	err := ownDeadline(caller, inner, context.Canceled, time.Minute)
+
+	if !IsInfraError(err) {
+		t.Errorf("a shutdown is still the environment, not the commit: err = %v", err)
+	}
+}
+
+func TestOwnDeadlineLeavesOtherErrorsAlone(t *testing.T) {
+	caller := context.Background()
+	inner, cancel := context.WithCancel(caller)
+	defer cancel()
+	original := errors.New("image pull failed")
+
+	if err := ownDeadline(caller, inner, original, time.Minute); !errors.Is(err, original) {
+		t.Errorf("err = %v, want the original error untouched", err)
+	}
+}
+
+func TestDiscoverDoesNotCacheFailures(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"my db", "my-db"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, sub, "compose.yaml"), []byte(validComposeYAML), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := Discover(dir, "proj", nil); err == nil {
+		t.Fatal("expected colliding project names to fail discovery")
+	}
+
+	cache.mu.Lock()
+	cachedErr, cachedFingerprint := cache.err, cache.fingerprint
+	cache.mu.Unlock()
+
+	if cachedErr != nil {
+		t.Errorf("cache holds err = %v: a failure cached against a still-valid fingerprint keeps discovery broken after the cause clears", cachedErr)
+	}
+	if cachedFingerprint != "" && cachedErr != nil {
+		t.Errorf("a failed discovery must not claim a valid fingerprint")
 	}
 }
