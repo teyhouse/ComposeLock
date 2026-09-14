@@ -925,3 +925,66 @@ func TestCancelledPreflightRevertIsRecordedForResume(t *testing.T) {
 		t.Error("Pending() = false, so the next run would take the normal path instead of resuming the revert")
 	}
 }
+
+func TestReconcileNeverPromotesACommitItCouldNotWeigh(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), "include:\n  - ../../shared/base.yaml\n"+validComposeYAML)
+	writeComposeFile(t, filepath.Join(repoPath, "shared", "base.yaml"), validComposeYAML)
+
+	compose := &fakeCompose{loadErr: fmt.Errorf("compose: %w", syscall.ECONNREFUSED)}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "shared/base.yaml"
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
+
+	Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if store.State.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want %q: a commit whose stacks could not be weighed was never applied, so it must not become the rollback target",
+			store.State.LastHealthyCommit, "aaa111")
+	}
+	if store.State.LastCheckoutCommit != "bbb222" {
+		t.Errorf("LastCheckoutCommit = %q, want the checkout to still move to %q", store.State.LastCheckoutCommit, "bbb222")
+	}
+}
+
+func TestReconcileAppliesAStackWhoseInputsCannotBeEnumerated(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	stackDir := filepath.Join(composeDir, "db")
+	writeComposeFile(t, filepath.Join(stackDir, "docker-compose.yaml"), "include:\n  - ${FRAG}/base.yaml\n"+validComposeYAML)
+	writeComposeFile(t, filepath.Join(repoPath, "shared", "base.yaml"), validComposeYAML)
+
+	compose := &fakeCompose{project: &ctypes.Project{
+		Name:         "test-stack-db",
+		WorkingDir:   stackDir,
+		ComposeFiles: []string{filepath.Join(stackDir, "docker-compose.yaml")},
+		Services:     ctypes.Services{"web": ctypes.ServiceConfig{Name: "web"}},
+	}}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "shared/base.yaml"
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("a stack whose input set cannot be enumerated must be applied rather than skipped, result = %+v", result)
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}
+
+func TestCancelledRevertRecordsTheStacksItWasReverting(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	st := withHealthy("aaa111")
+	deps, store := testDeps(t, gitNoChange("aaa111"), &fakeCompose{}, snapshots(healthySnapshot()), st)
+
+	revertFailed(ctx, deps, st, "bbb222", "aaa111", stackFixtures("test-stack-a"), errors.New("discovering compose stacks at rollback target: boom"), time.Now())
+
+	if !equalStringSlices(store.State.PendingStacks, []string{"test-stack-a"}) {
+		t.Fatalf("PendingStacks = %v, want [test-stack-a]: an empty list means every stack to restrictToNames, which would re-up stacks this cycle never touched",
+			store.State.PendingStacks)
+	}
+}

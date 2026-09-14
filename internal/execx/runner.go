@@ -12,7 +12,7 @@ import (
 
 const waitDelay = 5 * time.Second
 
-var credentialRE = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/\s]+@`)
+var credentialRE = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/\s"'<>{}|\\]+@`)
 
 func Redact(b []byte) []byte {
 	return credentialRE.ReplaceAll(b, []byte("${1}***@"))

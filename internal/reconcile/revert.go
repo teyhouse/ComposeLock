@@ -31,7 +31,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 
 	targetStacks, err := stacksAllowingEmpty(deps)
 	if err != nil {
-		return revertFailed(ctx, deps, st, failedCommit, target, nil, fmt.Errorf("discovering compose stacks at rollback target: %w", err), start)
+		return revertFailed(ctx, deps, st, failedCommit, target, stacks, fmt.Errorf("discovering compose stacks at rollback target: %w", err), start)
 	}
 	revertStacks := intersectByProjectName(targetStacks, stacks)
 
@@ -126,7 +126,9 @@ func revertInterrupted(ctx context.Context, deps Deps, st *state.State, failedCo
 	next := *st
 	next.PendingRevert = true
 	next.PendingCommit = failedCommit
-	next.PendingStacks = stackNames(stacks)
+	if names := stackNames(stacks); len(names) > 0 {
+		next.PendingStacks = names
+	}
 	if next.PendingSince.IsZero() {
 		next.PendingSince = now
 	}

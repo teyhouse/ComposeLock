@@ -239,10 +239,9 @@ func reportStacks(cfg *config.Config, names []string) []string {
 	return names
 }
 
-func filterChanged(ctx context.Context, deps Deps, stacks, previous []compose.Stack, changedFiles []string) []compose.Stack {
+func filterChanged(ctx context.Context, deps Deps, stacks, previous []compose.Stack, changedFiles []string) (changed []compose.Stack, undetermined bool) {
 	repoPath := deps.Config.RepoPath
 	touched := touchedStackDirs(repoPath, append(slices.Clone(stacks), previous...), changedFiles)
-	var changed []compose.Stack
 	for _, s := range stacks {
 		if s.Dir == "" {
 			changed = append(changed, s)
@@ -252,23 +251,33 @@ func filterChanged(ctx context.Context, deps Deps, stacks, previous []compose.St
 			changed = append(changed, s)
 			continue
 		}
-		if stackInputsMatch(ctx, deps, s, changedFiles) {
+		match, determined := stackInputsMatch(ctx, deps, s, changedFiles)
+		if !determined {
+			undetermined = true
+			continue
+		}
+		if match {
 			deps.Log.Info("a changed file outside compose_dir is an input of this stack", "project", s.ProjectName)
 			changed = append(changed, s)
 		}
 	}
-	return changed
+	return changed, undetermined
 }
 
-func stackInputsMatch(ctx context.Context, deps Deps, s compose.Stack, changedFiles []string) bool {
+func stackInputsMatch(ctx context.Context, deps Deps, s compose.Stack, changedFiles []string) (match, determined bool) {
 	project, err := deps.Compose.LoadProject(ctx, s.Files, s.ProjectName)
 	if err != nil {
 		deps.Log.Warn("loading a compose project to attribute a change failed, leaving the stack out of this cycle",
 			"project", s.ProjectName, "err", err)
-		return false
+		return false, false
 	}
-	inputs, _ := compose.ProjectInputs(project)
-	return dependencyChanged(deps.Config.RepoPath, inputs, changedFiles)
+	inputs, complete := compose.ProjectInputs(project)
+	if !complete {
+		deps.Log.Info("compose project has inputs that cannot be resolved without applying it, treating the stack as changed",
+			"project", s.ProjectName, "inputs", inputs)
+		return true, true
+	}
+	return dependencyChanged(deps.Config.RepoPath, inputs, changedFiles), true
 }
 
 func touchedStackDirs(repoPath string, stacks []compose.Stack, changedFiles []string) map[string]struct{} {

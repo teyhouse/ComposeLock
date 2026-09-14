@@ -33,6 +33,10 @@ func TestRedactStripsURLCredentials(t *testing.T) {
 			"see https://github.com/x/y/issues/1@2 for details",
 			"see https://github.com/x/y/issues/1@2 for details",
 		},
+		{
+			"fatal: unable to access 'https://example.com',mail 'foo@bar.com'",
+			"fatal: unable to access 'https://example.com',mail 'foo@bar.com'",
+		},
 	}
 	for _, tt := range tests {
 		if got := RedactString(tt.in); got != tt.want {

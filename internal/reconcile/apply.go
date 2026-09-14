@@ -201,11 +201,12 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	vanished := vanishedStacks(previousStacks, stacks)
 
 	changedStacks := stacks
+	undetermined := false
 	switch {
 	case st.LastHealthyCommit == "":
 		deps.Log.Info("no healthy deployment recorded yet, applying every stack", "commit", commit)
 	case result.ChangedFiles != nil:
-		changedStacks = filterChanged(ctx, deps, stacks, previousStacks, result.ChangedFiles)
+		changedStacks, undetermined = filterChanged(ctx, deps, stacks, previousStacks, result.ChangedFiles)
 	case len(pendingStacks) > 0:
 		changedStacks = restrictToNames(stacks, pendingStacks)
 	}
@@ -214,8 +215,15 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 			result.Err = err
 			return result
 		}
-		deps.Log.Info("no compose stack changed, nothing to apply", "commit", commit)
 		result.Skipped = true
+		if undetermined {
+			deps.Log.Warn("a stack could not be weighed against this commit, advancing the checkout without promoting it", "commit", commit)
+			if err := recordCheckout(deps, st, commit); err != nil {
+				result.Err = err
+			}
+			return result
+		}
+		deps.Log.Info("no compose stack changed, nothing to apply", "commit", commit)
 		if err := promoteHealthy(deps, st, commit, stackNames(stacks)); err != nil {
 			result.Err = err
 		}
