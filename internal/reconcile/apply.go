@@ -205,7 +205,7 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 	case st.LastHealthyCommit == "":
 		deps.Log.Info("no healthy deployment recorded yet, applying every stack", "commit", commit)
 	case result.ChangedFiles != nil:
-		changedStacks = filterChanged(cfg.RepoPath, stacks, previousStacks, result.ChangedFiles)
+		changedStacks = filterChanged(ctx, deps, stacks, previousStacks, result.ChangedFiles)
 	case len(pendingStacks) > 0:
 		changedStacks = restrictToNames(stacks, pendingStacks)
 	}
@@ -395,7 +395,7 @@ func restoreCheckout(ctx context.Context, deps Deps, commit string) error {
 func relevantChange(ctx context.Context, deps Deps, changedFiles []string) bool {
 	cfg := deps.Config
 	if cfg.ComposeDir != "" {
-		return composeDirRelevant(cfg.RepoPath, cfg.ComposeDir, changedFiles)
+		return composeDirRelevant(cfg.RepoPath, cfg.ComposeDir, changedFiles) || composeDirInputsRelevant(ctx, deps, changedFiles)
 	}
 	return composeFileRelevant(ctx, deps, changedFiles)
 }
@@ -405,18 +405,36 @@ func composeFileRelevant(ctx context.Context, deps Deps, changedFiles []string) 
 	if composeFileChanged(cfg.RepoPath, cfg.ComposeFile, changedFiles) {
 		return true
 	}
-	project, err := deps.Compose.LoadProject(ctx, []string{resolveUnderRepo(cfg.RepoPath, cfg.ComposeFile)}, cfg.ProjectName)
+	return projectInputsRelevant(ctx, deps, []string{resolveUnderRepo(cfg.RepoPath, cfg.ComposeFile)}, cfg.ProjectName, changedFiles)
+}
+
+func composeDirInputsRelevant(ctx context.Context, deps Deps, changedFiles []string) bool {
+	stacks, err := stacksAllowingEmpty(deps)
 	if err != nil {
-		deps.Log.Warn("loading the compose project to weigh a change failed, treating the commit as relevant", "err", err)
+		deps.Log.Warn("discovering compose stacks to weigh a change failed, treating the commit as relevant", "err", err)
+		return true
+	}
+	for _, s := range stacks {
+		if projectInputsRelevant(ctx, deps, s.Files, s.ProjectName, changedFiles) {
+			return true
+		}
+	}
+	return false
+}
+
+func projectInputsRelevant(ctx context.Context, deps Deps, files []string, projectName string, changedFiles []string) bool {
+	project, err := deps.Compose.LoadProject(ctx, files, projectName)
+	if err != nil {
+		deps.Log.Warn("loading the compose project to weigh a change failed, treating the commit as relevant", "project", projectName, "err", err)
 		return true
 	}
 	inputs, complete := compose.ProjectInputs(project)
 	if !complete {
-		deps.Log.Info("compose project has inputs that cannot be resolved without applying it, treating the commit as relevant", "inputs", inputs)
+		deps.Log.Info("compose project has inputs that cannot be resolved without applying it, treating the commit as relevant", "project", projectName, "inputs", inputs)
 		return true
 	}
-	deps.Log.Debug("weighing changed files against the project's inputs", "inputs", inputs)
-	return dependencyChanged(cfg.RepoPath, inputs, changedFiles)
+	deps.Log.Debug("weighing changed files against the project's inputs", "project", projectName, "inputs", inputs)
+	return dependencyChanged(deps.Config.RepoPath, inputs, changedFiles)
 }
 
 func dependencyChanged(repoPath string, inputs []string, changedFiles []string) bool {

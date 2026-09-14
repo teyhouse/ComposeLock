@@ -25,6 +25,14 @@ func TestRedactStripsURLCredentials(t *testing.T) {
 			"fatal: repository 'https://github.com/x/y.git' not found",
 			"fatal: repository 'https://github.com/x/y.git' not found",
 		},
+		{
+			"fatal: could not read from https://teyhouse:p@ssw@rd@github.com/x/y.git",
+			"fatal: could not read from https://***@github.com/x/y.git",
+		},
+		{
+			"see https://github.com/x/y/issues/1@2 for details",
+			"see https://github.com/x/y/issues/1@2 for details",
+		},
 	}
 	for _, tt := range tests {
 		if got := RedactString(tt.in); got != tt.want {

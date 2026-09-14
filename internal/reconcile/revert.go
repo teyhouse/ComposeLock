@@ -60,7 +60,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 
 	watchResult, _, err := watchStacks(ctx, deps, revertStacks, projects, target)
 	if err != nil {
-		return revertInterrupted(ctx, deps, st, failedCommit, target, revertStacks, err, start)
+		return revertInterrupted(ctx, deps, st, failedCommit, target, revertStacks, fmt.Errorf("health watch during revert: %w", err), start)
 	}
 	watchDuration := time.Duration(cfg.HealthWatchSeconds) * time.Second
 
@@ -120,8 +120,7 @@ func reportedCommit(failedCommit, target string) string {
 	return failedCommit
 }
 
-func revertInterrupted(ctx context.Context, deps Deps, st *state.State, failedCommit, target string, stacks []compose.Stack, watchErr error, start time.Time) Result {
-	err := fmt.Errorf("health watch during revert: %w", watchErr)
+func revertInterrupted(ctx context.Context, deps Deps, st *state.State, failedCommit, target string, stacks []compose.Stack, err error, start time.Time) Result {
 	now := deps.Clock.Now()
 
 	next := *st
@@ -148,7 +147,7 @@ func revertInterrupted(ctx context.Context, deps Deps, st *state.State, failedCo
 		deps.Log.Warn("revert interrupted by shutdown, will resume on the next run", "target", target, "err", err)
 		return Result{RolledBackTo: target, Err: err}
 	}
-	deps.Log.Error("revert health watch failed, will resume on the next run", "target", target, "err", err)
+	deps.Log.Error("revert did not finish, will resume on the next run", "target", target, "err", err)
 	embed := notify.BuildEmbed(notify.Report{
 		Outcome:  notify.OutcomeFailure,
 		Title:    "ComposeLock: revert interrupted, will resume",
@@ -167,9 +166,8 @@ func revertInterrupted(ctx context.Context, deps Deps, st *state.State, failedCo
 }
 
 func revertFailed(ctx context.Context, deps Deps, st *state.State, failedCommit, target string, stacks []compose.Stack, err error, start time.Time) Result {
-	if ctx.Err() != nil {
-		deps.Log.Warn("revert interrupted", "err", err)
-		return Result{RolledBackTo: target, Err: fmt.Errorf("revert interrupted: %w", err)}
+	if ctx.Err() != nil || compose.IsInfraError(err) {
+		return revertInterrupted(ctx, deps, st, failedCommit, target, stacks, err, start)
 	}
 	return degrade(deps, st, failedCommit, target, stackNames(stacks), err, start)
 }

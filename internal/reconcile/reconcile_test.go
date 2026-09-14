@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -65,16 +66,17 @@ type loadCall struct {
 }
 
 type fakeCompose struct {
-	mu        sync.Mutex
-	loadErr   error
-	downErr   error
-	upErrs    []error
-	onUp      func(call int)
-	onDown    func(projectName string)
-	project   *ctypes.Project
-	upCalls   int
-	loadCalls []loadCall
-	downCalls []string
+	mu         sync.Mutex
+	loadErr    error
+	downErr    error
+	upErrs     []error
+	onUp       func(call int)
+	onDown     func(projectName string)
+	project    *ctypes.Project
+	upCalls    int
+	upProjects []string
+	loadCalls  []loadCall
+	downCalls  []string
 }
 
 func (f *fakeCompose) LoadProject(_ context.Context, files []string, projectName string) (*ctypes.Project, error) {
@@ -88,8 +90,11 @@ func (f *fakeCompose) LoadProject(_ context.Context, files []string, projectName
 	return &ctypes.Project{Name: projectName, Services: ctypes.Services{"web": ctypes.ServiceConfig{Name: "web"}}}, nil
 }
 
-func (f *fakeCompose) Up(ctx context.Context, _ *ctypes.Project) error {
+func (f *fakeCompose) Up(ctx context.Context, project *ctypes.Project) error {
 	f.upCalls++
+	if project != nil {
+		f.upProjects = append(f.upProjects, project.Name)
+	}
 	if f.onUp != nil {
 		f.onUp(f.upCalls)
 	}
@@ -948,8 +953,11 @@ func TestReconcileDirModePartialChangeOnlyAppliesChangedStack(t *testing.T) {
 	if compose.upCalls != 1 {
 		t.Errorf("Up called %d times, want 1 (root stack must not be touched)", compose.upCalls)
 	}
-	if len(compose.loadCalls) != 1 || compose.loadCalls[0].projectName != "test-stack-db" {
-		t.Errorf("loadCalls = %+v, want exactly one call for test-stack-db", compose.loadCalls)
+	if !equalStringSlices(compose.upProjects, []string{"test-stack-db"}) {
+		t.Errorf("upProjects = %v, want only test-stack-db applied", compose.upProjects)
+	}
+	if !equalStringSlices(result.Stacks, []string{"test-stack-db"}) {
+		t.Errorf("Stacks = %v, want only test-stack-db in the cycle", result.Stacks)
 	}
 }
 
@@ -974,10 +982,9 @@ func TestReconcileDirModeOneStackFailureRevertsOnlyThatCycle(t *testing.T) {
 	if !result.Reverted {
 		t.Fatalf("expected Reverted = true, result = %+v", result)
 	}
-	for _, call := range compose.loadCalls {
-		if call.projectName == "test-stack-c" {
-			t.Fatalf("test-stack-c must never be touched, loadCalls = %+v", compose.loadCalls)
-		}
+	if slices.Contains(compose.upProjects, "test-stack-c") || slices.Contains(compose.downCalls, "test-stack-c") {
+		t.Fatalf("test-stack-c must never be applied or torn down by another stack's failure, up = %v down = %v",
+			compose.upProjects, compose.downCalls)
 	}
 	if compose.upCalls != 2 {
 		t.Errorf("Up called %d times, want 2 (failed apply + revert apply of test-stack only)", compose.upCalls)

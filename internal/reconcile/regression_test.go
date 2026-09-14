@@ -829,3 +829,99 @@ func TestRecoveryBudgetMeasuresFromWhenTheCommitWentPending(t *testing.T) {
 		t.Fatalf("expected DEGRADED once the commit had been pending for longer than %s, result = %+v", budget, result)
 	}
 }
+
+func TestReconcileDirModeAppliesAChangeToAnInputOutsideComposeDir(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	stackDir := filepath.Join(composeDir, "db")
+	writeComposeFile(t, filepath.Join(stackDir, "docker-compose.yaml"), "include:\n  - ../../shared/base.yaml\n"+validComposeYAML)
+	writeComposeFile(t, filepath.Join(repoPath, "shared", "base.yaml"), validComposeYAML)
+
+	compose := &fakeCompose{project: &ctypes.Project{
+		Name:         "test-stack-db",
+		WorkingDir:   stackDir,
+		ComposeFiles: []string{filepath.Join(stackDir, "docker-compose.yaml")},
+		Services:     ctypes.Services{"web": ctypes.ServiceConfig{Name: "web"}},
+	}}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "shared/base.yaml"
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("expected an include fragment outside compose_dir to count as a change, result = %+v", result)
+	}
+	if compose.upCalls != 1 {
+		t.Errorf("Up called %d times, want 1", compose.upCalls)
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}
+
+func TestReconcileDirModeStillSkipsACommitNoStackDependsOn(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	writeComposeFile(t, filepath.Join(composeDir, "db", "docker-compose.yaml"), validComposeYAML)
+
+	compose := &fakeCompose{project: &ctypes.Project{
+		Name:         "test-stack-db",
+		WorkingDir:   filepath.Join(composeDir, "db"),
+		ComposeFiles: []string{filepath.Join(composeDir, "db", "docker-compose.yaml")},
+		Services:     ctypes.Services{"web": ctypes.ServiceConfig{Name: "web"}},
+	}}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "docs/README.md"
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if result.Applied || compose.upCalls != 0 {
+		t.Fatalf("a commit touching nothing any stack depends on must still advance the checkout without applying, result = %+v", result)
+	}
+	if store.State.LastCheckoutCommit != "bbb222" {
+		t.Errorf("LastCheckoutCommit = %q, want the checkout to advance to %q", store.State.LastCheckoutCommit, "bbb222")
+	}
+}
+
+func TestRevertInfraErrorResumesInsteadOfDegrading(t *testing.T) {
+	compose := &fakeCompose{upErrs: []error{nil, fmt.Errorf("compose up: %w", syscall.ECONNREFUSED)}}
+	snap := snapshots(healthySnapshot(), healthySnapshot(), unhealthySnapshot(), healthySnapshot())
+	deps, store := testDeps(t, gitChange("aaa111", "bbb222"), compose, snap, withHealthy("aaa111"))
+
+	first := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if first.Degraded {
+		t.Fatalf("a Docker blip during the revert must not need --force, result = %+v", first)
+	}
+	if !store.State.PendingRevert {
+		t.Fatalf("expected the interrupted revert to be recorded for the next run, state = %+v", store.State)
+	}
+
+	second := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !second.Reverted {
+		t.Fatalf("expected the next run to resume the revert, result = %+v", second)
+	}
+	if store.State.PendingRevert || store.State.LastResult != state.ResultReverted {
+		t.Errorf("state = %+v, want the revert finished and cleared", store.State)
+	}
+}
+
+func TestCancelledPreflightRevertIsRecordedForResume(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	snap := &toggleSnapshotter{unhealthy: true}
+	g := gitChange("aaa111", "bbb222")
+	g.onCheckout = func(string) { cancel() }
+	deps, store := testDeps(t, g, &fakeCompose{}, snap, withHealthy("aaa111"))
+
+	Reconcile(ctx, Options{Trigger: "poll"}, deps)
+
+	if !store.State.PendingRevert {
+		t.Fatalf("a pre-flight revert cancelled by a shutdown must be recorded, state = %+v", store.State)
+	}
+	if !store.State.Pending() {
+		t.Error("Pending() = false, so the next run would take the normal path instead of resuming the revert")
+	}
+}
