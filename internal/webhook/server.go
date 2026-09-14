@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	maxBodyBytes  = 1 << 20
-	drainTimeout  = 30 * time.Second
-	refHeadPrefix = "refs/heads/"
+	maxBodyBytes     = 1 << 20
+	drainLogInterval = 30 * time.Second
+	refHeadPrefix    = "refs/heads/"
 )
 
 type ReconcileFunc func(ctx context.Context)
@@ -78,7 +78,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	var wg sync.WaitGroup
 	defer func() {
 		stopWorker()
-		s.waitBounded(&wg)
+		s.drain(&wg)
 	}()
 	wg.Go(func() { s.processTriggers(workerCtx) })
 
@@ -95,18 +95,23 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}
 }
 
-func (s *Server) waitBounded(wg *sync.WaitGroup) {
+func (s *Server) drain(wg *sync.WaitGroup) {
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
-	timer := time.NewTimer(drainTimeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-	case <-timer.C:
-		s.log.Error("webhook: reconcile did not stop in time, exiting anyway", "timeout", drainTimeout.String())
+	ticker := time.NewTicker(drainLogInterval)
+	defer ticker.Stop()
+	start := time.Now()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			s.log.Warn("webhook: still waiting for the in-flight reconcile before exiting",
+				"waited", time.Since(start).Round(time.Second).String())
+		}
 	}
 }
 

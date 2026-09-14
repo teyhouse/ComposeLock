@@ -535,3 +535,20 @@ func TestWatchScalingUpKeepsTheBaselineContainers(t *testing.T) {
 		t.Errorf("Outcome = %v (%s), want healthy: an extra replica alongside the baseline is not a replacement", res.Outcome, res.Reason)
 	}
 }
+
+func TestWatchIgnoresAStaleUnhealthyProbeOnACompletedContainer(t *testing.T) {
+	completed := ContainerStatus{ID: "c1", Service: "migrate", State: StateExited, ExitCode: 0, Health: HealthUnhealthy}
+	web := ContainerStatus{ID: "c2", Service: "web", State: StateRunning, Health: HealthHealthy}
+	snap := &fakeSnapshotter{snapshots: []Snapshot{{Containers: []ContainerStatus{completed, web}}}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Healthy {
+		t.Errorf("Outcome = %v (%s), want healthy: Evaluate exempts a one-shot that exited 0, and the watch must agree", res.Outcome, res.Reason)
+	}
+	if healthy, reason := Evaluate(Snapshot{Containers: []ContainerStatus{completed, web}}); !healthy {
+		t.Errorf("Evaluate() = false (%s), want the same verdict as the watch", reason)
+	}
+}

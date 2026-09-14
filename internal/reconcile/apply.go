@@ -76,22 +76,13 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 
 	previousStacks, err := previousStacksAt(deps)
 	if err != nil {
-		deps.Log.Error("discovering compose stacks at the current checkout", "err", err)
-		result.Err = fmt.Errorf("discovering compose stacks: %w", err)
 		if ctx.Err() != nil {
+			result.Err = fmt.Errorf("discovering compose stacks: %w", err)
 			return result
 		}
-		recordOutcome(deps, st, state.ResultFailedPreflight, gitResult.NewCommit)
-		embed := notify.BuildEmbed(notify.Report{
-			Outcome: notify.OutcomeFailure,
-			Title:   "ComposeLock: pre-flight check failed",
-			Commit:  gitResult.NewCommit,
-			Branch:  cfg.Branch,
-			Err:     result.Err,
-		})
-		result.Notification = &embed
-		result.NotificationKey = "preflight:" + gitResult.NewCommit
-		return result
+		deps.Log.Warn("discovering compose stacks at the current checkout failed, continuing with the last healthy stack set so a repairing commit can still be checked out",
+			"commit", gitResult.OldCommit, "err", err)
+		previousStacks = deployedStacks(st, nil)
 	}
 
 	live, err := evaluateLive(ctx, deps, previousStacks)

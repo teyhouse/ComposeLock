@@ -644,3 +644,58 @@ func TestReconcileSingleFileUnresolvableIncludeIsTreatedAsRelevant(t *testing.T)
 		t.Fatalf("an input set that cannot be enumerated must fall back to applying, result = %+v", result)
 	}
 }
+
+func TestReconcileMissingComposeDirNeverRecordsAHealthyDeploy(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "absent")
+
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "absent/db/docker-compose.yaml"
+	compose := &fakeCompose{}
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if result.Err == nil {
+		t.Fatalf("a compose_dir that does not exist must fail loudly, result = %+v", result)
+	}
+	if compose.upCalls != 0 {
+		t.Errorf("Up called %d times, want 0", compose.upCalls)
+	}
+	if store.State.LastHealthyCommit != "aaa111" {
+		t.Errorf("LastHealthyCommit = %q, want the deploy of nothing not to be promoted to %q", store.State.LastHealthyCommit, "bbb222")
+	}
+	if store.State.LastResult == state.ResultSuccess {
+		t.Errorf("LastResult = %q, want a failure", store.State.LastResult)
+	}
+}
+
+func TestReconcileBrokenCurrentCheckoutStillAcceptsTheRepairingCommit(t *testing.T) {
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	stackFile := filepath.Join(composeDir, "db", "docker-compose.yaml")
+	writeComposeFile(t, stackFile, invalidComposeYAML)
+
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "deployment/db/docker-compose.yaml"
+	g.onCheckout = func(commit string) {
+		if commit == "bbb222" {
+			writeComposeFile(t, stackFile, validComposeYAML)
+		}
+	}
+
+	compose := &fakeCompose{}
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), repoPath, composeDir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("a commit repairing an invalid compose file must still be checked out, result = %+v", result)
+	}
+	if compose.upCalls != 1 {
+		t.Errorf("Up called %d times, want 1", compose.upCalls)
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}

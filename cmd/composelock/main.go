@@ -28,17 +28,26 @@ func printVersion() {
 	fmt.Printf("composelock %s (commit %s, built %s)\n", version, commit, date)
 }
 
-func splitCommand(args []string) (string, []string) {
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		return args[0], args[1:]
+func parseArgs(f *cliFlags, args []string) (string, error) {
+	command, rest := "", args
+	for {
+		if err := f.fs.Parse(rest); err != nil {
+			return "", err
+		}
+		if f.fs.NArg() == 0 {
+			return command, nil
+		}
+		if command == "" {
+			command = f.fs.Arg(0)
+		}
+		rest = f.fs.Args()[1:]
 	}
-	return "", args
 }
 
 func run(args []string) int {
 	f := newCLIFlags()
-	command, rest := splitCommand(args)
-	if err := f.fs.Parse(rest); err != nil {
+	command, err := parseArgs(f, args)
+	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -51,12 +60,9 @@ func run(args []string) int {
 	}
 
 	if command == "" {
-		switch {
-		case f.fs.NArg() > 0:
-			command = f.fs.Arg(0)
-		case f.initFlag:
+		if f.initFlag {
 			command = "init"
-		default:
+		} else {
 			command = "sync"
 		}
 	}

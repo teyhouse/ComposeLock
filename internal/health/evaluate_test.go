@@ -103,3 +103,13 @@ func TestChangedServicesHandlesScaledServices(t *testing.T) {
 		t.Errorf("ChangedServices() = %v, want none: the same two containers in another order", got)
 	}
 }
+
+func TestEvaluatePreflightToleratesRestarting(t *testing.T) {
+	snap := Snapshot{Containers: []ContainerStatus{
+		{ID: "c1", Service: "web", State: StateRestarting, RestartCount: 1},
+	}}
+
+	if healthy, reason := EvaluatePreflight(snap); !healthy {
+		t.Errorf("EvaluatePreflight() = false (%s), want the gate to agree with the watch, which accepts a restart within tolerance", reason)
+	}
+}

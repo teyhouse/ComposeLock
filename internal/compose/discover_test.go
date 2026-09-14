@@ -2,6 +2,7 @@ package compose
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -361,10 +362,22 @@ func TestDiscoverSkipsDanglingSymlink(t *testing.T) {
 	}
 }
 
-func TestDiscoverMissingDirReportsErrNoStacks(t *testing.T) {
+func TestDiscoverMissingDirIsNotAnEmptyComposeDir(t *testing.T) {
 	_, err := Discover(filepath.Join(t.TempDir(), "absent"), "myproject", nil)
-	if !errors.Is(err, ErrNoStacks) {
-		t.Fatalf("err = %v, want it to wrap ErrNoStacks", err)
+	if err == nil {
+		t.Fatal("Discover() = nil, want a missing compose_dir to fail")
+	}
+	if errors.Is(err, ErrNoStacks) {
+		t.Errorf("err = %v, want a missing compose_dir to stay distinguishable from an empty one", err)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("err = %v, want it to wrap fs.ErrNotExist", err)
+	}
+}
+
+func TestDiscoverEmptyDirStillReportsErrNoStacks(t *testing.T) {
+	if _, err := Discover(t.TempDir(), "myproject", nil); !errors.Is(err, ErrNoStacks) {
+		t.Fatalf("err = %v, want an existing but empty compose_dir to wrap ErrNoStacks", err)
 	}
 }
 

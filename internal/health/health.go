@@ -187,6 +187,9 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 				result.Outcome = Unhealthy
 				return result, nil
 			}
+			if c.Completed() {
+				continue
+			}
 			if c.State == StateCreated || c.State == StatePaused {
 				anyWedged = true
 			}
@@ -321,7 +324,7 @@ func Evaluate(snap Snapshot) (healthy bool, reason string) {
 }
 
 func EvaluatePreflight(snap Snapshot) (healthy bool, reason string) {
-	return evaluate(snap, true, false)
+	return evaluate(snap, true, true)
 }
 
 func evaluate(snap Snapshot, tolerateStarting, tolerateRestarting bool) (healthy bool, reason string) {

@@ -147,9 +147,12 @@ func (w *inputWalker) walkInclude(paths []string, projectDir string, envFiles []
 	}
 
 	for _, f := range envFiles {
-		if abs, ok := resolveInput(baseDir, f); ok {
-			w.paths = append(w.paths, abs)
+		abs, ok := resolveInput(baseDir, f)
+		if !ok {
+			w.complete = false
+			continue
 		}
+		w.paths = append(w.paths, abs)
 	}
 	if len(envFiles) == 0 && includeDir != "" {
 		if abs, ok := resolveInput(includeDir, ".env"); ok {

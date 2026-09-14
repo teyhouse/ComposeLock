@@ -157,3 +157,19 @@ func TestIsInfraError(t *testing.T) {
 		})
 	}
 }
+
+func TestProjectInputsReportsIncompleteForAnInterpolatedIncludeEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "docker-compose.yml"), "include:\n  - path: a/compose.yaml\n    env_file: ${CFG_DIR}/app.env\n")
+	write(t, filepath.Join(dir, "a", "compose.yaml"), "services:\n  web:\n    image: nginx\n")
+
+	project := &types.Project{
+		WorkingDir:   dir,
+		ComposeFiles: []string{filepath.Join(dir, "docker-compose.yml")},
+	}
+
+	got, complete := ProjectInputs(project)
+	if complete {
+		t.Errorf("ProjectInputs = %q, complete = true, want an env_file that needs interpolation to make the set incomplete", got)
+	}
+}

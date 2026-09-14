@@ -37,15 +37,6 @@ func IsComposeFile(name string) bool {
 	}
 }
 
-func IsHiddenPath(rel string) bool {
-	for _, seg := range strings.FieldsFunc(rel, func(r rune) bool { return r == '/' || r == filepath.Separator }) {
-		if isHidden(seg) {
-			return true
-		}
-	}
-	return false
-}
-
 var composeTopLevelKeys = map[string]bool{
 	"configs":  true,
 	"include":  true,
@@ -157,7 +148,7 @@ func discover(composeDir, baseProjectName string, log *slog.Logger) ([]Stack, er
 	entries, err := os.ReadDir(composeDir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("reading compose_dir %s: %w: %w", composeDir, ErrNoStacks, err)
+			return nil, fmt.Errorf("compose_dir %s does not exist: %w", composeDir, err)
 		}
 		return nil, fmt.Errorf("reading compose_dir %s: %w", composeDir, err)
 	}
