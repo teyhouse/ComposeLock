@@ -37,7 +37,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 	revertStacks := intersectByProjectName(targetStacks, stacks)
 
 	if err := tearDownStacks(ctx, deps, vanishedStacks(stacks, targetStacks), "stack does not exist at rollback target"); err != nil {
-		return revertFailed(ctx, deps, st, failedCommit, target, revertStacks, err, start)
+		return revertFailed(ctx, deps, st, failedCommit, target, stacks, err, start)
 	}
 
 	var allServices []string

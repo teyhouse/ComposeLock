@@ -523,5 +523,12 @@ func resolveUnderRepo(repoPath, p string) string {
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(repoPath, p)
 	}
-	return filepath.Clean(p)
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	return abs
 }

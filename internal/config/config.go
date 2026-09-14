@@ -142,6 +142,9 @@ func Load(path string, overrides Overrides, logger *slog.Logger) (*Config, error
 		return nil, err
 	}
 	cfg.StateFile = canonicalPath(cfg.StateFile)
+	if cfg.RepoPath != "" {
+		cfg.RepoPath = absPath(cfg.RepoPath)
+	}
 
 	composeFileExplicit := rawFieldString(raw, "compose_file") != "" || overrides.ComposeFile != nil
 	if cfg.ComposeDir != "" && composeFileExplicit {
@@ -171,6 +174,14 @@ func warnUnknownFields(raw map[string]json.RawMessage, t reflect.Type, prefix st
 		}
 		warnUnknownFields(nested, field, prefix+key+".", logger)
 	}
+}
+
+func absPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return abs
 }
 
 func canonicalPath(path string) string {

@@ -52,6 +52,50 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadAbsolutisesRepoPath(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, []byte(`{
+		"repo_path": ".",
+		"compose_file": "./docker-compose.yml",
+		"project_name": "my-stack"
+	}`))
+
+	cfg, err := Load(path, Overrides{}, testLogger(&bytes.Buffer{}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if !filepath.IsAbs(cfg.RepoPath) {
+		t.Fatalf("RepoPath = %q, want an absolute path: the reconciler compares paths built from it against the absolute paths compose reports for a project's inputs", cfg.RepoPath)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RepoPath != wd {
+		t.Errorf("RepoPath = %q, want %q", cfg.RepoPath, wd)
+	}
+}
+
+func TestLoadAbsolutisesRepoPathFromAFlag(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, []byte(`{
+		"repo_path": "/srv/ignored",
+		"compose_file": "./docker-compose.yml",
+		"project_name": "my-stack"
+	}`))
+
+	repo := "./sub"
+	cfg, err := Load(path, Overrides{RepoPath: &repo}, testLogger(&bytes.Buffer{}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if !filepath.IsAbs(cfg.RepoPath) {
+		t.Errorf("RepoPath = %q, want a relative --repo to be absolutised too", cfg.RepoPath)
+	}
+}
+
 func TestLoadUnknownFieldWarns(t *testing.T) {
 	dir := t.TempDir()
 	path := writeConfig(t, dir, []byte(`{

@@ -211,15 +211,17 @@ func restrictToNames(stacks []compose.Stack, names []string) []compose.Stack {
 	if len(names) == 0 {
 		return stacks
 	}
-	wanted := make(map[string]struct{}, len(names))
-	for _, n := range names {
-		wanted[n] = struct{}{}
-	}
-	var out []compose.Stack
+	found := make(map[string]compose.Stack, len(stacks))
 	for _, s := range stacks {
-		if _, ok := wanted[s.ProjectName]; ok {
+		found[s.ProjectName] = s
+	}
+	out := make([]compose.Stack, 0, len(names))
+	for _, n := range names {
+		if s, ok := found[n]; ok {
 			out = append(out, s)
+			continue
 		}
+		out = append(out, compose.Stack{ProjectName: n})
 	}
 	return out
 }

@@ -1142,3 +1142,169 @@ func TestForcedRetryKeepsTheKnownBadMarkerUntilItSucceeds(t *testing.T) {
 		t.Errorf("a forced retry interrupted before the commit was proved healthy must keep the known-bad marker, state = %+v", store.State)
 	}
 }
+
+func relativeRepoDeps(t *testing.T, g *fakeGit, compose *fakeCompose, snap health.Snapshotter, st *state.State, dir string) (Deps, *state.MemStore) {
+	t.Helper()
+	deps, store := singleFileDeps(t, g, compose, snap, st, dir)
+	t.Chdir(dir)
+	deps.Config.RepoPath = "."
+	deps.Config.ComposeFile = "./docker-compose.yml"
+	deps.Git.RepoPath = "."
+	return deps, store
+}
+
+func TestRelativeRepoPathAppliesAnEnvFileChange(t *testing.T) {
+	dir := t.TempDir()
+	compose := &fakeCompose{project: singleFileProject(t, dir)}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "app.env"
+	deps, store := relativeRepoDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("a relative repo_path must still weigh a changed env_file against the absolute paths compose reports, result = %+v", result)
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}
+
+func TestRelativeRepoPathAppliesADockerfileChange(t *testing.T) {
+	dir := t.TempDir()
+	compose := &fakeCompose{project: singleFileProject(t, dir)}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "app/Dockerfile"
+	deps, _ := relativeRepoDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
+
+	if result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); !result.Applied {
+		t.Fatalf("a relative repo_path must still weigh a changed Dockerfile, result = %+v", result)
+	}
+}
+
+func TestRelativeRepoPathStillSkipsAnUnrelatedChange(t *testing.T) {
+	dir := t.TempDir()
+	compose := &fakeCompose{project: singleFileProject(t, dir)}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "docs/README.md"
+	deps, store := relativeRepoDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), dir)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if result.Applied || compose.upCalls != 0 {
+		t.Fatalf("absolutising a relative repo_path must not make every commit relevant, result = %+v", result)
+	}
+	if store.State.LastCheckoutCommit != "bbb222" {
+		t.Errorf("LastCheckoutCommit = %q, want the checkout to advance to %q", store.State.LastCheckoutCommit, "bbb222")
+	}
+}
+
+func TestRelativeRepoPathDirModeAppliesAnInputOutsideComposeDir(t *testing.T) {
+	repoPath := t.TempDir()
+	stackDir := filepath.Join(repoPath, "deployment", "db")
+	writeComposeFile(t, filepath.Join(stackDir, "docker-compose.yaml"), "include:\n  - ../../shared/base.yaml\n"+validComposeYAML)
+	writeComposeFile(t, filepath.Join(repoPath, "shared", "base.yaml"), validComposeYAML)
+
+	compose := &fakeCompose{project: &ctypes.Project{
+		Name:         "test-stack-db",
+		WorkingDir:   stackDir,
+		ComposeFiles: []string{filepath.Join(stackDir, "docker-compose.yaml")},
+		Services:     ctypes.Services{"web": ctypes.ServiceConfig{Name: "web"}},
+	}}
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = "shared/base.yaml"
+	t.Chdir(repoPath)
+	deps, store := testDirDeps(t, g, compose, snapshots(healthySnapshot()), withHealthy("aaa111"), ".", "deployment")
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Applied {
+		t.Fatalf("a relative repo_path must still attribute an include fragment outside compose_dir to its stack, result = %+v", result)
+	}
+	if store.State.LastHealthyCommit != "bbb222" {
+		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}
+
+func addedStackDirDeps(t *testing.T, compose *fakeCompose, snap health.Snapshotter, changed string) (Deps, *state.MemStore) {
+	t.Helper()
+	repoPath := t.TempDir()
+	composeDir := filepath.Join(repoPath, "deployment")
+	stackB := filepath.Join(composeDir, "b")
+	writeComposeFile(t, filepath.Join(composeDir, "a", "compose.yaml"), validComposeYAML)
+
+	g := gitChange("aaa111", "bbb222")
+	g.diffFiles = changed
+	g.onCheckout = func(commit string) {
+		if commit == "aaa111" {
+			if err := os.RemoveAll(stackB); err != nil {
+				t.Error(err)
+			}
+			return
+		}
+		writeComposeFile(t, filepath.Join(stackB, "compose.yaml"), validComposeYAML)
+	}
+
+	st := withHealthy("aaa111")
+	st.LastHealthyStacks = []string{"test-stack-a"}
+	return testDirDeps(t, g, compose, snap, st, repoPath, composeDir)
+}
+
+func TestInterruptedRevertTearsDownAStackTheRollbackTargetDoesNotHave(t *testing.T) {
+	compose := &fakeCompose{downErr: fmt.Errorf("compose down: %w", syscall.ECONNREFUSED)}
+	snap := &perProjectSnapshotter{}
+	snap.set("test-stack-a", snapshots(healthySnapshot()))
+	snap.set("test-stack-b", snapshots(unhealthySnapshot()))
+	deps, store := addedStackDirDeps(t, compose, snap, "deployment/b/compose.yaml")
+
+	if first := Reconcile(t.Context(), Options{Trigger: "poll"}, deps); first.Degraded {
+		t.Fatalf("a Docker blip during the teardown must not need --force, result = %+v", first)
+	}
+	if !store.State.PendingRevert {
+		t.Fatalf("expected the interrupted revert to be recorded for the next run, state = %+v", store.State)
+	}
+	if !equalStringSlices(store.State.PendingStacks, []string{"test-stack-b"}) {
+		t.Fatalf("PendingStacks = %v, want [test-stack-b]: the stack that only exists at the failed commit is the one still running",
+			store.State.PendingStacks)
+	}
+
+	compose.downErr = nil
+	downsBefore := len(compose.downCalls)
+
+	second := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !slices.Contains(compose.downCalls[downsBefore:], "test-stack-b") {
+		t.Fatalf("the resumed revert must tear down the orphaned stack before reporting success, down calls = %v, result = %+v",
+			compose.downCalls, second)
+	}
+	if store.State.PendingRevert {
+		t.Errorf("expected the resumed revert to clear the pending revert, state = %+v", store.State)
+	}
+}
+
+func TestInterruptedRevertKeepsAVanishedStackInPendingStacks(t *testing.T) {
+	compose := &fakeCompose{downErr: fmt.Errorf("compose down: %w", syscall.ECONNREFUSED)}
+	snap := &perProjectSnapshotter{}
+	snap.set("test-stack-a", snapshots(healthySnapshot()))
+	snap.set("test-stack-b", snapshots(unhealthySnapshot()))
+	deps, store := addedStackDirDeps(t, compose, snap, "deployment/a/compose.yaml\ndeployment/b/compose.yaml")
+
+	Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !slices.Contains(store.State.PendingStacks, "test-stack-b") {
+		t.Fatalf("PendingStacks = %v, want it to keep test-stack-b: a stack missing from the rollback target is not in the revert set, but it is still running",
+			store.State.PendingStacks)
+	}
+
+	compose.downErr = nil
+	downsBefore := len(compose.downCalls)
+
+	second := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !slices.Contains(compose.downCalls[downsBefore:], "test-stack-b") {
+		t.Fatalf("the resumed revert must still tear down the vanished stack, down calls = %v, result = %+v", compose.downCalls, second)
+	}
+	if !second.Reverted {
+		t.Errorf("expected the resumed revert to complete, result = %+v", second)
+	}
+}

@@ -47,3 +47,4 @@ fuzz.md
 /scripts/push.sh
 
 *.json.lock
+/bug_prompt
