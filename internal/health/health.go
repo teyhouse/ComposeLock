@@ -187,7 +187,7 @@ func Watch(ctx context.Context, snap Snapshotter, clock Clock, opts Options, log
 				result.Outcome = Unhealthy
 				return result, nil
 			}
-			if c.Completed() {
+			if c.Completed() || c.State == StateRestarting {
 				continue
 			}
 			if c.State == StateCreated || c.State == StatePaused {

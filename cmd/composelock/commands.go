@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/teyhouse/ComposeLock/internal/compose"
 	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/health"
 	"github.com/teyhouse/ComposeLock/internal/reconcile"
@@ -113,26 +114,20 @@ func cmdInit(f *cliFlags) int {
 func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps reconcile.Deps) int {
 	fmt.Println("config:", configPath)
 
-	if deps.Lock != nil {
-		held, err := deps.Lock.TryLock()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "acquiring state lock:", err)
-			return 2
+	var st *state.State
+	var stacks []compose.Stack
+	var loadErr, discoverErr error
+	if err := withStateLock(deps, func() {
+		if st, loadErr = deps.State.Load(); loadErr != nil {
+			return
 		}
-		if held {
-			defer func() {
-				if err := deps.Lock.Unlock(); err != nil {
-					deps.Log.Error("releasing state lock", "err", err)
-				}
-			}()
-		} else {
-			fmt.Println("note: a reconcile is in progress, state and containers may not agree")
-		}
+		stacks, discoverErr = reconcile.StacksFor(cfg, deps.Log)
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
 	}
-
-	st, err := deps.State.Load()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "reading state:", err)
+	if loadErr != nil {
+		fmt.Fprintln(os.Stderr, "reading state:", loadErr)
 		return 2
 	}
 	data, err := json.Marshal(st, jsontext.WithIndent("  "))
@@ -142,9 +137,8 @@ func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps 
 	}
 	fmt.Printf("state:\n%s\n", data)
 
-	stacks, err := reconcile.StacksFor(cfg, deps.Log)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "discovering compose stacks:", err)
+	if discoverErr != nil {
+		fmt.Fprintln(os.Stderr, "discovering compose stacks:", discoverErr)
 		return 1
 	}
 
@@ -155,6 +149,28 @@ func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps 
 		}
 	}
 	return code
+}
+
+func withStateLock(deps reconcile.Deps, fn func()) error {
+	if deps.Lock == nil {
+		fn()
+		return nil
+	}
+	held, err := deps.Lock.TryLock()
+	if err != nil {
+		return fmt.Errorf("acquiring state lock: %w", err)
+	}
+	if held {
+		defer func() {
+			if err := deps.Lock.Unlock(); err != nil {
+				deps.Log.Error("releasing state lock", "err", err)
+			}
+		}()
+	} else {
+		fmt.Println("note: a reconcile is in progress, state and containers may not agree")
+	}
+	fn()
+	return nil
 }
 
 func printStackContainers(ctx context.Context, deps reconcile.Deps, projectName string) int {

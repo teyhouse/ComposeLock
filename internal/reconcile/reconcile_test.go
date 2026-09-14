@@ -65,10 +65,12 @@ type loadCall struct {
 }
 
 type fakeCompose struct {
+	mu        sync.Mutex
 	loadErr   error
 	downErr   error
 	upErrs    []error
 	onUp      func(call int)
+	onDown    func(projectName string)
 	project   *ctypes.Project
 	upCalls   int
 	loadCalls []loadCall
@@ -101,7 +103,12 @@ func (f *fakeCompose) Up(ctx context.Context, _ *ctypes.Project) error {
 }
 
 func (f *fakeCompose) Down(_ context.Context, projectName string) error {
+	if f.onDown != nil {
+		f.onDown(projectName)
+	}
+	f.mu.Lock()
 	f.downCalls = append(f.downCalls, projectName)
+	f.mu.Unlock()
 	return f.downErr
 }
 

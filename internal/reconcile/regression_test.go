@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	ctypes "github.com/compose-spec/compose-go/v2/types"
 
@@ -697,5 +698,63 @@ func TestReconcileBrokenCurrentCheckoutStillAcceptsTheRepairingCommit(t *testing
 	}
 	if store.State.LastHealthyCommit != "bbb222" {
 		t.Errorf("LastHealthyCommit = %q, want %q", store.State.LastHealthyCommit, "bbb222")
+	}
+}
+
+func TestTearDownStacksRunsStacksConcurrently(t *testing.T) {
+	const stacks = 3
+	entered := make(chan struct{}, stacks)
+	release := make(chan struct{})
+	compose := &fakeCompose{onDown: func(string) {
+		entered <- struct{}{}
+		<-release
+	}}
+	deps, _ := testDirDeps(t, gitNoChange("aaa111"), compose, snapshots(healthySnapshot()), state.New(), t.TempDir(), t.TempDir())
+
+	done := make(chan error, 1)
+	go func() { done <- tearDownStacks(t.Context(), deps, stackFixtures("a", "b", "c"), "test") }()
+
+	for i := range stacks {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of %d teardowns had started, want them to overlap instead of costing a timeout each", i, stacks)
+		}
+	}
+	close(release)
+
+	if err := <-done; err != nil {
+		t.Fatalf("tearDownStacks: %v", err)
+	}
+	if len(compose.downCalls) != stacks {
+		t.Errorf("downCalls = %v, want %d stacks torn down", compose.downCalls, stacks)
+	}
+}
+
+func TestPreflightDegradedNotificationKeyNamesTheTarget(t *testing.T) {
+	snap := &toggleSnapshotter{unhealthy: true}
+	g := gitChange("aaa111", "bbb222")
+	g.onCheckout = func(commit string) {
+		if commit == "aaa111" {
+			snap.set(false)
+		}
+	}
+	deps, _ := testDeps(t, g, &fakeCompose{}, snap, withHealthy("aaa111"))
+
+	for range maxPreflightBlocks {
+		snap.set(true)
+		Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+	}
+	snap.set(true)
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Degraded {
+		t.Fatalf("expected DEGRADED, result = %+v", result)
+	}
+	if result.NotificationKey == "degraded:" {
+		t.Fatal("every pre-flight DEGRADED shares one throttle key, so distinct ones suppress each other for an hour")
+	}
+	if !strings.Contains(result.NotificationKey, "aaa111") {
+		t.Errorf("NotificationKey = %q, want the rollback target in the key", result.NotificationKey)
 	}
 }

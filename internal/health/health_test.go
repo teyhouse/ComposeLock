@@ -552,3 +552,37 @@ func TestWatchIgnoresAStaleUnhealthyProbeOnACompletedContainer(t *testing.T) {
 		t.Errorf("Evaluate() = false (%s), want the same verdict as the watch", reason)
 	}
 }
+
+func TestWatchIgnoresAStaleUnhealthyProbeOnARestartingContainer(t *testing.T) {
+	restarting := ContainerStatus{ID: "c1", Service: "web", State: StateRestarting, Health: HealthUnhealthy, RestartCount: 1}
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
+		{Containers: []ContainerStatus{restarting}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Healthy {
+		t.Errorf("Outcome = %v (%s), want healthy: a restart within tolerance is judged by the restart count, not by the probe the container reported before it restarted", res.Outcome, res.Reason)
+	}
+	if healthy, reason := EvaluatePreflight(Snapshot{Containers: []ContainerStatus{restarting}}); !healthy {
+		t.Errorf("EvaluatePreflight() = false (%s), want the gate and the watch to agree on the same snapshot", reason)
+	}
+}
+
+func TestWatchStillFailsARestartingContainerBeyondTolerance(t *testing.T) {
+	snap := &fakeSnapshotter{snapshots: []Snapshot{
+		{Containers: []ContainerStatus{running("c1", "web")}},
+		{Containers: []ContainerStatus{{ID: "c1", Service: "web", State: StateRestarting, Health: HealthUnhealthy, RestartCount: 5}}},
+	}}
+
+	res, err := Watch(t.Context(), snap, &fakeClock{}, baseOpts(), testLog())
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if res.Outcome != Unhealthy {
+		t.Errorf("Outcome = %v, want unhealthy: excessive restart churn must still fail the watch", res.Outcome)
+	}
+}

@@ -106,6 +106,13 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 	return Result{Reverted: true, RolledBackTo: target, HealthWatch: watchDuration, Err: revertErr, Notification: &embed, NotificationKey: key}
 }
 
+func degradedKey(failedCommit, target string) string {
+	if failedCommit == preflightRecovery {
+		return "degraded:preflight:" + target
+	}
+	return "degraded:" + failedCommit
+}
+
 func reportedCommit(failedCommit, target string) string {
 	if failedCommit == preflightRecovery {
 		return target
@@ -193,5 +200,5 @@ func degrade(deps Deps, st *state.State, failedCommit, target string, stacks []s
 		Duration: time.Since(start),
 		Err:      err,
 	})
-	return Result{Degraded: true, RolledBackTo: target, Err: err, Notification: &embed, NotificationKey: "degraded:" + failedCommit}
+	return Result{Degraded: true, RolledBackTo: target, Err: err, Notification: &embed, NotificationKey: degradedKey(failedCommit, target)}
 }

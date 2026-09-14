@@ -25,6 +25,8 @@ var errDegraded = errors.New("system is DEGRADED; use --force to retry")
 
 const teardownTimeout = 2 * time.Minute
 
+const maxConcurrentTeardowns = 8
+
 type Options struct {
 	DryRun  bool
 	Force   bool
@@ -312,11 +314,23 @@ func tearDownStacks(ctx context.Context, deps Deps, stacks []compose.Stack, reas
 	}
 	base := context.WithoutCancel(ctx)
 
+	failures := make([]error, len(stacks))
+	sem := make(chan struct{}, maxConcurrentTeardowns)
+	var wg sync.WaitGroup
+	for i, s := range stacks {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			deps.Log.Info("tearing down compose stack", "project", s.ProjectName, "reason", reason)
+			failures[i] = downStack(base, deps, s.ProjectName)
+		})
+	}
+	wg.Wait()
+
 	var errs []error
 	var removed, remaining []string
-	for _, s := range stacks {
-		deps.Log.Info("tearing down compose stack", "project", s.ProjectName, "reason", reason)
-		if err := downStack(base, deps, s.ProjectName); err != nil {
+	for i, s := range stacks {
+		if err := failures[i]; err != nil {
 			deps.Log.Error("tearing down compose stack failed", "project", s.ProjectName, "err", err)
 			errs = append(errs, fmt.Errorf("tearing down %s: %w", s.ProjectName, err))
 			remaining = append(remaining, s.ProjectName)

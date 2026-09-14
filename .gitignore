@@ -39,6 +39,9 @@ go.work.sum
 architecture.md
 plan.md
 
+# Review notes (local only)
+bug.md
+
 # Personal registry push script (local only)
 /scripts/push.sh
 

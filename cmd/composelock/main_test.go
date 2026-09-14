@@ -1,6 +1,15 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"log/slog"
+	"testing"
+
+	"github.com/teyhouse/ComposeLock/internal/config"
+	"github.com/teyhouse/ComposeLock/internal/health"
+	"github.com/teyhouse/ComposeLock/internal/reconcile"
+	"github.com/teyhouse/ComposeLock/internal/state"
+)
 
 func TestParseArgsAcceptsFlagsOnBothSidesOfTheCommand(t *testing.T) {
 	f := newCLIFlags()
@@ -77,5 +86,63 @@ func TestParseArgsWithoutACommandStaysEmpty(t *testing.T) {
 	}
 	if !f.versionFlag {
 		t.Error("--version was dropped")
+	}
+}
+
+type recordingLock struct {
+	held bool
+}
+
+func (l *recordingLock) TryLock() (bool, error) {
+	l.held = true
+	return true, nil
+}
+
+func (l *recordingLock) Unlock() error {
+	l.held = false
+	return nil
+}
+
+type lockWatchingSnapshotter struct {
+	lock      *recordingLock
+	heldAtRun bool
+	calls     int
+}
+
+func (s *lockWatchingSnapshotter) Snapshot(context.Context, string) (health.Snapshot, error) {
+	s.calls++
+	if s.lock.held {
+		s.heldAtRun = true
+	}
+	return health.Snapshot{}, nil
+}
+
+func TestStatusReleasesTheStateLockBeforeSnapshotting(t *testing.T) {
+	lock := &recordingLock{}
+	snap := &lockWatchingSnapshotter{lock: lock}
+	cfg := &config.Config{
+		RepoPath:    t.TempDir(),
+		ComposeFile: "docker-compose.yml",
+		ProjectName: "test-stack",
+	}
+	deps := reconcile.Deps{
+		Config: cfg,
+		Health: snap,
+		State:  &state.MemStore{State: state.New()},
+		Lock:   lock,
+		Log:    slog.New(slog.DiscardHandler),
+	}
+
+	if code := cmdStatus(t.Context(), "composelock.json", cfg, deps); code != 0 {
+		t.Fatalf("cmdStatus() = %d, want 0", code)
+	}
+	if snap.calls == 0 {
+		t.Fatal("no snapshot was taken")
+	}
+	if snap.heldAtRun {
+		t.Error("status held the state lock across the container snapshots, which makes a reconcile tick skip for as long as Docker is slow")
+	}
+	if lock.held {
+		t.Error("status left the state lock held")
 	}
 }
