@@ -228,12 +228,15 @@ func cmdPoll(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 		logResult(deps.Log, "poll tick complete", result)
 		notifier.send(ctx, result)
 
-		timer.Reset(interval)
+		if ctx.Err() != nil {
+			return 0
+		}
 		select {
 		case <-ctx.Done():
 			return 0
 		case <-timer.C:
 		}
+		timer.Reset(interval)
 	}
 }
 
