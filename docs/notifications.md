@@ -1,0 +1,19 @@
+# Notifications
+
+[Back to README](../README.md)
+
+Set `discord_webhook` to post a colour-coded embed for every outcome that matters: a successful deploy (green), a revert that recovered the stack (orange), and a failure or DEGRADED state (red). Repeated identical notifications are suppressed for an hour per key, so a stack failing every poll tick does not flood the channel, and a notification that failed to send never consumes that hour. The key names the event and its commit, and a pre-flight DEGRADED (which has no failing commit of its own) is keyed by its rollback target, so two of them do not silence each other.
+
+A successful deploy looks like this:
+
+| Field        | Example                                                   | Meaning                                                                 |
+|--------------|-----------------------------------------------------------|-------------------------------------------------------------------------|
+| Commit       | `8e76297`                                                 | The commit that is now deployed                                          |
+| Branch       | `main`                                                    | The tracked branch                                                       |
+| Services     | `pihole, traefik, vaultwarden, whoami`                    | Every service in the stacks this cycle applied                           |
+| Updated      | `vaultwarden`                                             | Only the services whose containers Compose actually replaced             |
+| Stacks       | `my-stack, my-stack-db`                                   | Which stacks were applied (`compose_dir` mode only)                      |
+| Health Watch | `5m0s (success)`                                          | How long the result was watched, and the verdict                         |
+| Duration     | `5m36s`                                                   | Wall clock for the whole reconcile                                       |
+
+Compose leaves a service alone when its configuration did not change, so `Updated` narrows `Services` to what actually moved: a one-service bump lists seven names under `Services` and one under `Updated`. It reads `none` when a compose file changed without changing any container, and is omitted entirely when `health_watch_seconds` is `0`, since there is nothing to compare against. The same list is logged as `updated_services`.

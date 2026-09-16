@@ -52,7 +52,7 @@ func newCLIFlags() *cliFlags {
 	f.fs.StringVar(&f.remote, "remote", "", "Git remote name")
 	f.fs.StringVar(&f.branch, "branch", "", "Branch to track")
 	f.fs.StringVar(&f.composeFile, "compose-file", "", "Path to docker-compose.yml")
-	f.fs.StringVar(&f.composeDir, "compose-dir", "", "Directory of compose files (see README); overrides -compose-file")
+	f.fs.StringVar(&f.composeDir, "compose-dir", "", "Directory of compose files (see docs/compose-dir.md); overrides -compose-file")
 	f.fs.StringVar(&f.projectName, "project-name", "", "Compose project name (required for SDK)")
 	f.fs.StringVar(&f.stateFile, "state-file", "", "Path to state JSON")
 	f.fs.StringVar(&f.discord, "discord", "", "Discord webhook URL")
