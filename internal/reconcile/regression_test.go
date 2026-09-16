@@ -330,6 +330,24 @@ func TestReconcileResumedRevertOnlyTouchesThePendingStacks(t *testing.T) {
 	}
 }
 
+func TestReconcileRevertOfAnAppliedCommitResetsPreflightBlocks(t *testing.T) {
+	st := withHealthy("aaa111")
+	st.PendingCommit = "bbb222"
+	st.LastFailedCommit = "bbb222"
+	st.PreflightBlocks = maxPreflightBlocks - 1
+	deps, store := testDeps(t, gitNoChange("bbb222"), &fakeCompose{}, snapshots(healthySnapshot()), st)
+
+	result := Reconcile(t.Context(), Options{Trigger: "poll"}, deps)
+
+	if !result.Reverted || result.Degraded {
+		t.Fatalf("expected the resumed revert to succeed, result = %+v", result)
+	}
+	if store.State.PreflightBlocks != 0 {
+		t.Errorf("PreflightBlocks = %d, want 0: the commit being reverted got past the gate, so the consecutive-block streak is broken",
+			store.State.PreflightBlocks)
+	}
+}
+
 func TestReconcileFreshInstallAppliesEvenWhenTheCommitLooksIrrelevant(t *testing.T) {
 	compose := &fakeCompose{}
 	g := gitChange("aaa111", "bbb222")

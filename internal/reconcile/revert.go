@@ -81,6 +81,7 @@ func doRevert(ctx context.Context, deps Deps, st *state.State, stacks []compose.
 	next.LastAttemptAt = deps.Clock.Now()
 	if failedCommit != preflightRecovery {
 		next.LastAttemptCommit = failedCommit
+		next.PreflightBlocks = 0
 	}
 	next.LastResult = state.ResultReverted
 	if err := deps.State.Save(&next); err != nil {
