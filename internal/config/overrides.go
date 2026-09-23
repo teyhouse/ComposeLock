@@ -26,12 +26,13 @@ type Overrides struct {
 	RestartTolerance *int
 	HealthStreak     *int
 
-	RetryDelay     *time.Duration
-	PollInterval   *time.Duration
-	HealthWatch    *time.Duration
-	HealthInterval *time.Duration
-	DockerTimeout  *time.Duration
-	DockerUp       *time.Duration
+	RetryDelay      *time.Duration
+	PollInterval    *time.Duration
+	MonitorInterval *time.Duration
+	HealthWatch     *time.Duration
+	HealthInterval  *time.Duration
+	DockerTimeout   *time.Duration
+	DockerUp        *time.Duration
 }
 
 func (c *Config) Apply(o Overrides) error {
@@ -56,6 +57,7 @@ func (c *Config) Apply(o Overrides) error {
 	return errors.Join(
 		setSeconds(&c.RetryDelaySeconds, o.RetryDelay, "retry_delay_seconds"),
 		setSeconds(&c.PollIntervalSeconds, o.PollInterval, "poll_interval_seconds"),
+		setSeconds(&c.MonitorIntervalSeconds, o.MonitorInterval, "monitor_interval_seconds"),
 		setSeconds(&c.HealthWatchSeconds, o.HealthWatch, "health_watch_seconds"),
 		setSeconds(&c.HealthPollIntervalSeconds, o.HealthInterval, "health_poll_interval_seconds"),
 		setSeconds(&c.DockerTimeoutSeconds, o.DockerTimeout, "docker_timeout_seconds"),

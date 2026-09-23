@@ -207,6 +207,21 @@ func cmdReconcile(ctx context.Context, trigger string, dryRun, force bool, deps 
 	return exitCode(result)
 }
 
+func startMonitor(ctx context.Context, cfg *config.Config, deps reconcile.Deps) (stop func()) {
+	if cfg.MonitorIntervalSeconds <= 0 {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		reconcile.NewMonitor(deps).Run(ctx, time.Duration(cfg.MonitorIntervalSeconds)*time.Second)
+	})
+	return func() {
+		cancel()
+		wg.Wait()
+	}
+}
+
 func cmdPoll(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 	interval := time.Duration(cfg.PollIntervalSeconds) * time.Second
 	if interval <= 0 {
@@ -216,6 +231,9 @@ func cmdPoll(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 
 	stopPprof := startPprof(ctx, cfg.PprofListen, deps.Log)
 	defer stopPprof()
+
+	stopMonitor := startMonitor(ctx, cfg, deps)
+	defer stopMonitor()
 
 	notifier := &asyncNotifier{deps: deps}
 	defer notifier.drain()
@@ -243,6 +261,9 @@ func cmdPoll(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 func cmdWebhook(ctx context.Context, cfg *config.Config, deps reconcile.Deps) int {
 	stopPprof := startPprof(ctx, cfg.PprofListen, deps.Log)
 	defer stopPprof()
+
+	stopMonitor := startMonitor(ctx, cfg, deps)
+	defer stopMonitor()
 
 	notifier := &asyncNotifier{deps: deps}
 	defer notifier.drain()

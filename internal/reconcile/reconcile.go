@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
@@ -97,6 +98,17 @@ func (d Deps) singleFlight() *sync.Mutex {
 	return mu.(*sync.Mutex)
 }
 
+var activities sync.Map
+
+func (d Deps) activity() *atomic.Uint64 {
+	key := ""
+	if d.Config != nil {
+		key = d.Config.StateFile
+	}
+	a, _ := activities.LoadOrStore(key, new(atomic.Uint64))
+	return a.(*atomic.Uint64)
+}
+
 func Reconcile(ctx context.Context, opts Options, deps Deps) Result {
 	start := time.Now()
 
@@ -104,8 +116,12 @@ func Reconcile(ctx context.Context, opts Options, deps Deps) Result {
 		deps.Log.Info("reconcile already running, skipped", "trigger", opts.Trigger)
 		return Result{Skipped: true, SkipReason: SkipInFlight, Duration: time.Since(start)}
 	}
+	deps.activity().Add(1)
 	result := func() Result {
-		defer deps.singleFlight().Unlock()
+		defer func() {
+			deps.activity().Add(1)
+			deps.singleFlight().Unlock()
+		}()
 
 		if deps.Lock != nil {
 			held, err := deps.Lock.TryLock()

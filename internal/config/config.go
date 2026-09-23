@@ -45,7 +45,8 @@ type Config struct {
 	DockerTimeoutSeconds   int `json:"docker_timeout_seconds"`
 	DockerUpTimeoutSeconds int `json:"docker_up_timeout_seconds"`
 
-	PollIntervalSeconds int `json:"poll_interval_seconds"`
+	PollIntervalSeconds    int `json:"poll_interval_seconds"`
+	MonitorIntervalSeconds int `json:"monitor_interval_seconds"`
 
 	HealthWatchSeconds        int `json:"health_watch_seconds"`
 	HealthPollIntervalSeconds int `json:"health_poll_interval_seconds"`
@@ -78,7 +79,8 @@ func Default() *Config {
 		DockerTimeoutSeconds:   60,
 		DockerUpTimeoutSeconds: 1800,
 
-		PollIntervalSeconds: 0,
+		PollIntervalSeconds:    0,
+		MonitorIntervalSeconds: 60,
 
 		HealthWatchSeconds:        300,
 		HealthPollIntervalSeconds: 5,
@@ -306,6 +308,9 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	}
 	if c.PollIntervalSeconds < 0 {
 		return fmt.Errorf("config: poll_interval_seconds must be >= 0")
+	}
+	if c.MonitorIntervalSeconds < 0 {
+		return fmt.Errorf("config: monitor_interval_seconds must be >= 0")
 	}
 	if c.DockerTimeoutSeconds < 0 {
 		return fmt.Errorf("config: docker_timeout_seconds must be >= 0")
