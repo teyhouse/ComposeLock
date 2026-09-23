@@ -55,7 +55,7 @@ func buildDeps(cfg *config.Config, log *slog.Logger) (reconcile.Deps, error) {
 		Health:    &health.ComposeSnapshotter{Service: composeSvc, Timeout: dockerTimeout},
 		Clock:     health.RealClock{},
 		State:     state.FileStore{Path: cfg.StateFile},
-		Notifier:  notify.New(cfg.DiscordWebhook, log),
+		Notifier:  notify.New(cfg.DiscordWebhook, log, notify.WithWebhook(cfg.NotifyWebhook.URL, cfg.NotifyWebhook.Headers)),
 		Heartbeat: heartbeat.New(cfg.HeartbeatURL, log),
 		Log:       log,
 	}, nil
