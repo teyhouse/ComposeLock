@@ -171,6 +171,33 @@ func BuildEmbed(r Report) Embed {
 	}
 }
 
+type Alert struct {
+	Stack        string
+	Commit       string
+	Branch       string
+	Problem      string
+	UnhealthyFor time.Duration
+}
+
+func BuildAlertEmbed(a Alert) Embed {
+	commit := a.Commit
+	if len(commit) > 7 {
+		commit = commit[:7]
+	}
+	fields := []Field{
+		{Name: "Stack", Value: orDash(truncate(a.Stack, maxFieldValueLen)), Inline: true},
+		{Name: "Commit", Value: orDash(commit), Inline: true},
+		{Name: "Branch", Value: orDash(truncate(a.Branch, maxFieldValueLen)), Inline: true},
+		{Name: "Unhealthy for", Value: formatDuration(a.UnhealthyFor), Inline: true},
+		{Name: "Problem", Value: orDash(truncate(a.Problem, maxErrorFieldLen))},
+	}
+	return Embed{
+		Title:  truncate(OutcomeFailure.icon()+" Stack unhealthy: "+a.Stack, maxTitleLen),
+		Color:  int(ColorFailure),
+		Fields: fields,
+	}
+}
+
 func formatDuration(d time.Duration) string {
 	if d < time.Second {
 		return d.Round(time.Millisecond).String()
@@ -272,8 +299,8 @@ func (n *Notifier) release(key string) {
 	delete(n.sent, key)
 }
 
-func (n *Notifier) Send(ctx context.Context, embed Embed) {
-	n.send(ctx, embed)
+func (n *Notifier) Send(ctx context.Context, embed Embed) bool {
+	return n.send(ctx, embed)
 }
 
 func (n *Notifier) send(ctx context.Context, embed Embed) bool {

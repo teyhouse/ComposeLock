@@ -30,12 +30,13 @@ type cliFlags struct {
 	restartTolerance int
 	healthStreak     int
 
-	retryDelay     time.Duration
-	pollInterval   time.Duration
-	healthWatch    time.Duration
-	healthInterval time.Duration
-	dockerTimeout  time.Duration
-	dockerUp       time.Duration
+	retryDelay      time.Duration
+	pollInterval    time.Duration
+	monitorInterval time.Duration
+	healthWatch     time.Duration
+	healthInterval  time.Duration
+	dockerTimeout   time.Duration
+	dockerUp        time.Duration
 
 	dryRun      bool
 	force       bool
@@ -60,6 +61,7 @@ func newCLIFlags() *cliFlags {
 	f.fs.IntVar(&f.retryAttempts, "retry-attempts", 0, "Git sync retry attempts (default 3)")
 	f.fs.DurationVar(&f.retryDelay, "retry-delay", 0, "Delay between Git retries (default 20s)")
 	f.fs.DurationVar(&f.pollInterval, "poll-interval", 0, "Poll interval for `poll` (default 5m)")
+	f.fs.DurationVar(&f.monitorInterval, "monitor-interval", 0, "Health monitor interval in poll/webhook mode, 0 disables it (default 60s)")
 	f.fs.DurationVar(&f.healthWatch, "health-watch", 0, "Health watch window (default 5m)")
 	f.fs.DurationVar(&f.healthInterval, "health-interval", 0, "Health poll interval (default 5s)")
 	f.fs.IntVar(&f.restartTolerance, "restart-tolerance", 0, "Restarts allowed before failing (default 1)")
@@ -115,6 +117,8 @@ func (f *cliFlags) overrides() config.Overrides {
 			o.RetryDelay = &f.retryDelay
 		case "poll-interval":
 			o.PollInterval = &f.pollInterval
+		case "monitor-interval":
+			o.MonitorInterval = &f.monitorInterval
 		case "health-watch":
 			o.HealthWatch = &f.healthWatch
 		case "health-interval":

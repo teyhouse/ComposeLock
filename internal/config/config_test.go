@@ -129,6 +129,7 @@ func TestLoadValidationErrors(t *testing.T) {
 		{"zero health poll interval", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "health_poll_interval_seconds": 0}`},
 		{"zero unhealthy streak", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "health_unhealthy_streak": 0}`},
 		{"negative poll interval", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "poll_interval_seconds": -1}`},
+		{"negative monitor interval", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "monitor_interval_seconds": -1}`},
 		{"public pprof listener", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "pprof_listen": "0.0.0.0:6060"}`},
 	}
 

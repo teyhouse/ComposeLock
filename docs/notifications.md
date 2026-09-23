@@ -17,3 +17,9 @@ A successful deploy looks like this:
 | Duration     | `5m36s`                                                   | Wall clock for the whole reconcile                                       |
 
 Compose leaves a service alone when its configuration did not change, so `Updated` narrows `Services` to what actually moved: a one-service bump lists seven names under `Services` and one under `Updated`. It reads `none` when a compose file changed without changing any container, and is omitted entirely when `health_watch_seconds` is `0`, since there is nothing to compare against. The same list is logged as `updated_services`.
+
+## Health alerts
+
+In `poll` and `webhook` mode, ComposeLock also checks the deployed stacks every `monitor_interval_seconds` (default 60) between deploys, and posts a red "Stack unhealthy" embed to the same `discord_webhook` when a stack stays unhealthy for `health_unhealthy_streak` consecutive checks (default 3). A stack counts as unhealthy when a container is not running or its healthcheck reports `unhealthy`, when a container restarted since the previous check, or when a service that was running has no containers any more. There is one alert per incident: nothing more is sent while the stack stays broken, and nothing is sent when it recovers. It only alerts and never touches the stack. Checks are skipped while a reconcile is running or a deploy is pending, since those send their own notifications.
+
+A long-running service that was stopped cleanly with exit code 0 looks like a finished one-shot container and is not flagged.

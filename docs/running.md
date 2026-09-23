@@ -2,7 +2,7 @@
 
 [Back to README](../README.md)
 
-`composelock sync` is a single self-contained reconcile, meant to be invoked repeatedly: by cron, by `composelock poll` as a long-running process, or by `composelock webhook` on push. Use cron if you do not want a supervised background process; use `poll` or `webhook` under systemd, Docker or a similar supervisor, as the [container example](../README.md#run-as-a-container) does.
+`composelock sync` is a single self-contained reconcile, meant to be invoked repeatedly: by cron, by `composelock poll` as a long-running process, or by `composelock webhook` on push. Use cron if you do not want a supervised background process; use `poll` or `webhook` under systemd, Docker or a similar supervisor, as the [container example](../README.md#run-as-a-container) does. Only `poll` and `webhook` send [health alerts](notifications.md#health-alerts) between deploys, since cron has no process running in between.
 
 ## Cron
 
