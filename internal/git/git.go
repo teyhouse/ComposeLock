@@ -198,7 +198,7 @@ func validCommit(commit string) bool {
 
 func splitNUL(out string) []string {
 	var files []string
-	for _, f := range strings.Split(out, "\x00") {
+	for f := range strings.SplitSeq(out, "\x00") {
 		if f != "" {
 			files = append(files, f)
 		}

@@ -4,6 +4,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -223,12 +224,7 @@ func TestProjectInputsCycleTerminates(t *testing.T) {
 }
 
 func containsPath(paths []string, want string) bool {
-	for _, p := range paths {
-		if p == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(paths, want)
 }
 
 func FuzzProjectInputs(f *testing.F) {

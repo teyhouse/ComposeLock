@@ -273,11 +273,11 @@ func rawFieldString(raw map[string]json.RawMessage, field string) string {
 
 func knownFields(t reflect.Type) map[string]reflect.Type {
 	fields := make(map[string]reflect.Type, t.NumField())
-	for i := range t.NumField() {
-		tag := t.Field(i).Tag.Get("json")
+	for field := range t.Fields() {
+		tag := field.Tag.Get("json")
 		name, _, _ := strings.Cut(tag, ",")
 		if name != "" {
-			fields[name] = t.Field(i).Type
+			fields[name] = field.Type
 		}
 	}
 	return fields
