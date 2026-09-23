@@ -25,11 +25,6 @@ func cmdPause(ctx context.Context, deps reconcile.Deps, pauseFor time.Duration, 
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	attrs := []any{"reason", reason}
-	if !until.IsZero() {
-		attrs = append(attrs, "until", until)
-	}
-	deps.Log.Info("deployments paused", attrs...)
 	fmt.Println("deployments paused " + pauseDescription(until, reason))
 	return 0
 }
@@ -48,7 +43,6 @@ func cmdResume(ctx context.Context, deps reconcile.Deps) int {
 		fmt.Println("deployments were not paused")
 		return 0
 	}
-	deps.Log.Info("deployments resumed")
 	fmt.Println("deployments resumed")
 	return 0
 }
