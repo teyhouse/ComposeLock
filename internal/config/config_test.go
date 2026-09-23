@@ -131,6 +131,8 @@ func TestLoadValidationErrors(t *testing.T) {
 		{"negative poll interval", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "poll_interval_seconds": -1}`},
 		{"negative monitor interval", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "monitor_interval_seconds": -1}`},
 		{"non-http heartbeat url", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "heartbeat_url": "ftp://hc.example/ping"}`},
+		{"notify webhook header with a space", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "notify_webhook": {"url": "https://hooks.example/x", "headers": {"X Token": "t"}}}`},
+		{"notify webhook headers without url", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "notify_webhook": {"headers": {"X-Token": "t"}}}`},
 		{"public pprof listener", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "pprof_listen": "0.0.0.0:6060"}`},
 	}
 

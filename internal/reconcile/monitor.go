@@ -2,6 +2,7 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -16,13 +17,15 @@ type stackMemory struct {
 	restarts map[string]int
 	streak   int
 	since    time.Time
+	incident uint64
 	alerted  bool
 }
 
 type Monitor struct {
-	deps   Deps
-	key    string
-	stacks map[string]*stackMemory
+	deps      Deps
+	key       string
+	stacks    map[string]*stackMemory
+	incidents uint64
 }
 
 func NewMonitor(deps Deps) *Monitor {
@@ -129,7 +132,8 @@ func (m *Monitor) observe(ctx context.Context, st *state.State, name string, sna
 		return
 	}
 	if mem.streak == 0 {
-		mem.since = now
+		m.incidents++
+		mem.since, mem.incident = now, m.incidents
 		m.deps.Log.Warn("health monitor: stack unhealthy", "project", name, "problem", problem)
 	}
 	mem.streak++
@@ -149,7 +153,8 @@ func (m *Monitor) observe(ctx context.Context, st *state.State, name string, sna
 		mem.alerted = true
 		return
 	}
-	if mem.alerted = m.deps.Notifier.Send(ctx, embed); mem.alerted {
+	key := fmt.Sprintf("monitor:%s:%d", name, mem.incident)
+	if mem.alerted = m.deps.Notifier.SendThrottled(ctx, key, embed); mem.alerted {
 		m.deps.Log.Info("health monitor: alert sent", "project", name, "problem", problem)
 	}
 }

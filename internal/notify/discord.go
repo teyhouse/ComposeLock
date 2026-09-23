@@ -1,18 +1,13 @@
 package notify
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
-	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -73,7 +68,12 @@ type Embed struct {
 	Color       int     `json:"color"`
 	Fields      []Field `json:"fields,omitempty"`
 
-	commit string
+	outcome    Outcome
+	title      string
+	commit     string
+	message    string
+	commitURL  string
+	compareURL string
 }
 
 func (e *Embed) Commit() string {
@@ -171,10 +171,12 @@ func BuildEmbed(r Report) Embed {
 	}
 
 	return Embed{
-		Title:  truncate(title, maxTitleLen),
-		Color:  int(r.Outcome.color()),
-		Fields: fields,
-		commit: r.Commit,
+		Title:   truncate(title, maxTitleLen),
+		Color:   int(r.Outcome.color()),
+		Fields:  fields,
+		outcome: r.Outcome,
+		title:   r.Title,
+		commit:  r.Commit,
 	}
 }
 
@@ -199,10 +201,12 @@ func BuildAlertEmbed(a Alert) Embed {
 		{Name: "Problem", Value: orDash(truncate(a.Problem, maxErrorFieldLen))},
 	}
 	return Embed{
-		Title:  truncate(OutcomeFailure.icon()+" Stack unhealthy: "+a.Stack, maxTitleLen),
-		Color:  int(ColorFailure),
-		Fields: fields,
-		commit: a.Commit,
+		Title:   truncate(OutcomeFailure.icon()+" Stack unhealthy: "+a.Stack, maxTitleLen),
+		Color:   int(ColorFailure),
+		Fields:  fields,
+		outcome: OutcomeFailure,
+		title:   "Stack unhealthy: " + a.Stack,
+		commit:  a.Commit,
 	}
 }
 
@@ -246,8 +250,15 @@ func (e *Embed) AddCommitContext(c CommitContext) {
 	if c.Rollback == nil && c.Count > 1 {
 		meta = append(meta, fmt.Sprintf("%d commits since %s", c.Count, shortHash(c.Base)))
 	}
+	plain := slices.Clone(lines)
+	if len(meta) > 0 {
+		plain = append(plain, strings.Join(meta, " · "))
+	}
+	e.message = plainText(strings.Join(plain, "\n"))
+
 	if c.RepoURL != "" && c.Base != "" && c.Base != c.Commit.ID {
-		meta = append(meta, fmt.Sprintf("[compare](%s/compare/%s...%s)", c.RepoURL, c.Base, c.Commit.ID))
+		e.compareURL = fmt.Sprintf("%s/compare/%s...%s", c.RepoURL, c.Base, c.Commit.ID)
+		meta = append(meta, "[compare]("+e.compareURL+")")
 	}
 	if len(meta) > 0 {
 		lines = append(lines, strings.Join(meta, " · "))
@@ -257,6 +268,7 @@ func (e *Embed) AddCommitContext(c CommitContext) {
 	if c.RepoURL == "" {
 		return
 	}
+	e.commitURL = c.RepoURL + "/commit/" + c.Commit.ID
 	for i := range e.Fields {
 		if e.Fields[i].Name == "Commit" && e.Fields[i].Value == shortHash(c.Commit.ID) {
 			e.Fields[i].Value = c.link(c.Commit.ID)
@@ -321,135 +333,6 @@ const (
 	maxRateLimitWait = 15 * time.Second
 	drainLimit       = 8 << 10
 )
-
-type Notifier struct {
-	webhookURL string
-	client     *http.Client
-	log        *slog.Logger
-
-	mu   sync.Mutex
-	sent map[string]time.Time
-}
-
-func New(webhookURL string, log *slog.Logger) *Notifier {
-	if webhookURL == "" {
-		log.Info("discord notifications disabled: no webhook configured")
-	}
-	return &Notifier{
-		webhookURL: webhookURL,
-		client:     &http.Client{Timeout: 10 * time.Second},
-		log:        log,
-		sent:       make(map[string]time.Time),
-	}
-}
-
-func (n *Notifier) Enabled() bool {
-	return n.webhookURL != ""
-}
-
-func (n *Notifier) SendThrottled(ctx context.Context, key string, embed Embed) {
-	if !n.Enabled() {
-		return
-	}
-	if key == "" {
-		n.reset()
-	} else if !n.claim(key) {
-		n.log.Info("discord notify: suppressing repeated notification", "key", key, "repeat_interval", RepeatInterval.String())
-		return
-	}
-	if !n.send(ctx, embed) && key != "" {
-		n.release(key)
-	}
-}
-
-func (n *Notifier) reset() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	clear(n.sent)
-}
-
-func (n *Notifier) claim(key string) bool {
-	now := time.Now()
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	for k, at := range n.sent {
-		if now.Sub(at) >= RepeatInterval {
-			delete(n.sent, k)
-		}
-	}
-	if _, blocked := n.sent[key]; blocked {
-		return false
-	}
-	n.sent[key] = now
-	return true
-}
-
-func (n *Notifier) release(key string) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	delete(n.sent, key)
-}
-
-func (n *Notifier) Send(ctx context.Context, embed Embed) bool {
-	return n.send(ctx, embed)
-}
-
-func (n *Notifier) send(ctx context.Context, embed Embed) bool {
-	if !n.Enabled() {
-		return false
-	}
-
-	data, err := json.Marshal(Payload{Embeds: []Embed{embed}})
-	if err != nil {
-		n.log.Warn("discord notify: marshaling payload failed", "err", err)
-		return false
-	}
-
-	for attempt := range 2 {
-		retryAfter, err := n.post(ctx, data)
-		if err != nil {
-			n.log.Warn("discord notify: request failed", "err", err)
-			return false
-		}
-		if retryAfter <= 0 {
-			return true
-		}
-		if attempt > 0 {
-			n.log.Warn("discord notify: still rate limited, dropping notification")
-			return false
-		}
-		n.log.Warn("discord notify: rate limited, retrying", "retry_after", retryAfter.String())
-		if !sleepCtx(ctx, retryAfter) {
-			return false
-		}
-	}
-	return false
-}
-
-func (n *Notifier) post(ctx context.Context, data []byte) (time.Duration, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.webhookURL, bytes.NewReader(data))
-	if err != nil {
-		return 0, redactURL(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := n.client.Do(req)
-	if err != nil {
-		return 0, redactURL(err)
-	}
-	defer func() {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
-		resp.Body.Close()
-	}()
-
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return rateLimitDelay(resp.Header.Get("Retry-After")), nil
-	}
-	if resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("non-2xx response: %d", resp.StatusCode)
-	}
-	return 0, nil
-}
 
 func rateLimitDelay(retryAfter string) time.Duration {
 	secs, err := strconv.ParseFloat(strings.TrimSpace(retryAfter), 64)

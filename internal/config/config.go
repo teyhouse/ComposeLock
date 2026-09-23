@@ -21,6 +21,11 @@ const schemaVersion = 1
 
 const defaultPath = "composelock.json"
 
+type NotifyWebhookConfig struct {
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitzero"`
+}
+
 type WebhookConfig struct {
 	Listen string `json:"listen"`
 	Path   string `json:"path"`
@@ -60,7 +65,8 @@ type Config struct {
 	LogFormat      string `json:"log_format"`
 	PprofListen    string `json:"pprof_listen"`
 
-	Webhook WebhookConfig `json:"webhook"`
+	Webhook       WebhookConfig       `json:"webhook"`
+	NotifyWebhook NotifyWebhookConfig `json:"notify_webhook"`
 }
 
 func Default() *Config {
@@ -322,6 +328,9 @@ func (c *Config) Validate(logger *slog.Logger) error {
 			return fmt.Errorf("config: repo_url must be an http(s) URL without credentials, got %q", c.RepoURL)
 		}
 	}
+	if err := c.NotifyWebhook.validate(); err != nil {
+		return err
+	}
 	if c.HeartbeatURL != "" {
 		if u, err := url.Parse(c.HeartbeatURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 			return errors.New("config: heartbeat_url must be an http(s) URL")
@@ -412,4 +421,37 @@ func Init(path string, force bool, overrides Overrides) (*Config, error) {
 		return nil, fmt.Errorf("writing config file %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+func (w NotifyWebhookConfig) validate() error {
+	if w.URL == "" {
+		if len(w.Headers) > 0 {
+			return errors.New("config: notify_webhook.headers is set but notify_webhook.url is empty")
+		}
+		return nil
+	}
+	if u, err := url.Parse(w.URL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return errors.New("config: notify_webhook.url must be an http(s) URL")
+	}
+	for name, value := range w.Headers {
+		if !validHeaderName(name) {
+			return fmt.Errorf("config: notify_webhook.headers has an invalid header name %q", name)
+		}
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("config: notify_webhook.headers[%q] must not contain line breaks", name)
+		}
+	}
+	return nil
+}
+
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r <= ' ' || r >= 0x7f || strings.ContainsRune("()<>@,;:\\\"/[]?={}", r) {
+			return false
+		}
+	}
+	return true
 }
