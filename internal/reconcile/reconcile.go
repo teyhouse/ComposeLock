@@ -60,6 +60,7 @@ type Result struct {
 
 type ComposeService interface {
 	LoadProject(ctx context.Context, composeFiles []string, projectName string) (*types.Project, error)
+	Pull(ctx context.Context, project *types.Project) error
 	Up(ctx context.Context, project *types.Project) error
 	Down(ctx context.Context, projectName string) error
 }

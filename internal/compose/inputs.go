@@ -280,7 +280,7 @@ func IsInfraError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, errRegistryUnavailable) {
 		return true
 	}
 	if client.IsErrConnectionFailed(err) {

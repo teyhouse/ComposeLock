@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
+	cerrdefs "github.com/containerd/errdefs"
 )
 
 func TestCheckEnvFilesMissing(t *testing.T) {
@@ -223,5 +224,18 @@ func TestDiscoverDoesNotCacheFailures(t *testing.T) {
 	}
 	if cachedFingerprint != "" && cachedErr != nil {
 		t.Errorf("a failed discovery must not claim a valid fingerprint")
+	}
+}
+
+func TestClassifyPullErrorSeparatesImageMistakesFromRegistryOutages(t *testing.T) {
+	for _, err := range []error{cerrdefs.ErrNotFound, cerrdefs.ErrInvalidArgument, cerrdefs.ErrUnauthenticated, cerrdefs.ErrPermissionDenied} {
+		if IsInfraError(classifyPullError(err)) {
+			t.Errorf("%v classified as a registry outage, want the commit's fault", err)
+		}
+	}
+	for _, err := range []error{cerrdefs.ErrInternal, cerrdefs.ErrUnavailable, errors.New("toomanyrequests")} {
+		if !IsInfraError(classifyPullError(err)) {
+			t.Errorf("%v classified as the commit's fault, want a registry outage", err)
+		}
 	}
 }
