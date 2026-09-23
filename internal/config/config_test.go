@@ -133,6 +133,7 @@ func TestLoadValidationErrors(t *testing.T) {
 		{"non-http heartbeat url", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "heartbeat_url": "ftp://hc.example/ping"}`},
 		{"notify webhook header with a space", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "notify_webhook": {"url": "https://hooks.example/x", "headers": {"X Token": "t"}}}`},
 		{"notify webhook headers without url", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "notify_webhook": {"headers": {"X-Token": "t"}}}`},
+		{"malformed deploy window", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "deploy_window": "2am-5am"}`},
 		{"public pprof listener", `{"repo_path": ".", "compose_file": "x", "project_name": "y", "pprof_listen": "0.0.0.0:6060"}`},
 	}
 

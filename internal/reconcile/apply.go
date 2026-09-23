@@ -63,6 +63,16 @@ func runNormal(ctx context.Context, opts Options, deps Deps, st *state.State, st
 		return result
 	}
 
+	if w, ok := cfg.Window(); ok && gitResult.Changed {
+		if now := deps.Clock.Now(); !w.Open(now) {
+			deps.Log.Info("outside the deploy window, not applying",
+				"waiting_commit", gitResult.NewCommit, "deploy_window", w.String(), "opens_at", w.NextOpening(now))
+			result.Skipped = true
+			result.SkipReason = SkipOutsideWindow
+			return result
+		}
+	}
+
 	if !gitResult.Changed {
 		deps.Log.Warn("checkout does not match the expected commit, re-applying",
 			"head", gitResult.OldCommit, "expected", st.ExpectedCheckout(), "last_healthy_commit", st.LastHealthyCommit)

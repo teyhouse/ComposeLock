@@ -19,6 +19,7 @@ type Overrides struct {
 	RepoURL     *string
 	LogFormat   *string
 	PprofListen *string
+	Window      *string
 
 	WebhookListen *string
 	WebhookPath   *string
@@ -49,6 +50,7 @@ func (c *Config) Apply(o Overrides) error {
 	setString(&c.RepoURL, o.RepoURL)
 	setString(&c.LogFormat, o.LogFormat)
 	setString(&c.PprofListen, o.PprofListen)
+	setString(&c.DeployWindow, o.Window)
 	setString(&c.Webhook.Listen, o.WebhookListen)
 	setString(&c.Webhook.Path, o.WebhookPath)
 

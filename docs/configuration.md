@@ -22,6 +22,7 @@ This writes a default `composelock.json` and an empty `state.json`. Config path 
 | `docker_timeout_seconds`        | `60`                  | Timeout for Docker calls other than `up`; `0` disables it |
 | `docker_up_timeout_seconds`     | `1800`                | Timeout for `compose up`, which may pull or build; `0` disables it |
 | `poll_interval_seconds`         | `0`                   | Used only by `composelock poll`; `0` disables it |
+| `deploy_window`                 | (any time)            | Only apply new commits between these local times, e.g. `02:00-05:00`, see [Deploy window](running.md#deploy-window) |
 | `monitor_interval_seconds`      | `60`                  | How often `poll`/`webhook` check the deployed stacks for [health alerts](notifications.md#health-alerts); `0` disables it |
 | `health_watch_seconds`          | `300`                 | How long to watch after apply/revert            |
 | `health_poll_interval_seconds`  | `5`                   | Poll interval during the health watch           |

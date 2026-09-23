@@ -321,3 +321,10 @@ func TestHealthzAnswersOK(t *testing.T) {
 		t.Errorf("GET /healthz = %d, want 200", resp.StatusCode)
 	}
 }
+
+func TestTriggerQueuesOneReconcileAndCoalescesTheRest(t *testing.T) {
+	s := New(Config{Path: "/webhook"}, func(context.Context) {}, slog.New(slog.DiscardHandler))
+	if !s.Trigger() || s.Trigger() {
+		t.Error("want the first trigger queued and the second coalesced while no worker drains the queue")
+	}
+}
