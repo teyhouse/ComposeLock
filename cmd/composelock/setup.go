@@ -14,6 +14,7 @@ import (
 	"github.com/teyhouse/ComposeLock/internal/execx"
 	"github.com/teyhouse/ComposeLock/internal/git"
 	"github.com/teyhouse/ComposeLock/internal/health"
+	"github.com/teyhouse/ComposeLock/internal/heartbeat"
 	"github.com/teyhouse/ComposeLock/internal/notify"
 	"github.com/teyhouse/ComposeLock/internal/reconcile"
 	"github.com/teyhouse/ComposeLock/internal/state"
@@ -50,12 +51,13 @@ func buildDeps(cfg *config.Config, log *slog.Logger) (reconcile.Deps, error) {
 			Branch:   cfg.Branch,
 			SSHKey:   cfg.SSHKey,
 		},
-		Compose:  composeSvc,
-		Health:   &health.ComposeSnapshotter{Service: composeSvc, Timeout: dockerTimeout},
-		Clock:    health.RealClock{},
-		State:    state.FileStore{Path: cfg.StateFile},
-		Notifier: notify.New(cfg.DiscordWebhook, log),
-		Log:      log,
+		Compose:   composeSvc,
+		Health:    &health.ComposeSnapshotter{Service: composeSvc, Timeout: dockerTimeout},
+		Clock:     health.RealClock{},
+		State:     state.FileStore{Path: cfg.StateFile},
+		Notifier:  notify.New(cfg.DiscordWebhook, log),
+		Heartbeat: heartbeat.New(cfg.HeartbeatURL, log),
+		Log:       log,
 	}, nil
 }
 

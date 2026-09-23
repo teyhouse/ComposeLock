@@ -53,7 +53,13 @@ func New(cfg Config, reconcile ReconcileFunc, log *slog.Logger) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+s.cfg.Path, s.handleWebhook)
+	mux.HandleFunc("GET /healthz", handleHealthz)
 	return mux
+}
+
+func handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, "ok\n")
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {

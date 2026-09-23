@@ -306,3 +306,18 @@ func TestProcessTriggersSurvivesAPanickingReconcile(t *testing.T) {
 		t.Fatal("worker died on the first panic instead of recovering")
 	}
 }
+
+func TestHealthzAnswersOK(t *testing.T) {
+	s := New(Config{Path: "/webhook"}, func(context.Context) {}, slog.New(slog.DiscardHandler))
+	srv := httptest.NewServer(s.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /healthz = %d, want 200", resp.StatusCode)
+	}
+}

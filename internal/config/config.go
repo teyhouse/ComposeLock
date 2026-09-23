@@ -56,6 +56,7 @@ type Config struct {
 
 	DiscordWebhook string `json:"discord_webhook"`
 	RepoURL        string `json:"repo_url"`
+	HeartbeatURL   string `json:"heartbeat_url"`
 	LogFormat      string `json:"log_format"`
 	PprofListen    string `json:"pprof_listen"`
 
@@ -91,6 +92,7 @@ func Default() *Config {
 
 		DiscordWebhook: "",
 		RepoURL:        "",
+		HeartbeatURL:   "",
 		LogFormat:      "json",
 		PprofListen:    "",
 
@@ -318,6 +320,11 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	if c.RepoURL != "" {
 		if u, err := url.Parse(c.RepoURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
 			return fmt.Errorf("config: repo_url must be an http(s) URL without credentials, got %q", c.RepoURL)
+		}
+	}
+	if c.HeartbeatURL != "" {
+		if u, err := url.Parse(c.HeartbeatURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+			return errors.New("config: heartbeat_url must be an http(s) URL")
 		}
 	}
 	if c.DockerTimeoutSeconds < 0 {

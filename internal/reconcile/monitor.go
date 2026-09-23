@@ -49,23 +49,29 @@ type stackSnapshot struct {
 }
 
 func (m *Monitor) Check(ctx context.Context) {
+	if m.check(ctx) {
+		m.deps.Heartbeat.Ping(ctx)
+	}
+}
+
+func (m *Monitor) check(ctx context.Context) (completed bool) {
 	activity := m.deps.activity()
 	before := activity.Load()
 	if before%2 == 1 {
-		return
+		return false
 	}
 	st, err := m.deps.State.Load()
 	if err != nil {
 		m.deps.Log.Warn("health monitor: loading state", "err", err)
-		return
+		return true
 	}
 	if st.PendingCommit != "" || st.PendingRevert || st.LastHealthyCommit == "" {
-		return
+		return true
 	}
 	names, err := m.watched(st)
 	if err != nil {
 		m.deps.Log.Warn("health monitor: discovering compose stacks", "err", err)
-		return
+		return true
 	}
 	if key := st.LastHealthyCommit + "|" + st.LastCheckoutCommit + "|" + strings.Join(names, ","); key != m.key {
 		m.key = key
@@ -77,7 +83,7 @@ func (m *Monitor) Check(ctx context.Context) {
 		snap, err := m.deps.Health.Snapshot(ctx, name)
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return false
 			}
 			m.deps.Log.Warn("health monitor: snapshot failed", "project", name, "err", err)
 			continue
@@ -85,13 +91,14 @@ func (m *Monitor) Check(ctx context.Context) {
 		snaps = append(snaps, stackSnapshot{name: name, snap: snap})
 	}
 	if activity.Load() != before {
-		return
+		return false
 	}
 
 	now := m.deps.Clock.Now()
 	for _, s := range snaps {
 		m.observe(ctx, st, s.name, s.snap, now)
 	}
+	return true
 }
 
 func (m *Monitor) watched(st *state.State) ([]string, error) {
