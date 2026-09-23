@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	_ "time/tzdata"
 
 	"github.com/teyhouse/ComposeLock/internal/config"
 )

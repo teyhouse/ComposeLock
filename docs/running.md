@@ -45,6 +45,25 @@ composelock --config /srv/composelock.json resume
 
 A paused run still fetches and logs the commit that is waiting, but applies, reverts and recovers nothing, and the [health monitor](notifications.md#health-alerts) sends no alerts, so containers you stop on purpose do not page anyone. `-for` ends the pause on its own; without it the pause lasts until `resume`. `status` shows the pause and its reason. The heartbeat keeps pinging, since ComposeLock itself is still running. The pause lives in the state file, so it survives restarts and applies to cron, `poll` and `webhook` alike. If a reconcile is running, `pause` waits for it to finish rather than interrupting it.
 
+## Deploy window
+
+To let pushed changes land only at a quiet time, set `deploy_window` in the config:
+
+```json
+{
+  "deploy_window": "02:00-05:00"
+}
+```
+
+Outside the window, a run that finds a new commit fetches it, logs `outside the deploy window, not applying` with the waiting commit and the next opening time, and exits 0 without touching anything. The first run inside the window deploys it through the usual pre-flight gate and health watch. `status` shows the window and whether it is open.
+
+- The format is `HH:MM-HH:MM` in 24-hour time. The start is inclusive and the end exclusive, so `02:00-05:00` allows 02:00 up to 04:59. A window may cross midnight: `22:00-06:00` covers the night.
+- Times are local to the ComposeLock process. The container image runs in UTC unless you set `TZ`, for example `-e TZ=Europe/Berlin`. The time zone database is built into the binary, so `TZ` works even though the image ships no zoneinfo files.
+- The window only holds new commits. A deploy that is already running finishes, and crash recovery or an interrupted revert resumes at any time, since those restore a known-good state rather than bring in a change. The very first deploy of a fresh install is not held either.
+- The window is optional: without `deploy_window` (or with an empty value) commits deploy whenever they arrive, exactly as before, so existing configs need no change.
+- To deploy right away outside the window, override it for a single run: `composelock --config /srv/composelock.json -deploy-window "" sync`.
+- The window applies to cron, `poll` and `webhook` alike. With cron, schedule at least one run inside the window; with `poll`, the first tick after it opens deploys. With `webhook`, a push held outside the window schedules one reconcile for the moment the window opens, so it deploys without another push.
+
 ## Deployment history
 
 `composelock status` lists the last 20 runs that did something: deploys, reverts, DEGRADED, and failures, each with its time, result and commit, the rollback target for a revert, and a shortened error. Identical consecutive entries, such as a git fetch failing every tick during a network outage, are folded into one line with a repeat count. Runs that found nothing to do are not recorded. The history is stored in the state file.

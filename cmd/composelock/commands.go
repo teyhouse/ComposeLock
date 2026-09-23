@@ -131,6 +131,7 @@ func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps 
 		fmt.Fprintln(os.Stderr, "reading state:", loadErr)
 		return 2
 	}
+	printDeployWindow(cfg, time.Now())
 	printPauseAndHistory(st, time.Now())
 	data, err := json.Marshal(st, jsontext.WithIndent("  "))
 	if err != nil {
@@ -270,7 +271,11 @@ func cmdWebhook(ctx context.Context, cfg *config.Config, deps reconcile.Deps) in
 	notifier := &asyncNotifier{deps: deps}
 	defer notifier.drain()
 
-	srv := webhook.New(webhook.Config{
+	opening := &windowTimer{}
+	defer opening.stop()
+
+	var srv *webhook.Server
+	srv = webhook.New(webhook.Config{
 		Addr:   cfg.Webhook.Listen,
 		Path:   cfg.Webhook.Path,
 		Secret: cfg.Webhook.Secret,
@@ -279,6 +284,9 @@ func cmdWebhook(ctx context.Context, cfg *config.Config, deps reconcile.Deps) in
 		result := reconcile.Reconcile(rctx, reconcile.Options{Trigger: "webhook"}, deps)
 		logResult(deps.Log, "webhook reconcile complete", result)
 		notifier.send(rctx, result)
+		if result.SkipReason == reconcile.SkipOutsideWindow {
+			opening.schedule(cfg, func() { srv.Trigger() }, deps.Log)
+		}
 	}, deps.Log)
 
 	deps.Log.Info("webhook server starting", "addr", cfg.Webhook.Listen, "path", cfg.Webhook.Path)
@@ -321,4 +329,44 @@ func orNone(s string) string {
 		return "-"
 	}
 	return s
+}
+
+func printDeployWindow(cfg *config.Config, now time.Time) {
+	w, ok := cfg.Window()
+	if !ok {
+		return
+	}
+	if w.Open(now) {
+		fmt.Printf("deploy window: %s (open)\n", w)
+		return
+	}
+	fmt.Printf("deploy window: %s (closed, opens %s)\n", w, w.NextOpening(now).Format(time.DateTime))
+}
+
+type windowTimer struct {
+	mu    sync.Mutex
+	timer *time.Timer
+}
+
+func (w *windowTimer) schedule(cfg *config.Config, trigger func(), log *slog.Logger) {
+	window, ok := cfg.Window()
+	if !ok {
+		return
+	}
+	at := window.NextOpening(time.Now())
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+	w.timer = time.AfterFunc(time.Until(at), trigger)
+	log.Info("reconcile scheduled for when the deploy window opens", "at", at)
+}
+
+func (w *windowTimer) stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.timer != nil {
+		w.timer.Stop()
+	}
 }

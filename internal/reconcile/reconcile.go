@@ -89,6 +89,7 @@ const (
 	SkipLocked             = "another composelock process holds the state lock"
 	SkipPreflightUnhealthy = "pre-flight gate would block this commit: the live stack is unhealthy"
 	SkipPaused             = "deployments are paused"
+	SkipOutsideWindow      = "outside the deploy window"
 )
 
 var processSingleFlight sync.Mutex

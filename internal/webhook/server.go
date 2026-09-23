@@ -170,9 +170,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	select {
-	case s.triggers <- struct{}{}:
-	default:
+	if !s.Trigger() {
 		s.log.Info("webhook: reconcile already queued, coalescing trigger")
 	}
 	w.WriteHeader(http.StatusAccepted)
@@ -210,4 +208,13 @@ func (s *Server) validSignature(header string, body []byte) bool {
 	expected := hex.EncodeToString(mac.Sum(nil))
 
 	return hmac.Equal([]byte(sig), []byte(expected))
+}
+
+func (s *Server) Trigger() bool {
+	select {
+	case s.triggers <- struct{}{}:
+		return true
+	default:
+		return false
+	}
 }

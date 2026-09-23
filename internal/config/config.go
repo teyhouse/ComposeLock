@@ -54,6 +54,8 @@ type Config struct {
 	PollIntervalSeconds    int `json:"poll_interval_seconds"`
 	MonitorIntervalSeconds int `json:"monitor_interval_seconds"`
 
+	DeployWindow string `json:"deploy_window"`
+
 	HealthWatchSeconds        int `json:"health_watch_seconds"`
 	HealthPollIntervalSeconds int `json:"health_poll_interval_seconds"`
 	HealthUnhealthyStreak     int `json:"health_unhealthy_streak"`
@@ -326,6 +328,11 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	if c.RepoURL != "" {
 		if u, err := url.Parse(c.RepoURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
 			return fmt.Errorf("config: repo_url must be an http(s) URL without credentials, got %q", c.RepoURL)
+		}
+	}
+	if c.DeployWindow != "" {
+		if _, err := ParseDeployWindow(c.DeployWindow); err != nil {
+			return fmt.Errorf("config: %w", err)
 		}
 	}
 	if err := c.NotifyWebhook.validate(); err != nil {

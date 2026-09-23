@@ -23,6 +23,7 @@ type cliFlags struct {
 	sshKey      string
 	logFormat   string
 	pprofListen string
+	window      string
 
 	webhookListen string
 	webhookPath   string
@@ -74,6 +75,7 @@ func newCLIFlags() *cliFlags {
 	f.fs.DurationVar(&f.dockerTimeout, "docker-timeout", 0, "Timeout for Docker calls other than up (default 60s)")
 	f.fs.DurationVar(&f.dockerUp, "docker-up-timeout", 0, "Timeout for compose up, which may pull or build (default 30m)")
 	f.fs.StringVar(&f.pprofListen, "pprof-listen", "", "Loopback address for pprof in poll/webhook mode")
+	f.fs.StringVar(&f.window, "deploy-window", "", "Only apply new commits between these local times, e.g. 02:00-05:00; an empty value allows any time")
 	f.fs.StringVar(&f.webhookListen, "webhook-listen", "", "Address for `webhook` (default 127.0.0.1:8080)")
 	f.fs.StringVar(&f.webhookPath, "webhook-path", "", "Path for `webhook` (default /webhook)")
 	f.fs.StringVar(&f.logFormat, "log-format", "", "json|text (default json)")
@@ -116,6 +118,8 @@ func (f *cliFlags) overrides() config.Overrides {
 			o.LogFormat = &f.logFormat
 		case "pprof-listen":
 			o.PprofListen = &f.pprofListen
+		case "deploy-window":
+			o.Window = &f.window
 		case "webhook-listen":
 			o.WebhookListen = &f.webhookListen
 		case "webhook-path":
