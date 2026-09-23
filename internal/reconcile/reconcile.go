@@ -18,6 +18,7 @@ import (
 	"github.com/teyhouse/ComposeLock/internal/config"
 	"github.com/teyhouse/ComposeLock/internal/git"
 	"github.com/teyhouse/ComposeLock/internal/health"
+	"github.com/teyhouse/ComposeLock/internal/heartbeat"
 	"github.com/teyhouse/ComposeLock/internal/notify"
 	"github.com/teyhouse/ComposeLock/internal/state"
 )
@@ -69,15 +70,16 @@ type Locker interface {
 }
 
 type Deps struct {
-	Config   *config.Config
-	Git      *git.Syncer
-	Compose  ComposeService
-	Health   health.Snapshotter
-	Clock    health.Clock
-	State    state.Store
-	Notifier *notify.Notifier
-	Lock     Locker
-	Log      *slog.Logger
+	Config    *config.Config
+	Git       *git.Syncer
+	Compose   ComposeService
+	Health    health.Snapshotter
+	Clock     health.Clock
+	State     state.Store
+	Notifier  *notify.Notifier
+	Heartbeat *heartbeat.Pinger
+	Lock      Locker
+	Log       *slog.Logger
 }
 
 const (
@@ -145,6 +147,9 @@ func Reconcile(ctx context.Context, opts Options, deps Deps) Result {
 
 	if result.Notification != nil {
 		addCommitContext(ctx, deps, result.Notification, result.OldCommit, result.RolledBackTo)
+	}
+	if !opts.DryRun && result.SkipReason != SkipInFlight && result.SkipReason != SkipLocked {
+		deps.Heartbeat.Ping(ctx)
 	}
 	result.Duration = time.Since(start)
 	return result
