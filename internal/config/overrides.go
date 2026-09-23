@@ -16,6 +16,7 @@ type Overrides struct {
 	StateFile   *string
 	SSHKey      *string
 	Discord     *string
+	RepoURL     *string
 	LogFormat   *string
 	PprofListen *string
 
@@ -45,6 +46,7 @@ func (c *Config) Apply(o Overrides) error {
 	setString(&c.StateFile, o.StateFile)
 	setString(&c.SSHKey, o.SSHKey)
 	setString(&c.DiscordWebhook, o.Discord)
+	setString(&c.RepoURL, o.RepoURL)
 	setString(&c.LogFormat, o.LogFormat)
 	setString(&c.PprofListen, o.PprofListen)
 	setString(&c.Webhook.Listen, o.WebhookListen)

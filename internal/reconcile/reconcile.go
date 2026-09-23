@@ -143,6 +143,9 @@ func Reconcile(ctx context.Context, opts Options, deps Deps) Result {
 		return reconcileLocked(ctx, opts, deps, start)
 	}()
 
+	if result.Notification != nil {
+		addCommitContext(ctx, deps, result.Notification, result.OldCommit, result.RolledBackTo)
+	}
 	result.Duration = time.Since(start)
 	return result
 }

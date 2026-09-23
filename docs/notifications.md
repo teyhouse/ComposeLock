@@ -16,6 +16,8 @@ A successful deploy looks like this:
 | Health Watch | `5m0s (success)`                                          | How long the result was watched, and the verdict                         |
 | Duration     | `5m36s`                                                   | Wall clock for the whole reconcile                                       |
 
+Under the title, the embed shows the commit subject, the author and a compare link to the previously deployed commit, and says how many commits landed when there was more than one. A revert or DEGRADED embed names both the failed commit and the rollback target. The `Commit` field and the compare link point at the repository's web page, which is derived from the remote (`git@github.com:owner/repo.git` and `https://github.com/owner/repo.git` both become `https://github.com/owner/repo`, with any credentials in the remote URL dropped). Set `repo_url` when the web address differs from the remote, for example a self-hosted Gitea reached over SSH on another host name. A remote that is a local path gets no links.
+
 Compose leaves a service alone when its configuration did not change, so `Updated` narrows `Services` to what actually moved: a one-service bump lists seven names under `Services` and one under `Updated`. It reads `none` when a compose file changed without changing any container, and is omitted entirely when `health_watch_seconds` is `0`, since there is nothing to compare against. The same list is logged as `updated_services`.
 
 ## Health alerts

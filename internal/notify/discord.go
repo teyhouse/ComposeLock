@@ -72,6 +72,12 @@ type Embed struct {
 	Description string  `json:"description,omitempty"`
 	Color       int     `json:"color"`
 	Fields      []Field `json:"fields,omitempty"`
+
+	commit string
+}
+
+func (e *Embed) Commit() string {
+	return e.commit
 }
 
 type Payload struct {
@@ -168,6 +174,7 @@ func BuildEmbed(r Report) Embed {
 		Title:  truncate(title, maxTitleLen),
 		Color:  int(r.Outcome.color()),
 		Fields: fields,
+		commit: r.Commit,
 	}
 }
 
@@ -195,7 +202,91 @@ func BuildAlertEmbed(a Alert) Embed {
 		Title:  truncate(OutcomeFailure.icon()+" Stack unhealthy: "+a.Stack, maxTitleLen),
 		Color:  int(ColorFailure),
 		Fields: fields,
+		commit: a.Commit,
 	}
+}
+
+type CommitInfo struct {
+	ID      string
+	Subject string
+	Author  string
+}
+
+type CommitContext struct {
+	RepoURL  string
+	Commit   CommitInfo
+	Base     string
+	Count    int
+	Rollback *CommitInfo
+}
+
+const (
+	maxSubjectLen = 100
+	maxAuthorLen  = 64
+)
+
+func (e *Embed) AddCommitContext(c CommitContext) {
+	if c.Commit.ID == "" {
+		return
+	}
+	var lines []string
+	if c.Rollback != nil {
+		lines = append(lines,
+			"**Failed:** "+c.describe(c.Commit),
+			"**Rollback target:** "+c.describe(*c.Rollback),
+		)
+	} else if c.Commit.Subject != "" {
+		lines = append(lines, truncate(c.Commit.Subject, maxSubjectLen))
+	}
+
+	var meta []string
+	if c.Rollback == nil && c.Commit.Author != "" {
+		meta = append(meta, truncate(c.Commit.Author, maxAuthorLen))
+	}
+	if c.Rollback == nil && c.Count > 1 {
+		meta = append(meta, fmt.Sprintf("%d commits since %s", c.Count, shortHash(c.Base)))
+	}
+	if c.RepoURL != "" && c.Base != "" && c.Base != c.Commit.ID {
+		meta = append(meta, fmt.Sprintf("[compare](%s/compare/%s...%s)", c.RepoURL, c.Base, c.Commit.ID))
+	}
+	if len(meta) > 0 {
+		lines = append(lines, strings.Join(meta, " · "))
+	}
+	e.Description = strings.Join(lines, "\n")
+
+	if c.RepoURL == "" {
+		return
+	}
+	for i := range e.Fields {
+		if e.Fields[i].Name == "Commit" && e.Fields[i].Value == shortHash(c.Commit.ID) {
+			e.Fields[i].Value = c.link(c.Commit.ID)
+		}
+	}
+}
+
+func (c CommitContext) describe(info CommitInfo) string {
+	out := "`" + shortHash(info.ID) + "`"
+	if c.RepoURL != "" {
+		out = c.link(info.ID)
+	}
+	if info.Subject != "" {
+		out += " " + truncate(info.Subject, maxSubjectLen)
+	}
+	if info.Author != "" {
+		out += " (" + truncate(info.Author, maxAuthorLen) + ")"
+	}
+	return out
+}
+
+func (c CommitContext) link(id string) string {
+	return fmt.Sprintf("[%s](%s/commit/%s)", shortHash(id), c.RepoURL, id)
+}
+
+func shortHash(id string) string {
+	if len(id) > 7 {
+		return id[:7]
+	}
+	return id
 }
 
 func formatDuration(d time.Duration) string {

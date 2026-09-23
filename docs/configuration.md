@@ -28,6 +28,7 @@ This writes a default `composelock.json` and an empty `state.json`. Config path 
 | `health_unhealthy_streak`       | `3`                   | Consecutive unhealthy polls before failing      |
 | `health_restart_tolerance`      | `1`                   | Restarts allowed before treating it as a failure |
 | `discord_webhook`               | (disabled)            | Discord webhook URL for notifications           |
+| `repo_url`                      | (derived from remote) | Web URL of the repository for commit and compare links in notifications, e.g. `https://gitea.lan/home/stack` |
 | `log_format`                    | `json`                | `json` or `text`, logged to stdout              |
 | `pprof_listen`                  | (disabled)            | Loopback address for a pprof server in `poll`/`webhook` mode, e.g. `127.0.0.1:6060` |
 | `webhook.listen`                | `127.0.0.1:8080`      | Address for `composelock webhook`               |

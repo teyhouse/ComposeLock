@@ -146,3 +146,16 @@ func TestNotifierDisabledWithoutURL(t *testing.T) {
 	}
 	n.Send(t.Context(), Embed{Title: "should not be sent"})
 }
+
+func TestAddCommitContextOnRevert(t *testing.T) {
+	embed := BuildEmbed(Report{Outcome: OutcomeRecovered, Title: "reverted", Commit: "a1b2c3d4e5", Branch: "main"})
+	embed.AddCommitContext(CommitContext{
+		Commit:   CommitInfo{ID: "a1b2c3d4e5", Subject: "switch traefik to v3", Author: "teyhouse"},
+		Base:     "8e76297aa",
+		Rollback: &CommitInfo{ID: "8e76297aa", Subject: "bump vaultwarden"},
+	})
+	want := "**Failed:** `a1b2c3d` switch traefik to v3 (teyhouse)\n**Rollback target:** `8e76297` bump vaultwarden"
+	if embed.Description != want {
+		t.Errorf("Description =\n%s\nwant\n%s", embed.Description, want)
+	}
+}

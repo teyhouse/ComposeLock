@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -54,6 +55,7 @@ type Config struct {
 	HealthRestartTolerance    int `json:"health_restart_tolerance"`
 
 	DiscordWebhook string `json:"discord_webhook"`
+	RepoURL        string `json:"repo_url"`
 	LogFormat      string `json:"log_format"`
 	PprofListen    string `json:"pprof_listen"`
 
@@ -88,6 +90,7 @@ func Default() *Config {
 		HealthRestartTolerance:    1,
 
 		DiscordWebhook: "",
+		RepoURL:        "",
 		LogFormat:      "json",
 		PprofListen:    "",
 
@@ -311,6 +314,11 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	}
 	if c.MonitorIntervalSeconds < 0 {
 		return fmt.Errorf("config: monitor_interval_seconds must be >= 0")
+	}
+	if c.RepoURL != "" {
+		if u, err := url.Parse(c.RepoURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil {
+			return fmt.Errorf("config: repo_url must be an http(s) URL without credentials, got %q", c.RepoURL)
+		}
 	}
 	if c.DockerTimeoutSeconds < 0 {
 		return fmt.Errorf("config: docker_timeout_seconds must be >= 0")

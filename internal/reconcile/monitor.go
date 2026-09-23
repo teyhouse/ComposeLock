@@ -137,6 +137,7 @@ func (m *Monitor) observe(ctx context.Context, st *state.State, name string, sna
 		Problem:      problem,
 		UnhealthyFor: now.Sub(mem.since),
 	})
+	addCommitContext(ctx, m.deps, &embed, "", "")
 	if !m.deps.Notifier.Enabled() {
 		mem.alerted = true
 		return
