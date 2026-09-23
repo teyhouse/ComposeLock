@@ -22,6 +22,7 @@ type cliFlags struct {
 	repoURL     string
 	sshKey      string
 	logFormat   string
+	logLevel    string
 	pprofListen string
 	window      string
 
@@ -79,6 +80,7 @@ func newCLIFlags() *cliFlags {
 	f.fs.StringVar(&f.webhookListen, "webhook-listen", "", "Address for `webhook` (default 127.0.0.1:8080)")
 	f.fs.StringVar(&f.webhookPath, "webhook-path", "", "Path for `webhook` (default /webhook)")
 	f.fs.StringVar(&f.logFormat, "log-format", "", "json|text (default json)")
+	f.fs.StringVar(&f.logLevel, "log-level", "", "debug|info|warn|error (default info)")
 	f.fs.DurationVar(&f.pauseFor, "for", 0, "With pause: resume automatically after this long, e.g. 2h (default: until resume)")
 	f.fs.StringVar(&f.pauseReason, "reason", "", "With pause: why deployments are paused, shown by status")
 	f.fs.BoolVar(&f.dryRun, "dry-run", false, "Equivalent to `check`")
@@ -116,6 +118,8 @@ func (f *cliFlags) overrides() config.Overrides {
 			o.RepoURL = &f.repoURL
 		case "log-format":
 			o.LogFormat = &f.logFormat
+		case "log-level":
+			o.LogLevel = &f.logLevel
 		case "pprof-listen":
 			o.PprofListen = &f.pprofListen
 		case "deploy-window":

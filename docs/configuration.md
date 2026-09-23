@@ -34,6 +34,7 @@ This writes a default `composelock.json` and an empty `state.json`. Config path 
 | `heartbeat_url`                 | (disabled)            | URL pinged with a `GET` after every completed run, see [Heartbeat](running.md#heartbeat) |
 | `repo_url`                      | (derived from remote) | Web URL of the repository for commit and compare links in notifications, e.g. `https://gitea.lan/home/stack` |
 | `log_format`                    | `json`                | `json` or `text`, logged to stdout              |
+| `log_level`                     | `info`                | `debug`, `info`, `warn` or `error`; lines below this level are dropped |
 | `pprof_listen`                  | (disabled)            | Loopback address for a pprof server in `poll`/`webhook` mode, e.g. `127.0.0.1:6060` |
 | `webhook.listen`                | `127.0.0.1:8080`      | Address for `composelock webhook`               |
 | `webhook.path`                  | `/webhook`            | Path for `composelock webhook`                  |

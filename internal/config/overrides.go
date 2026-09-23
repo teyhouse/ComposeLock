@@ -18,6 +18,7 @@ type Overrides struct {
 	Discord     *string
 	RepoURL     *string
 	LogFormat   *string
+	LogLevel    *string
 	PprofListen *string
 	Window      *string
 
@@ -49,6 +50,7 @@ func (c *Config) Apply(o Overrides) error {
 	setString(&c.DiscordWebhook, o.Discord)
 	setString(&c.RepoURL, o.RepoURL)
 	setString(&c.LogFormat, o.LogFormat)
+	setString(&c.LogLevel, o.LogLevel)
 	setString(&c.PprofListen, o.PprofListen)
 	setString(&c.DeployWindow, o.Window)
 	setString(&c.Webhook.Listen, o.WebhookListen)

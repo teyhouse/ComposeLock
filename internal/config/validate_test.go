@@ -143,3 +143,15 @@ func TestValidateRejectsAPollIntervalLongerThanTheWatchWindow(t *testing.T) {
 		t.Errorf("Validate() = %v, want the check skipped when the watch is disabled", err)
 	}
 }
+
+func TestLogLevelDefaultsToInfoAndRejectsUnknownLevels(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), []byte(`{"repo_path": ".", "compose_file": "x", "project_name": "y"}`))
+	cfg, err := Load(path, Overrides{}, slog.New(slog.DiscardHandler))
+	if err != nil || cfg.Level() != slog.LevelInfo {
+		t.Fatalf("config without log_level: level %v, err %v, want info", cfg.Level(), err)
+	}
+	cfg.LogLevel = "verbose"
+	if err := cfg.Validate(slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "log_level") {
+		t.Errorf("Validate() error = %v, want a log_level error", err)
+	}
+}

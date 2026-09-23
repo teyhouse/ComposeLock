@@ -20,11 +20,14 @@ import (
 	"github.com/teyhouse/ComposeLock/internal/state"
 )
 
-func newLogger(format string, out io.Writer) *slog.Logger {
+func newLogger(format string, level slog.Level, out io.Writer) *slog.Logger {
+	var lv slog.LevelVar
+	lv.Set(level)
+	opts := &slog.HandlerOptions{Level: &lv}
 	if format == "text" {
-		return slog.New(slog.NewTextHandler(out, nil))
+		return slog.New(slog.NewTextHandler(out, opts))
 	}
-	return slog.New(slog.NewJSONHandler(out, nil))
+	return slog.New(slog.NewJSONHandler(out, opts))
 }
 
 func loadConfig(f *cliFlags, bootLogger *slog.Logger) (*config.Config, error) {
@@ -62,7 +65,7 @@ func buildDeps(cfg *config.Config, log *slog.Logger) (reconcile.Deps, error) {
 }
 
 func setup(f *cliFlags, writesState bool) (*config.Config, reconcile.Deps, int) {
-	bootLogger := newLogger("json", os.Stdout)
+	bootLogger := newLogger("json", slog.LevelInfo, os.Stdout)
 
 	cfg, err := loadConfig(f, bootLogger)
 	if err != nil {
@@ -70,7 +73,7 @@ func setup(f *cliFlags, writesState bool) (*config.Config, reconcile.Deps, int) 
 		return nil, reconcile.Deps{}, 2
 	}
 
-	log := newLogger(cfg.LogFormat, os.Stdout)
+	log := newLogger(cfg.LogFormat, cfg.Level(), os.Stdout)
 	log.Info("composelock starting", "version", version, "commit", commit, "built", date)
 
 	deps, err := buildDeps(cfg, log)

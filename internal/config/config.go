@@ -65,6 +65,7 @@ type Config struct {
 	RepoURL        string `json:"repo_url"`
 	HeartbeatURL   string `json:"heartbeat_url"`
 	LogFormat      string `json:"log_format"`
+	LogLevel       string `json:"log_level"`
 	PprofListen    string `json:"pprof_listen"`
 
 	Webhook       WebhookConfig       `json:"webhook"`
@@ -102,6 +103,7 @@ func Default() *Config {
 		RepoURL:        "",
 		HeartbeatURL:   "",
 		LogFormat:      "json",
+		LogLevel:       "info",
 		PprofListen:    "",
 
 		Webhook: WebhookConfig{
@@ -352,6 +354,9 @@ func (c *Config) Validate(logger *slog.Logger) error {
 	if c.PprofListen != "" && !isLoopback(c.PprofListen) {
 		return fmt.Errorf("config: pprof_listen must be a loopback address, got %q", c.PprofListen)
 	}
+	if _, ok := logLevels[c.LogLevel]; !ok {
+		return fmt.Errorf("config: log_level must be \"debug\", \"info\", \"warn\" or \"error\", got %q", c.LogLevel)
+	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		return fmt.Errorf("config: log_format must be \"json\" or \"text\", got %q", c.LogFormat)
 	}
@@ -461,4 +466,18 @@ func validHeaderName(name string) bool {
 		}
 	}
 	return true
+}
+
+var logLevels = map[string]slog.Level{
+	"debug": slog.LevelDebug,
+	"info":  slog.LevelInfo,
+	"warn":  slog.LevelWarn,
+	"error": slog.LevelError,
+}
+
+func (c *Config) Level() slog.Level {
+	if level, ok := logLevels[c.LogLevel]; ok {
+		return level
+	}
+	return slog.LevelInfo
 }
