@@ -14,6 +14,8 @@ const schemaVersion = 2
 
 const maxFailedCommits = 16
 
+const maxHistory = 20
+
 type Result string
 
 const (
@@ -51,6 +53,21 @@ type State struct {
 	PendingAttempts int       `json:"pending_attempts,omitzero"`
 	PendingStacks   []string  `json:"pending_stacks,omitzero"`
 	PendingRevert   bool      `json:"pending_revert,omitzero"`
+
+	PausedAt    time.Time `json:"paused_at,omitzero"`
+	PausedUntil time.Time `json:"paused_until,omitzero"`
+	PauseReason string    `json:"pause_reason,omitzero"`
+
+	History []Deployment `json:"history,omitzero"`
+}
+
+type Deployment struct {
+	At           time.Time `json:"at"`
+	Commit       string    `json:"commit,omitzero"`
+	Result       Result    `json:"result"`
+	RolledBackTo string    `json:"rolled_back_to,omitzero"`
+	Error        string    `json:"error,omitzero"`
+	Repeats      int       `json:"repeats,omitzero"`
 }
 
 func New() *State {
@@ -178,6 +195,32 @@ func (s *State) ForgetAllFailed() {
 	s.LastFailedCommit = ""
 	s.LastFailedAt = time.Time{}
 	s.FailedCommits = nil
+}
+
+func (s *State) Paused(now time.Time) bool {
+	return !s.PausedAt.IsZero() && (s.PausedUntil.IsZero() || now.Before(s.PausedUntil))
+}
+
+func (s *State) Pause(at, until time.Time, reason string) {
+	s.PausedAt, s.PausedUntil, s.PauseReason = at, until, reason
+}
+
+func (s *State) Resume() {
+	s.PausedAt, s.PausedUntil, s.PauseReason = time.Time{}, time.Time{}, ""
+}
+
+func (s *State) Record(d Deployment) {
+	history := slices.Clone(s.History)
+	if n := len(history); n > 0 && history[n-1].Commit == d.Commit && history[n-1].Result == d.Result {
+		d.Repeats = history[n-1].Repeats + 1
+		history[n-1] = d
+	} else {
+		history = append(history, d)
+	}
+	if len(history) > maxHistory {
+		history = slices.Clone(history[len(history)-maxHistory:])
+	}
+	s.History = history
 }
 
 func (s *State) ExpectedCheckout() string {

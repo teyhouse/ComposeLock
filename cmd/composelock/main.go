@@ -111,6 +111,10 @@ func run(args []string) int {
 		return cmdPoll(ctx, cfg, deps)
 	case "webhook":
 		return cmdWebhook(ctx, cfg, deps)
+	case "pause":
+		return cmdPause(ctx, deps, f.pauseFor, f.pauseReason)
+	case "resume":
+		return cmdResume(ctx, deps)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", command)
 		return 2
@@ -118,6 +122,20 @@ func run(args []string) int {
 }
 
 func checkFlagsFor(command string, f *cliFlags) error {
+	if command != "pause" {
+		var misplaced []string
+		f.fs.Visit(func(fl *flag.Flag) {
+			if fl.Name == "for" || fl.Name == "reason" {
+				misplaced = append(misplaced, "-"+fl.Name)
+			}
+		})
+		if len(misplaced) > 0 {
+			return fmt.Errorf("%s only applies to the pause command", strings.Join(misplaced, " and "))
+		}
+	}
+	if command == "pause" && f.pauseFor < 0 {
+		return fmt.Errorf("-for must not be negative, got %s", f.pauseFor)
+	}
 	if command != "poll" && command != "webhook" {
 		return nil
 	}

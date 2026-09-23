@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/compose-spec/compose-go/v2/types"
 
@@ -87,6 +88,7 @@ const (
 	SkipInFlight           = "reconcile already running in this process"
 	SkipLocked             = "another composelock process holds the state lock"
 	SkipPreflightUnhealthy = "pre-flight gate would block this commit: the live stack is unhealthy"
+	SkipPaused             = "deployments are paused"
 )
 
 var processSingleFlight sync.Mutex
@@ -143,7 +145,12 @@ func Reconcile(ctx context.Context, opts Options, deps Deps) Result {
 			}()
 		}
 
-		return reconcileLocked(ctx, opts, deps, start)
+		runStart := deps.Clock.Now()
+		result := reconcileLocked(ctx, opts, deps, start)
+		if !opts.DryRun {
+			recordHistory(deps, result, runStart)
+		}
+		return result
 	}()
 
 	if result.Notification != nil {
@@ -161,6 +168,10 @@ func reconcileLocked(ctx context.Context, opts Options, deps Deps, start time.Ti
 	if err != nil {
 		deps.Log.Error("loading state", "err", err)
 		return Result{Err: fmt.Errorf("loading state: %w", err)}
+	}
+
+	if now := deps.Clock.Now(); st.Paused(now) {
+		return pausedRun(ctx, deps, st)
 	}
 
 	if st.LastResult == state.ResultDegraded && !opts.Force {
@@ -490,4 +501,60 @@ func promoteHealthy(deps Deps, st *state.State, commit string, stacks []string) 
 	}
 	*st = next
 	return nil
+}
+
+const maxHistoryError = 200
+
+func pausedRun(ctx context.Context, deps Deps, st *state.State) Result {
+	result := Result{Skipped: true, SkipReason: SkipPaused}
+	attrs := []any{"reason", st.PauseReason}
+	if !st.PausedUntil.IsZero() {
+		attrs = append(attrs, "until", st.PausedUntil)
+	}
+	if gitResult, err := git.Fetch(ctx, deps.Git, 1, 0, deps.Log); err == nil {
+		result.Changed, result.OldCommit, result.NewCommit = gitResult.Changed, gitResult.OldCommit, gitResult.NewCommit
+		if gitResult.Changed {
+			attrs = append(attrs, "waiting_commit", gitResult.NewCommit)
+		}
+	}
+	deps.Log.Info("deployments are paused, not applying", attrs...)
+	return result
+}
+
+func recordHistory(deps Deps, result Result, runStart time.Time) {
+	if !result.Applied && !result.Reverted && !result.Degraded && result.Err == nil {
+		return
+	}
+	st, err := deps.State.Load()
+	if err != nil {
+		deps.Log.Error("recording deployment history: loading state", "err", err)
+		return
+	}
+	if st.LastAttemptAt.Before(runStart) || st.LastResult == state.ResultSkippedKnownBad {
+		return
+	}
+	entry := state.Deployment{
+		At:           st.LastAttemptAt,
+		Commit:       result.NewCommit,
+		Result:       st.LastResult,
+		RolledBackTo: result.RolledBackTo,
+	}
+	if result.Err != nil {
+		entry.Error = truncateError(result.Err.Error())
+	}
+	st.Record(entry)
+	if err := deps.State.Save(st); err != nil {
+		deps.Log.Error("recording deployment history: saving state", "err", err)
+	}
+}
+
+func truncateError(msg string) string {
+	if len(msg) <= maxHistoryError {
+		return msg
+	}
+	cut := maxHistoryError
+	for cut > 0 && !utf8.RuneStart(msg[cut]) {
+		cut--
+	}
+	return msg[:cut] + "..."
 }

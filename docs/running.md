@@ -33,3 +33,20 @@ Discord only reports what ComposeLock does, so a process that crashed, was never
 - The URL identifies your check, so it is never logged and has no command-line flag.
 
 `composelock webhook` also answers `GET /healthz` with `200 ok` on `webhook.listen`, for a reverse proxy or an external HTTP monitor. It shows that the process and its listener are up, not that reconciles are progressing; the heartbeat covers that. The image ships without `curl` or `wget`, so it has no built-in `HEALTHCHECK`.
+
+## Pausing deployments
+
+While you work on the host, hold ComposeLock with `composelock pause`, and lift the hold with `composelock resume`:
+
+```sh
+composelock --config /srv/composelock.json pause -for 2h -reason "NAS upgrade"
+composelock --config /srv/composelock.json resume
+```
+
+A paused run still fetches and logs the commit that is waiting, but applies, reverts and recovers nothing, and the [health monitor](notifications.md#health-alerts) sends no alerts, so containers you stop on purpose do not page anyone. `-for` ends the pause on its own; without it the pause lasts until `resume`. `status` shows the pause and its reason. The heartbeat keeps pinging, since ComposeLock itself is still running. The pause lives in the state file, so it survives restarts and applies to cron, `poll` and `webhook` alike. If a reconcile is running, `pause` waits for it to finish rather than interrupting it.
+
+## Deployment history
+
+`composelock status` lists the last 20 runs that did something: deploys, reverts, DEGRADED, and failures, each with its time, result and commit, the rollback target for a revert, and a shortened error. Identical consecutive entries, such as a git fetch failing every tick during a network outage, are folded into one line with a repeat count. Runs that found nothing to do are not recorded. The history is stored in the state file.
+
+State files from earlier versions need no changes: the pause and history fields are simply absent until first used.

@@ -39,6 +39,9 @@ type cliFlags struct {
 	dockerTimeout   time.Duration
 	dockerUp        time.Duration
 
+	pauseFor    time.Duration
+	pauseReason string
+
 	dryRun      bool
 	force       bool
 	initFlag    bool
@@ -74,6 +77,8 @@ func newCLIFlags() *cliFlags {
 	f.fs.StringVar(&f.webhookListen, "webhook-listen", "", "Address for `webhook` (default 127.0.0.1:8080)")
 	f.fs.StringVar(&f.webhookPath, "webhook-path", "", "Path for `webhook` (default /webhook)")
 	f.fs.StringVar(&f.logFormat, "log-format", "", "json|text (default json)")
+	f.fs.DurationVar(&f.pauseFor, "for", 0, "With pause: resume automatically after this long, e.g. 2h (default: until resume)")
+	f.fs.StringVar(&f.pauseReason, "reason", "", "With pause: why deployments are paused, shown by status")
 	f.fs.BoolVar(&f.dryRun, "dry-run", false, "Equivalent to `check`")
 	f.fs.BoolVar(&f.force, "force", false, "Override DEGRADED and the known-bad-commit skip; apply anyway")
 	f.fs.BoolVar(&f.initFlag, "init", false, "Scaffold a default config file")

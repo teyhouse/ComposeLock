@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
@@ -130,6 +131,7 @@ func cmdStatus(ctx context.Context, configPath string, cfg *config.Config, deps 
 		fmt.Fprintln(os.Stderr, "reading state:", loadErr)
 		return 2
 	}
+	printPauseAndHistory(st, time.Now())
 	data, err := json.Marshal(st, jsontext.WithIndent("  "))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "encoding state:", err)
@@ -285,4 +287,38 @@ func cmdWebhook(ctx context.Context, cfg *config.Config, deps reconcile.Deps) in
 		return 1
 	}
 	return 0
+}
+
+func printPauseAndHistory(st *state.State, now time.Time) {
+	if st.Paused(now) {
+		fmt.Println("paused:", pauseDescription(st.PausedUntil, st.PauseReason))
+	}
+	if len(st.History) == 0 {
+		return
+	}
+	fmt.Println("recent deployments (newest first):")
+	for _, d := range slices.Backward(st.History) {
+		line := fmt.Sprintf("  %s  %-17s %s", d.At.Local().Format(time.DateTime), d.Result, orNone(shortID(d.Commit)))
+		if d.RolledBackTo != "" {
+			line += " -> " + shortID(d.RolledBackTo)
+		}
+		if d.Repeats > 0 {
+			line += fmt.Sprintf(" (x%d)", d.Repeats+1)
+		}
+		if d.Error != "" {
+			line += "  " + d.Error
+		}
+		fmt.Println(line)
+	}
+}
+
+func shortID(commit string) string {
+	return commit[:min(len(commit), 7)]
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }

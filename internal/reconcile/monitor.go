@@ -65,7 +65,7 @@ func (m *Monitor) check(ctx context.Context) (completed bool) {
 		m.deps.Log.Warn("health monitor: loading state", "err", err)
 		return true
 	}
-	if st.PendingCommit != "" || st.PendingRevert || st.LastHealthyCommit == "" {
+	if st.PendingCommit != "" || st.PendingRevert || st.LastHealthyCommit == "" || st.Paused(m.deps.Clock.Now()) {
 		return true
 	}
 	names, err := m.watched(st)

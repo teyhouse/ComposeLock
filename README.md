@@ -104,10 +104,12 @@ The first `sync` deploys the current checkout even though `HEAD` already matches
 |------------|--------------------------------------------------------------------------|
 | `sync`     | One reconcile: fetch, gate, apply, watch, revert if needed               |
 | `check`    | Same as `sync` but dry run: reports what would change, applies nothing   |
-| `status`   | Prints config path, state file contents, and live container health       |
+| `status`   | Prints config path, pause state, recent deployments, state file contents, and live container health |
 | `init`     | Scaffolds a default config (and a state file with `--with-state`)        |
 | `poll`     | Runs `sync` in a loop every `poll_interval_seconds`                      |
 | `webhook`  | Starts an HTTP server that triggers `sync` on a Git push to `branch`     |
+| `pause`    | Holds deployments until `resume` (or for `-for 2h`), with an optional `-reason` |
+| `resume`   | Lifts a pause                                                            |
 | `version`  | Prints version, commit, and build date                                   |
 
 Bare `composelock` means `sync`, and `--version` matches the `version` command. Flags may come before or after the command. `poll` and `webhook` reject `--dry-run` and `--force`: they always reconcile for real.
