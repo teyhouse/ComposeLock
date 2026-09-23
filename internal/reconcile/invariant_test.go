@@ -102,6 +102,8 @@ func (c *invCompose) Up(ctx context.Context, _ *ctypes.Project) error {
 	return upErr
 }
 
+func (c *invCompose) Pull(context.Context, *ctypes.Project) error { return nil }
+
 func (c *invCompose) Down(context.Context, string) error { return nil }
 
 type invSnapshotter struct {

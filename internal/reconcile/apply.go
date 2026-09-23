@@ -252,6 +252,11 @@ func applyAndWatch(ctx context.Context, deps Deps, st *state.State, result Resul
 		}
 		projects[i] = project
 	}
+	for i, s := range changedStacks {
+		if err := deps.Compose.Pull(ctx, projects[i]); err != nil {
+			return abortApply(ctx, deps, st, result, "pulling images failed", fmt.Errorf("pulling images for %s: %w", s.ProjectName, err))
+		}
+	}
 
 	// Persisted before touching Docker so a crash here is recoverable via
 	// pending_commit on the next run.

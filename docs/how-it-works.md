@@ -22,6 +22,8 @@ The checkout only moves once the gate has passed, so a gate failure (Docker unre
 
 Checks that need the new tree (discovering its stacks, loading each project, verifying every `env_file` exists) run right after the checkout and before Compose is touched. If one fails, the worktree is restored and the commit recorded as known-bad. Push a new commit or run `composelock sync --force` to retry, which is what you want after fixing an `env_file` that lives on the host rather than in the repository.
 
+Once every changed stack has loaded, ComposeLock pulls the images their `compose up` would pull (images that are missing locally, and those with `pull_policy: always`), for all of them before the first container is recreated. Images already present are not re-pulled, so floating tags such as `:latest` do not move and a registry outage does not block a deploy that needs nothing new. In `compose_dir` mode this means a bad image in one stack no longer fails only after an earlier stack was already recreated. A pull that fails because the image does not exist, the reference is invalid, or access is denied is the commit's fault and is recorded as known-bad like the checks above. Any other pull failure (registry unreachable, DNS, timeouts, rate limits) is treated as a registry outage: the worktree is restored, the commit is not marked bad, and the next run retries it.
+
 `git checkout` runs `--detach --force`: the worktree is a deployment artifact and the branch is the only source of truth, so local edits under `repo_path` are discarded rather than carried into the next deploy.
 
 ## The health watch

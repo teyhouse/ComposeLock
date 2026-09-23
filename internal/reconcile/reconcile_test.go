@@ -84,6 +84,8 @@ type fakeCompose struct {
 	loadErr    error
 	downErr    error
 	upErrs     []error
+	pullErrs   map[string]error
+	pullCalls  []string
 	onUp       func(call int)
 	onDown     func(projectName string)
 	project    *ctypes.Project
@@ -102,6 +104,11 @@ func (f *fakeCompose) LoadProject(_ context.Context, files []string, projectName
 		return f.project, nil
 	}
 	return &ctypes.Project{Name: projectName, Services: ctypes.Services{"web": ctypes.ServiceConfig{Name: "web"}}}, nil
+}
+
+func (f *fakeCompose) Pull(_ context.Context, project *ctypes.Project) error {
+	f.pullCalls = append(f.pullCalls, project.Name)
+	return f.pullErrs[project.Name]
 }
 
 func (f *fakeCompose) Up(ctx context.Context, project *ctypes.Project) error {

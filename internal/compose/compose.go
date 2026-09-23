@@ -14,12 +14,15 @@ import (
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/moby/moby/client"
 )
+
+var errRegistryUnavailable = errors.New("registry unavailable")
 
 type Service struct {
 	compose   api.Compose
@@ -84,6 +87,70 @@ func (s *Service) Up(ctx context.Context, project *types.Project) error {
 		return fmt.Errorf("compose up: %w", ownDeadline(ctx, upCtx, err, s.upTimeout))
 	}
 	return nil
+}
+
+func (s *Service) Pull(ctx context.Context, project *types.Project) error {
+	pullCtx, cancel := s.withTimeout(ctx, s.upTimeout)
+	defer cancel()
+	services, err := s.imagesToPull(pullCtx, project)
+	if err != nil {
+		return fmt.Errorf("compose pull: %w", err)
+	}
+	if len(services) == 0 {
+		return nil
+	}
+	subset := *project
+	subset.Services = services
+	if err := s.compose.Pull(pullCtx, &subset, api.PullOptions{Quiet: true}); err != nil {
+		return fmt.Errorf("compose pull: %w", classifyPullError(ownDeadline(ctx, pullCtx, err, s.upTimeout)))
+	}
+	return nil
+}
+
+func classifyPullError(err error) error {
+	if cerrdefs.IsNotFound(err) || cerrdefs.IsInvalidArgument(err) || cerrdefs.IsUnauthorized(err) || cerrdefs.IsPermissionDenied(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errRegistryUnavailable, err)
+}
+
+func (s *Service) imagesToPull(ctx context.Context, project *types.Project) (types.Services, error) {
+	services := types.Services{}
+	for name, svc := range project.Services {
+		if svc.Image == "" || svc.Build != nil || svc.Provider != nil {
+			continue
+		}
+		policy, _, err := svc.GetPullPolicy()
+		if err != nil {
+			return nil, fmt.Errorf("service %q: %w", name, err)
+		}
+		switch policy {
+		case types.PullPolicyAlways:
+		case types.PullPolicyMissing, types.PullPolicyIfNotPresent:
+			present, err := s.imagePresent(ctx, svc.Image)
+			if err != nil {
+				return nil, err
+			}
+			if present {
+				continue
+			}
+		default:
+			continue
+		}
+		services[name] = svc
+	}
+	return services, nil
+}
+
+func (s *Service) imagePresent(ctx context.Context, image string) (bool, error) {
+	_, err := s.cli.Client().ImageInspect(ctx, image)
+	switch {
+	case err == nil:
+		return true, nil
+	case cerrdefs.IsNotFound(err):
+		return false, nil
+	}
+	return false, fmt.Errorf("inspecting image %s: %w", image, err)
 }
 
 func ownDeadline(caller, inner context.Context, err error, budget time.Duration) error {
