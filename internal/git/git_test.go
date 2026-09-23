@@ -277,3 +277,20 @@ func TestCheckoutDiscardsLocalModifications(t *testing.T) {
 		t.Errorf("calls = %v, want a detached forced checkout", fr.calls)
 	}
 }
+
+func TestWebURL(t *testing.T) {
+	tests := map[string]string{
+		"git@github.com:teyhouse/ComposeLock.git":            "https://github.com/teyhouse/ComposeLock",
+		"https://github.com/teyhouse/ComposeLock.git":        "https://github.com/teyhouse/ComposeLock",
+		"https://user:ghp_secret@github.com/teyhouse/cl.git": "https://github.com/teyhouse/cl",
+		"ssh://git@gitea.lan:2222/home/stack.git":            "https://gitea.lan/home/stack",
+		"http://gitea.lan:3000/home/stack":                   "http://gitea.lan:3000/home/stack",
+		"/srv/git/stack.git":                                 "",
+		"file:///srv/git/stack.git":                          "",
+	}
+	for remote, want := range tests {
+		if got := WebURL(remote); got != want {
+			t.Errorf("WebURL(%q) = %q, want %q", remote, got, want)
+		}
+	}
+}

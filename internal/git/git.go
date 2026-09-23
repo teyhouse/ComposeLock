@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -102,6 +104,75 @@ func (s *Syncer) Checkout(ctx context.Context, commit string) error {
 		return fmt.Errorf("git checkout %s: %w", commit, err)
 	}
 	return nil
+}
+
+func (s *Syncer) Describe(ctx context.Context, commit string) (subject, author string, err error) {
+	if err := checkCommit(commit); err != nil {
+		return "", "", fmt.Errorf("git log: %w", err)
+	}
+	out, err := s.git(ctx, QueryTimeout, "log", "-1", "--format=%s%x00%an", commit)
+	if err != nil {
+		return "", "", fmt.Errorf("git log %s: %w", commit, err)
+	}
+	subject, author, _ = strings.Cut(out, "\x00")
+	return subject, author, nil
+}
+
+func (s *Syncer) CountCommits(ctx context.Context, from, to string) (int, error) {
+	if err := errors.Join(checkCommit(from), checkCommit(to)); err != nil {
+		return 0, fmt.Errorf("git rev-list: %w", err)
+	}
+	out, err := s.git(ctx, QueryTimeout, "rev-list", "--count", from+".."+to)
+	if err != nil {
+		return 0, fmt.Errorf("git rev-list: %w", err)
+	}
+	n, err := strconv.Atoi(out)
+	if err != nil {
+		return 0, fmt.Errorf("git rev-list: parsing count %q: %w", out, err)
+	}
+	return n, nil
+}
+
+func (s *Syncer) RemoteURL(ctx context.Context) (string, error) {
+	out, err := s.git(ctx, QueryTimeout, "remote", "get-url", "--end-of-options", s.Remote)
+	if err != nil {
+		return "", fmt.Errorf("git remote get-url: %w", err)
+	}
+	return out, nil
+}
+
+func WebURL(remote string) string {
+	remote = strings.TrimSpace(remote)
+	if !strings.Contains(remote, "://") {
+		_, rest, found := strings.Cut(remote, "@")
+		if !found {
+			rest = remote
+		}
+		host, path, ok := strings.Cut(rest, ":")
+		if !ok || host == "" || strings.ContainsAny(host, "/\\") {
+			return ""
+		}
+		return webURL("https", host, path)
+	}
+	u, err := url.Parse(remote)
+	if err != nil {
+		return ""
+	}
+	switch u.Scheme {
+	case "https", "http":
+		return webURL(u.Scheme, u.Host, u.Path)
+	case "ssh", "git", "git+ssh":
+		return webURL("https", u.Hostname(), u.Path)
+	}
+	return ""
+}
+
+func webURL(scheme, host, path string) string {
+	path = strings.TrimSuffix(strings.Trim(path, "/"), ".git")
+	if host == "" || path == "" {
+		return ""
+	}
+	return scheme + "://" + host + "/" + path
 }
 
 func checkCommit(commit string) error {

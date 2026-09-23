@@ -19,6 +19,7 @@ type cliFlags struct {
 	projectName string
 	stateFile   string
 	discord     string
+	repoURL     string
 	sshKey      string
 	logFormat   string
 	pprofListen string
@@ -57,6 +58,7 @@ func newCLIFlags() *cliFlags {
 	f.fs.StringVar(&f.projectName, "project-name", "", "Compose project name (required for SDK)")
 	f.fs.StringVar(&f.stateFile, "state-file", "", "Path to state JSON")
 	f.fs.StringVar(&f.discord, "discord", "", "Discord webhook URL")
+	f.fs.StringVar(&f.repoURL, "repo-url", "", "Web URL of the repository for notification links (default: derived from the remote)")
 	f.fs.StringVar(&f.sshKey, "ssh-key", "", "Path to SSH key for Git")
 	f.fs.IntVar(&f.retryAttempts, "retry-attempts", 0, "Git sync retry attempts (default 3)")
 	f.fs.DurationVar(&f.retryDelay, "retry-delay", 0, "Delay between Git retries (default 20s)")
@@ -103,6 +105,8 @@ func (f *cliFlags) overrides() config.Overrides {
 			o.SSHKey = &f.sshKey
 		case "discord":
 			o.Discord = &f.discord
+		case "repo-url":
+			o.RepoURL = &f.repoURL
 		case "log-format":
 			o.LogFormat = &f.logFormat
 		case "pprof-listen":

@@ -32,6 +32,8 @@ type fakeGit struct {
 	fetchErr   error
 	diffFiles  string // newline-separated for readability; emitted NUL-separated like `git diff -z`
 	onCheckout func(commit string)
+	subjects   map[string]string
+	remoteURL  string
 }
 
 func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ...string) ([]byte, []byte, error) {
@@ -49,6 +51,18 @@ func (g *fakeGit) Run(_ context.Context, _ string, _ []string, _ string, args ..
 			files = "docker-compose.yml"
 		}
 		return []byte(strings.ReplaceAll(files, "\n", "\x00") + "\x00"), nil, nil
+	case "log":
+		if subject, ok := g.subjects[args[len(args)-1]]; ok {
+			return []byte(subject + "\x00teyhouse"), nil, nil
+		}
+	case "rev-list":
+		if g.subjects != nil {
+			return []byte("3"), nil, nil
+		}
+	case "remote":
+		if g.remoteURL != "" {
+			return []byte(g.remoteURL), nil, nil
+		}
 	case "checkout":
 		commit := args[len(args)-1]
 		g.head = commit
