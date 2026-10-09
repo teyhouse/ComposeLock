@@ -10,7 +10,7 @@ require (
 	github.com/gofrs/flock v0.13.1
 	github.com/moby/moby/client v0.6.1
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 )
 
 require (
