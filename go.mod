@@ -5,7 +5,7 @@ go 1.27.2
 require (
 	github.com/compose-spec/compose-go/v2 v2.16.1
 	github.com/containerd/errdefs v1.0.0
-	github.com/docker/cli v29.9.1+incompatible
+	github.com/docker/cli v29.9.2+incompatible
 	github.com/docker/compose/v5 v5.6.0
 	github.com/gofrs/flock v0.13.1
 	github.com/moby/moby/client v0.6.2
