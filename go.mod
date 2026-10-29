@@ -1,6 +1,6 @@
 module github.com/teyhouse/ComposeLock
 
-go 1.27.2
+go 1.27.3
 
 require (
 	github.com/compose-spec/compose-go/v2 v2.16.1
