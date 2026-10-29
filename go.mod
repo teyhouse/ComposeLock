@@ -3,10 +3,10 @@ module github.com/teyhouse/ComposeLock
 go 1.27.3
 
 require (
-	github.com/compose-spec/compose-go/v2 v2.16.1
+	github.com/compose-spec/compose-go/v2 v2.16.2
 	github.com/containerd/errdefs v1.0.0
 	github.com/docker/cli v29.9.2+incompatible
-	github.com/docker/compose/v5 v5.6.0
+	github.com/docker/compose/v5 v5.6.1
 	github.com/gofrs/flock v0.13.1
 	github.com/moby/moby/client v0.6.2
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
