@@ -9,7 +9,7 @@ require (
 	github.com/docker/compose/v5 v5.6.1
 	github.com/gofrs/flock v0.13.2
 	github.com/moby/moby/client v0.6.2
-	go.yaml.in/yaml/v4 v4.0.0-rc.6
+	go.yaml.in/yaml/v4 v4.0.0
 	golang.org/x/sync v0.24.0
 )
 
